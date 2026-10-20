@@ -7,7 +7,7 @@ const MONTHS = ['Январь','Февраль','Март','Апрель','Ма�
 const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 const HEAD_H = 46;          // высота заголовка месяца, px
 const BUFFER = 1.2;         // сколько экранов рендерим сверху/снизу
-const F_VIDEO = 1, F_TAKEN = 2;
+const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8;
 
 const st = {
   me: null,
@@ -567,21 +567,23 @@ function openViewer(i) {
   show(i);
 }
 
-function stopVideo() { const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true; }
+function stopVideo() {
+  $('v-note').hidden = true; const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true; }
 
 function show(i) {
   if (i < 0 || i >= st.list.length) return;
   V.i = i; const ph = st.list[i]; const tok = ++V.token;
-  const isVideo = !!(ph[6] & F_VIDEO);
+  const isVideo = !!(ph[6] & F_VIDEO) && !(ph[6] & F_NOPLAY);
   $('v-name').textContent = ph[2];
-  const taken = ph[6] & F_TAKEN;
-  let meta = (taken ? 'Снято ' : 'Изменён ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
-  if (taken && Math.abs(ph[4] - ph[3]) > 86400) meta += ' · файл изменён ' + fmt.format(new Date(ph[4] * 1000));
+  const fromMeta = ph[6] & F_TAKEN, fromName = ph[6] & F_NAME;
+  let meta = (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Изменён ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
+  if ((fromMeta || fromName) && Math.abs(ph[4] - ph[3]) > 86400) meta += ' · файл изменён ' + fmt.format(new Date(ph[4] * 1000));
   $('v-date').textContent = meta;
   $('v-orig').href = origUrl(ph, false);
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
+  $('v-note').hidden = !(ph[6] & F_NOPLAY);
   hi.classList.remove('ok'); hi.removeAttribute('src');
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
   if (isVideo) {

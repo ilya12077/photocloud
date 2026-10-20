@@ -92,7 +92,9 @@ async function loadOverview() {
   const cards = [
     ['Компьютер', { up: 'включён', down: 'выключен', waking: 'просыпается' }[o.pc] || o.pc],
     ['Файлов', `${ix.files.toLocaleString('ru')} (видео ${ix.videos.toLocaleString('ru')})`],
-    ['С датой съёмки', ix.files ? `${ix.with_date.toLocaleString('ru')} (${Math.round(ix.with_date / ix.files * 100)}%)` : '—'],
+    ['Дата из метаданных', ix.files ? `${ix.with_date.toLocaleString('ru')} (${Math.round(ix.with_date / ix.files * 100)}%)` : '—'],
+    ['Дата из имени файла', ix.files ? `${ix.with_name_date.toLocaleString('ru')} (${Math.round(ix.with_name_date / ix.files * 100)}%)` : '—'],
+    ['Только дата изменения', ix.files ? (ix.files - ix.with_date - ix.with_name_date).toLocaleString('ru') : '—'],
     ['Индекс', ix.state + (ix.error ? ` (${ix.error})` : '') + (ix.meta[1] && ix.meta[0] < ix.meta[1] ? `, даты ${ix.meta[0]}/${ix.meta[1]}` : '')],
     ['Обновлён', dt(ix.built_at)],
     ['Кэш эскизов', `${mb(o.cache.thumb[0])} из ${mb(o.cache.thumb[1])}`],

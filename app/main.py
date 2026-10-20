@@ -64,6 +64,9 @@ preview_cache = LRUBytes(S.preview_cache_mb * 1024 * 1024)
 render_sem = asyncio.Semaphore(S.workers)
 login_sem = asyncio.Semaphore(2)              # argon2 ест ~64 МБ RAM на проверку
 inflight: dict[tuple, asyncio.Future] = {}
+# файлы, которые не удалось декодировать: не мучаем ffmpeg/Pillow повторно 10 минут
+failed: dict[tuple, float] = {}
+FAILED_TTL = 600
 known_ips: dict[str, set] = {}
 _bg_tasks: set = set()
 
@@ -73,6 +76,7 @@ CONTENT_TYPES = {
     ".heic": "image/heic", ".heif": "image/heif",
     # .mov отдаём как mp4: Chrome/Edge тогда тоже пытаются его играть (кодек тот же H.264/HEVC)
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/mp4", ".3gp": "video/3gpp", ".webm": "video/webm",
+    ".mts": "video/mp2t", ".m2ts": "video/mp2t", ".avi": "video/x-msvideo",
 }
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
@@ -528,6 +532,8 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
            "e": S.preview_eco_size, "p": S.preview_size}[kind]
     cache, q = (thumb_cache, S.thumb_quality) if kind in "stm" else (preview_cache, S.preview_quality)
     key = (kind, pid, p.mtime, p.size)
+    if time.time() - failed.get(key, 0) < FAILED_TTL:
+        raise HTTPException(415)
     data = None
     try:
         for _ in range(3):
@@ -568,7 +574,10 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
         raise HTTPException(503, "pc") from None
     except (UnidentifiedImageError, Image.DecompressionBombWarning, Image.DecompressionBombError,
             OSError, ValueError, SyntaxError, MemoryError, video.subprocess.TimeoutExpired) as e:
-        log.info("не удалось декодировать %s: %s", pid, type(e).__name__)
+        log.info("не удалось декодировать %s (%s): %s", pid, p.name, type(e).__name__)
+        if len(failed) > 5000:
+            failed.clear()
+        failed[key] = time.time()
         raise HTTPException(415) from None
     if data is None:
         raise HTTPException(503)
@@ -701,7 +710,8 @@ async def admin_overview(_: Session = Depends(require_admin)):
         "uptime": int(time.time() - STARTED),
         "pc": "up" if up else ("waking" if PC.wake_at else "down"),
         "index": {"state": library.state, "error": library.error, "files": len(photos), "videos": videos,
-                  "with_date": sum(1 for p in photos if p.taken), "built_at": int(library.built_at),
+                  "with_date": sum(1 for p in photos if p.taken), "with_name_date": sum(1 for p in photos if not p.taken and p.named),
+                  "built_at": int(library.built_at),
                   "meta": [library.meta_done, library.meta_total]},
         "cache": {"thumb": [thumb_cache.size, thumb_cache.max], "preview": [preview_cache.size, preview_cache.max]},
         "sessions": len(sessions.list()),

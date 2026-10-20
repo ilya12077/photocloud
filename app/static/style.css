@@ -193,3 +193,6 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
   table.list td { border: 0; padding: 4px 12px; }
   .ops { justify-content: flex-start; }
 }
+
+.v-note { position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 2;
+  background: #000b; color: #fff; padding: 8px 14px; border-radius: 10px; font-size: 14px; text-align: center; max-width: 90%; }

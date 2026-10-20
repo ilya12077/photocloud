@@ -16,7 +16,9 @@ from typing import BinaryIO, Iterator
 log = logging.getLogger("photocloud.storage")
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
-VIDEO_EXT = {".mp4", ".mov", ".m4v", ".3gp", ".webm"}
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".3gp", ".webm", ".mts", ".m2ts", ".avi"}
+# браузер умеет играть только эти; остальные (видеокамеры AVCHD, старые AVI) — эскиз + скачать
+PLAYABLE_EXT = {".mp4", ".mov", ".m4v", ".3gp", ".webm"}
 MEDIA_EXT = IMAGE_EXT | VIDEO_EXT
 SKIP_NAMES = {"$recycle.bin", "system volume information", "thumbs.db", "desktop.ini", "@eadir", ".thumbnails"}
 FILE_ATTRIBUTE_HIDDEN = 0x2

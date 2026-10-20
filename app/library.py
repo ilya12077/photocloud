@@ -19,12 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import meta
-from .storage import VIDEO_EXT
+from .storage import PLAYABLE_EXT, VIDEO_EXT
 
 log = logging.getLogger("photocloud.library")
 
 F_VIDEO = 1
-F_TAKEN = 2   # дата из EXIF/метаданных, а не mtime
+F_TAKEN = 2   # дата из EXIF/метаданных
+F_NAME = 4    # дата из имени файла
+F_NOPLAY = 8  # видео, которое браузер не воспроизведёт
 
 
 def photo_id(rel: str, salt: int = 0) -> str:
@@ -44,11 +46,23 @@ class Photo:
     size: int
     mtime: float
     ext: str
-    taken: float = 0.0     # 0 = неизвестно
+    taken: float = 0.0     # из метаданных; 0 = неизвестно
+    named: float = 0.0     # из имени файла; 0 = нет
 
     @property
     def date(self) -> float:
-        return self.taken or self.mtime
+        # приоритет: метаданные -> имя файла -> дата изменения
+        return self.taken or self.named or self.mtime
+
+    def flags(self) -> int:
+        f = 0
+        if self.video:
+            f |= F_VIDEO | (0 if self.ext in PLAYABLE_EXT else F_NOPLAY)
+        if self.taken:
+            f |= F_TAKEN
+        elif self.named:
+            f |= F_NAME
+        return f
 
     @property
     def video(self) -> bool:
@@ -150,7 +164,7 @@ class Library:
             "d": [dates[0]] + [dates[i - 1] - dates[i] for i in range(1, len(dates))] if dates else [],
             "m": [int(p.mtime) - d for p, d in zip(photos, dates)],     # чаще всего 0
             "s": [(p.size + 1023) // 1024 for p in photos],              # КБ
-            "x": [(F_VIDEO if p.video else 0) | (F_TAKEN if p.taken else 0) for p in photos],
+            "x": [p.flags() for p in photos],
         }
         body = json.dumps({"folders": folder_list, **cols}, ensure_ascii=False, separators=(",", ":"))
         version = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
@@ -187,6 +201,7 @@ class Library:
                     pid = photo_id(rel, salt)
                 seen.add(pid)
                 p = Photo(pid, rel, folders[folder], name, size, mtime, os.path.splitext(name)[1].lower())
+                p.named = meta.name_date(name, self.tz) or 0.0
                 c = self.cache.get(p.cache_key())
                 if c:
                     p.taken = c

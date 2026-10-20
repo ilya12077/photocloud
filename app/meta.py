@@ -202,6 +202,40 @@ def _mp4_date(f, size: int) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------- дата из имени файла
+# Телефоны, мессенджеры и скриншотеры пишут время съёмки в имя (местное время):
+#   IMG_20240512_123456.jpg  PXL_20230101_120000123.jpg  20240512_123456.mp4 (Samsung)
+#   IMG-20230101-WA0001.jpg (WhatsApp, только дата)  photo_2023-01-01_12-00-00.jpg (Telegram)
+#   Screenshot_2023-01-01-12-00-00-123_com.app.png   1675859348723.jpg (Unix-время в мс)
+_NAME_DT = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])"
+    r"(?:(?:[-_. T]|\s+at\s+)?([01]\d|2[0-3])[-_.:h]?([0-5]\d)[-_.:m]?([0-5]\d)(?:[-_.]?\d{1,3})?)?(?!\d)")
+# суффикс копии — только через разделитель или в скобках: «1675859348723_1», «1675859348723 (2)»
+_NAME_UNIX = re.compile(r"^(\d{10}|\d{13})(?:[-_ ]\(?\d{1,3}\)?|\(\d{1,3}\))?$")
+
+
+def name_date(name: str, tz: ZoneInfo) -> float | None:
+    """Дата из имени файла (местное время) или None. Без даты времени — полдень."""
+    stem = name.rsplit(".", 1)[0]
+    m = _NAME_UNIX.match(stem)
+    if m:
+        v = int(m.group(1))
+        return _plausible(v / 1000 if len(m.group(1)) == 13 else v)
+    for m in _NAME_DT.finditer(stem):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        h, mi, s = (int(m.group(i)) if m.group(i) else None for i in (4, 5, 6))
+        if h is None:
+            h, mi, s = 12, 0, 0
+        try:
+            ts = dt.datetime(y, mo, d, h, mi, s, tzinfo=tz).timestamp()
+        except ValueError:          # 31 февраля и т.п.
+            continue
+        ts = _plausible(ts)
+        if ts:
+            return ts
+    return None
+
+
 def needs_scan(ext: str) -> bool:
     return ext in JPEG_EXT or ext in MP4_EXT
 
