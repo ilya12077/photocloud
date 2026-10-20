@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#111214" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+<title>Фотоархив</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e8a33d'/%3E%3Ccircle cx='16' cy='17' r='6.5' fill='none' stroke='%23111' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+
+<section id="login" class="login" hidden>
+  <form id="login-form" class="login-card" autocomplete="on">
+    <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name">Фотоархив</span></div>
+    <label>Логин<input id="lu" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="64" required></label>
+    <label>Пароль<input id="lp" name="password" type="password" autocomplete="current-password" maxlength="256" required></label>
+    <button type="submit" id="lbtn">Войти</button>
+    <a id="lgoogle" class="google-btn" href="/auth/google" hidden><span class="g" aria-hidden="true">G</span>Войти через Google</a>
+    <p id="lerr" class="err" role="alert"></p>
+  </form>
+</section>
+
+<section id="main" hidden>
+  <header class="top">
+    <div class="row">
+      <a href="#/" class="brand small" title="Все фото"><span class="logo" aria-hidden="true"></span><span class="brand-name" id="title">Фотоархив</span></a>
+      <nav id="crumbs" class="crumbs" aria-label="Путь"></nav>
+      <div class="tools">
+        <select id="sort" aria-label="Сортировка">
+          <option value="new">Сначала новые</option>
+          <option value="old">Сначала старые</option>
+          <option value="name">По имени</option>
+        </select>
+        <span class="zoom"><button id="zout" class="icon" title="Мельче (Ctrl+колесо, щипок)" aria-label="Мельче">−</button><button id="zin" class="icon" title="Крупнее" aria-label="Крупнее">+</button></span>
+        <div class="menu-wrap">
+          <button id="menu-btn" class="icon" aria-haspopup="true" aria-expanded="false" aria-label="Меню">⋯</button>
+          <div id="menu" class="menu" hidden>
+            <label class="mi"><input type="checkbox" id="rec"> Фото из подпапок</label>
+            <label class="mi"><input type="checkbox" id="eco"> Экономия трафика <small id="eco-auto"></small></label>
+            <button class="mi" id="refresh" type="button">Пересканировать папки</button>
+            <a class="mi" id="admin-link" href="/admin" hidden>Админка</a>
+            <button class="mi" id="logout" type="button">Выйти</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="banner" class="banner" hidden>
+      <span id="banner-text"></span>
+      <button id="banner-btn" type="button" hidden></button>
+    </div>
+  </header>
+
+  <div id="folders" class="folders"></div>
+  <div id="summary" class="summary"></div>
+  <div id="grid" class="vgrid"></div>
+  <p id="empty" class="empty" hidden></p>
+  <div id="pill" class="pill" hidden></div>
+  <div id="scrub" class="scrub" hidden><div id="scrub-handle" class="scrub-handle"><span id="scrub-label"></span></div></div>
+</section>
+
+<div id="viewer" class="viewer" hidden>
+  <div class="v-top">
+    <button id="v-close" class="icon" type="button" aria-label="Закрыть">✕</button>
+    <div class="v-meta"><div id="v-name"></div><div id="v-date" class="dim"></div></div>
+    <a id="v-orig" class="icon" target="_blank" rel="noopener" title="Оригинал в новой вкладке" aria-label="Оригинал">⤢</a>
+    <a id="v-dl" class="icon" title="Скачать оригинал" aria-label="Скачать">⤓</a>
+  </div>
+  <div class="v-stage" id="v-stage">
+    <img id="v-low" alt="">
+    <img id="v-img" alt="">
+    <video id="v-video" controls playsinline preload="metadata" hidden></video>
+    <div id="v-spin" class="spin" hidden></div>
+  </div>
+  <button id="v-prev" class="v-nav prev" type="button" aria-label="Предыдущее">‹</button>
+  <button id="v-next" class="v-nav next" type="button" aria-label="Следующее">›</button>
+</div>
+
+</body>
+</html>

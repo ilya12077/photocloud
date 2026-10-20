@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Админка</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e8a33d'/%3E%3Ccircle cx='16' cy='17' r='6.5' fill='none' stroke='%23111' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/admin.js" defer></script>
+</head>
+<body class="adm">
+
+<section id="setup" class="login" hidden>
+  <form id="setup-form" class="login-card">
+    <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name">Первый запуск</span></div>
+    <p class="dim2">Создай администратора. Ссылка из консоли сервера одноразовая.</p>
+    <label>Логин<input id="su" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="32" required></label>
+    <label>Пароль (от 12 символов)<input id="sp" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label>
+    <label>Ещё раз<input id="sp2" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label>
+    <button type="submit">Создать</button>
+    <p id="serr" class="err" role="alert"></p>
+  </form>
+</section>
+
+<section id="denied" class="login" hidden>
+  <div class="login-card">
+    <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name">Админка</span></div>
+    <p id="denied-text">Нужно войти под администратором.</p>
+    <a class="btn" href="/">На главную</a>
+  </div>
+</section>
+
+<section id="panel" hidden>
+  <header class="top">
+    <div class="row">
+      <a href="/" class="brand small" title="К фото"><span class="logo" aria-hidden="true"></span><span class="brand-name">Админка</span></a>
+      <nav class="tabs" id="tabs">
+        <button data-tab="overview" class="on">Обзор</button>
+        <button data-tab="users">Пользователи</button>
+        <button data-tab="security">Сессии</button>
+        <button data-tab="settings">Настройки</button>
+        <button data-tab="logs">Журнал</button>
+      </nav>
+    </div>
+  </header>
+  <p id="toast" class="toast" hidden></p>
+
+  <div class="adm-body">
+    <div data-pane="overview">
+      <div class="cards" id="ov-cards"></div>
+      <div class="actions">
+        <button class="btn" id="act-reindex">Пересканировать папки</button>
+        <button class="btn" id="act-wake">Разбудить компьютер</button>
+        <button class="btn" id="act-notify">Тестовое уведомление</button>
+        <button class="btn" id="act-cache">Очистить кэш эскизов</button>
+      </div>
+      <h3>Конфигурация (из .env, только чтение)</h3>
+      <table class="kv" id="ov-config"></table>
+    </div>
+
+    <div data-pane="users" hidden>
+      <table class="list" id="users"><thead><tr><th>Логин</th><th>Роль</th><th>Google</th><th>Создан</th><th></th></tr></thead><tbody></tbody></table>
+      <h3>Новый пользователь</h3>
+      <form id="add-user" class="inline">
+        <input id="nu" placeholder="логин" autocapitalize="off" spellcheck="false" maxlength="32" required>
+        <input id="np" type="password" placeholder="пароль, от 12 символов" autocomplete="new-password" minlength="12" maxlength="256" required>
+        <select id="nr"><option value="user">пользователь</option><option value="admin">администратор</option></select>
+        <button class="btn primary">Добавить</button>
+      </form>
+    </div>
+
+    <div data-pane="security" hidden>
+      <h3>Активные сессии</h3>
+      <table class="list" id="sessions"><thead><tr><th>Пользователь</th><th>IP</th><th>Вход</th><th>Активность</th><th></th></tr></thead><tbody></tbody></table>
+      <h3>Заблокированные IP</h3>
+      <table class="list" id="locks"><thead><tr><th>IP</th><th>Осталось</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div data-pane="settings" hidden>
+      <form id="settings" class="form">
+        <label>Название<input id="s-name" maxlength="40" required></label>
+        <fieldset><legend>Уведомления на телефон</legend><div id="s-events" class="checks"></div></fieldset>
+        <label>Сервис уведомлений HA<input id="s-notify" placeholder="notify.mobile_app_…" spellcheck="false"></label>
+        <label>Сервис пробуждения ПК<input id="s-wake" placeholder="script.…" spellcheck="false"></label>
+        <label>Данные для сервиса пробуждения (JSON)<textarea id="s-wakedata" rows="2" spellcheck="false"></textarea></label>
+        <div class="grid3">
+          <label>Ждать пробуждения, с<input id="s-waket" type="number" min="10" max="1800"></label>
+          <label>Пересканировать папки, с<input id="s-ttl" type="number" min="30" max="86400"></label>
+          <label>Выход при бездействии, ч<input id="s-idle" type="number" min="1" max="2160"></label>
+        </div>
+        <button class="btn primary">Сохранить</button>
+      </form>
+    </div>
+
+    <div data-pane="logs" hidden>
+      <div class="inline">
+        <select id="log-kind"><option value="audit">Журнал безопасности</option><option value="server">Логи сервера</option></select>
+        <select id="log-level" hidden><option value="info">info+</option><option value="warning">warning+</option><option value="error">error</option></select>
+        <input id="log-filter" placeholder="фильтр…">
+        <button class="btn" id="log-refresh">Обновить</button>
+      </div>
+      <table class="list logs" id="log"><tbody></tbody></table>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
