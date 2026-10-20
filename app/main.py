@@ -12,7 +12,9 @@ import logging
 import mimetypes
 import re
 import secrets
+import random
 import time
+from collections import deque
 from pathlib import Path
 from urllib.parse import quote
 
@@ -26,10 +28,11 @@ from . import config
 from . import logs
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
 from .ha import HomeAssistant, clean
-from .images import LRUBytes, TooLarge, read_limited, render
-from . import video
+from .images import HEAD_BYTES, LRUBytes, TooLarge, embedded_heic, embedded_jpeg, finish, read_limited, render
+from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
 from .library import Library
+from .sched import PRIO_GRID, PRIO_VIEWER, Gone, Scheduler
 from .storage import make_storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -47,6 +50,8 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 storage = make_storage(S)
 library = Library(S.data_dir, S.tz, S.meta_threads)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
+TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
+transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
 google = GoogleAuth(S.google_client_id, S.google_client_secret, S.public_url) if S.google_client_id else None
 # одноразовый секрет для внутреннего канала ffmpeg -> приложение (только loopback)
 INTERNAL_TOKEN = secrets.token_urlsafe(32)
@@ -61,7 +66,7 @@ sessions = SessionStore(S.session_idle_hours * 3600, S.session_max_hours * 3600)
 limiter = LoginLimiter()
 thumb_cache = LRUBytes(S.thumb_cache_mb * 1024 * 1024)
 preview_cache = LRUBytes(S.preview_cache_mb * 1024 * 1024)
-render_sem = asyncio.Semaphore(S.workers)
+sched = Scheduler(S.workers)
 login_sem = asyncio.Semaphore(2)              # argon2 ест ~64 МБ RAM на проверку
 inflight: dict[tuple, asyncio.Future] = {}
 # файлы, которые не удалось декодировать: не мучаем ffmpeg/Pillow повторно 10 минут
@@ -127,7 +132,7 @@ SEC_HEADERS = [
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), interest-cohort=()"),
     (b"content-security-policy",
      b"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
-     b"media-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
+     b"media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
 ]
 if S.cookie_secure:
     SEC_HEADERS.append((b"strict-transport-security", b"max-age=31536000"))
@@ -173,7 +178,7 @@ async def lifespan(_app):
     global loop
     loop = asyncio.get_running_loop()
     if FFMPEG:
-        log.info("ffmpeg: %s", FFMPEG)
+        log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
     else:
         log.warning("ffmpeg не найден — у видео не будет эскизов (pip install imageio-ffmpeg)")
     if SETUP_TOKEN:
@@ -401,7 +406,7 @@ async def logout(request: Request):
 async def me(s: Session = Depends(require_user)):
     return no_store(JSONResponse({"user": s.user, "role": s.role, "name": S.public_name,  # type: ignore[attr-defined]
                                   "sizes": {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size},
-                                  "video": bool(FFMPEG)}))
+                                  "video": bool(FFMPEG), "transcode": TRANSCODE}))
 
 
 # ---------------------------------------------------------------- ПК и индекс
@@ -507,21 +512,88 @@ def _video_src(p) -> tuple[str, str]:
     return f"http://{host}:{S.port}/internal/raw/{p.id}?k={INTERNAL_TOKEN}", "http,tcp"
 
 
-def _produce(p, box: int, quality: int) -> bytes:
+def _produce(p, box: int, quality: int, tm: dict | None = None) -> bytes:
+    tm = {} if tm is None else tm
     if p.video:
         if not FFMPEG:
             raise ValueError("no ffmpeg")
         src, protocols = _video_src(p)
-        return render(video.frame(FFMPEG, src, protocols, p.ext, box, 90), box, quality, S.image_format)
-    rel = p.rel
+        t = time.perf_counter()
+        frame = video.frame(FFMPEG, src, protocols, p.ext, box, 90)
+        tm["decode"] = (time.perf_counter() - t) * 1000        # ffmpeg: чтение + декод кадра
+        return render(frame, box, quality, S.image_format, tm)
+    limit = S.max_decode_mb * 1024 * 1024
+    small = box <= S.thumb_size                 # для эскизов пробуем встроенный готовый эскиз
+    t = time.perf_counter()
     try:
-        with storage.open(rel) as f:
-            data = read_limited(f, S.max_decode_mb * 1024 * 1024)
+        with storage.open(p.rel) as f:
+            if small and p.ext in (".jpg", ".jpeg"):
+                # сначала только начало файла: по сети это в разы быстрее, чем тянуть все 4–10 МБ
+                head = f.read(HEAD_BYTES)
+                tm["read"] = (time.perf_counter() - t) * 1000
+                t1 = time.perf_counter()
+                emb = embedded_jpeg(head, box)
+                if emb is not None:
+                    tm["decode"] = (time.perf_counter() - t1) * 1000
+                    tm["src"] = 1                # 1 = встроенный эскиз
+                    return finish(emb, box, quality, S.image_format, tm, time.perf_counter())
+                t = time.perf_counter()
+                data = head + read_limited(f, max(0, limit - len(head)))
+                if len(data) > limit:
+                    raise TooLarge
+            else:
+                data = read_limited(f, limit)
     except TooLarge:
         raise
     except Exception as e:  # noqa: BLE001
         raise ConnectionError(type(e).__name__) from e
-    return render(data, box, quality, S.image_format)
+    tm["read"] = tm.get("read", 0) + (time.perf_counter() - t) * 1000
+    if small and p.ext in (".heic", ".heif"):
+        t1 = time.perf_counter()
+        emb = embedded_heic(data, box)
+        if emb is not None:
+            tm["decode"] = (time.perf_counter() - t1) * 1000
+            tm["src"] = 1
+            return finish(emb, box, quality, S.image_format, tm, time.perf_counter())
+    return render(data, box, quality, S.image_format, tm)
+
+
+def _fmt_class(p) -> str:
+    if p.video:
+        return "видео"
+    return {".jpg": "jpeg", ".jpeg": "jpeg", ".heic": "heic", ".heif": "heic", ".png": "png"}.get(p.ext, "другое")
+
+
+class Perf:
+    """Статистика генерации эскизов для админки (последние 2000 запросов)."""
+    recs: deque = deque(maxlen=2000)
+    hits = 0
+    misses = 0
+
+    @classmethod
+    def summary(cls) -> dict:
+        def med(vals):
+            vals = sorted(vals)
+            return round(vals[len(vals) // 2], 1) if vals else None
+
+        def p90(vals):
+            vals = sorted(vals)
+            return round(vals[min(len(vals) - 1, int(len(vals) * 0.9))], 1) if vals else None
+
+        groups: dict = {}
+        for r in cls.recs:
+            groups.setdefault((r["kind"], r["fmt"]), []).append(r)
+        rows = []
+        for (kind, fmt), rs in sorted(groups.items()):
+            row = {"kind": kind, "fmt": fmt, "n": len(rs), "kb": med([r["kb"] for r in rs])}
+            for st_ in ("queue", "read", "decode", "resize", "encode", "total"):
+                row[st_] = med([r.get(st_, 0) for r in rs])
+            row["total_p90"] = p90([r["total"] for r in rs])
+            row["embedded"] = round(sum(1 for r in rs if r.get("src")) / len(rs) * 100)
+            rows.append(row)
+        total = cls.hits + cls.misses
+        return {"rows": rows, "hit_ratio": round(cls.hits / total * 100) if total else None,
+                "requests": total, "workers": S.workers, "inflight": len(inflight), "waiting": sched.waiting}
 
 
 async def rendered(request: Request, kind: str, pid: str) -> Response:
@@ -535,15 +607,19 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     if time.time() - failed.get(key, 0) < FAILED_TTL:
         raise HTTPException(415)
     data = None
+    timing = ""
     try:
         for _ in range(3):
             data = cache.get(key)
             if data is not None:
+                Perf.hits += 1
+                timing = "cache;desc=hit"
                 break
             fut = inflight.get(key)
             if fut is not None:
                 try:
                     data = await asyncio.shield(fut)
+                    timing = "shared;desc=joined"
                     break
                 except ClientGone:
                     continue   # тот, кто генерировал, ушёл — попробуем сами
@@ -551,11 +627,24 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
             fut.add_done_callback(lambda f: f.cancelled() or f.exception())
             inflight[key] = fut
             try:
-                async with render_sem:
-                    # пока ждали очередь, пользователь мог проскроллить дальше — не тратим CPU
-                    if await request.is_disconnected():
-                        raise ClientGone
-                    data = await run_in_threadpool(_produce, p, box, q)
+                tq = time.perf_counter()
+                try:
+                    # просмотрщик — вне очереди; в сетке — сначала самые свежие запросы
+                    await sched.acquire(PRIO_GRID if kind in "stm" else PRIO_VIEWER, request)
+                except Gone:
+                    raise ClientGone from None
+                try:
+                    tm = {"queue": (time.perf_counter() - tq) * 1000}
+                    t0 = time.perf_counter()
+                    data = await run_in_threadpool(_produce, p, box, q, tm)
+                    tm["total"] = (time.perf_counter() - t0) * 1000
+                finally:
+                    sched.release()
+                Perf.misses += 1
+                Perf.recs.append({"kind": kind, "fmt": _fmt_class(p), "kb": len(data) / 1024, **tm})
+                # видно в браузере: DevTools -> Network -> запрос -> Timing
+                timing = ", ".join(f"{k};dur={v:.1f}" for k, v in tm.items() if k != "src") + \
+                    (", src;desc=embedded" if tm.get("src") else "")
                 cache.put(key, data)
                 fut.set_result(data)
                 break
@@ -574,7 +663,9 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
         raise HTTPException(503, "pc") from None
     except (UnidentifiedImageError, Image.DecompressionBombWarning, Image.DecompressionBombError,
             OSError, ValueError, SyntaxError, MemoryError, video.subprocess.TimeoutExpired) as e:
-        log.info("не удалось декодировать %s (%s): %s", pid, p.name, type(e).__name__)
+        # одну и ту же неудачу видят все, кто ждал этот эскиз, — в лог пишем один раз
+        if time.time() - failed.get(key, 0) > 2:
+            log.info("не удалось декодировать %s (%s): %s %s", pid, p.name, type(e).__name__, str(e)[:160])
         if len(failed) > 5000:
             failed.clear()
         failed[key] = time.time()
@@ -584,7 +675,7 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     v = request.query_params.get("v")
     cc = "private, max-age=31536000, immutable" if v == str(int(p.mtime)) else "private, max-age=60"
     return Response(data, media_type="image/webp" if S.image_format == "webp" else "image/jpeg",
-                    headers={"cache-control": cc})
+                    headers={"cache-control": cc, "server-timing": timing})
 
 
 def _size(f) -> int:
@@ -650,6 +741,70 @@ async def image(request: Request, kind: str = PathParam(pattern=r"^[stmep]$"),
                 pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
     """s/t/m — эскизы 240/400/900, e/p — превью 1280/2048 (размеры настраиваются)."""
     return await rendered(request, kind, pid)
+
+
+# ---------------------------------------------------------------- видео: HLS на лету
+
+def _vid(pid: str):
+    p = library.get(pid)
+    if p is None or not p.video:
+        raise HTTPException(404)
+    if not TRANSCODE:
+        raise HTTPException(404, "transcode off")
+    return p
+
+
+async def _duration(p) -> float:
+    k = f"{p.id}:{int(p.mtime)}:{p.size}"
+    if k not in transcoder.durations:
+        src, prot = _video_src(p)
+        try:
+            transcoder.durations[k] = await asyncio.to_thread(
+                transcode.probe_duration, FFMPEG, src, prot, video.DEMUXER[p.ext])
+        except Exception:  # noqa: BLE001
+            transcoder.durations[k] = None
+        if len(transcoder.durations) > 5000:
+            transcoder.durations.clear()
+    d = transcoder.durations.get(k)
+    if not d:
+        raise HTTPException(415, "no duration")
+    return d
+
+
+@app.get("/vid/{pid}/{profile}/index.m3u8")
+async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathParam(pattern=r"^(eco|hq)$"),
+                       _: Session = Depends(require_user)):
+    p = _vid(pid)
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
+    d = await _duration(p)
+    body = transcode.playlist(d, lambda i: f"{i}.ts?v={int(p.mtime)}")
+    return Response(body, media_type="application/vnd.apple.mpegurl", headers={"cache-control": "no-cache"})
+
+
+@app.get("/vid/{pid}/{profile}/{n}.ts")
+async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
+                      profile: str = PathParam(pattern=r"^(eco|hq)$"), n: int = PathParam(ge=0, le=100000),
+                      _: Session = Depends(require_user)):
+    p = _vid(pid)
+    d = await _duration(p)
+    if n * transcode.SEG >= d:
+        raise HTTPException(404)
+    src, prot = _video_src(p)
+    dem = video.DEMUXER[p.ext]
+
+    def maker(i):
+        return lambda: transcode.segment(FFMPEG, src, prot, dem, i, d, profile)
+    key = lambda i: (pid, int(p.mtime), p.size, profile, i)  # noqa: E731
+    try:
+        data = await transcoder.get(key(n), maker(n))
+    except ValueError:
+        raise HTTPException(415) from None
+    except Exception:  # noqa: BLE001
+        raise HTTPException(503, "pc") from None
+    if (n + 1) * transcode.SEG < d:
+        transcoder.prefetch(key(n + 1), maker(n + 1))     # следующий кусок — заранее
+    return Response(data, media_type="video/mp2t", headers={"cache-control": "private, max-age=3600"})
 
 
 @app.get("/internal/raw/{pid}")
@@ -892,6 +1047,52 @@ async def admin_cache_clear(request: Request, s: Session = Depends(require_admin
     preview_cache.clear()
     audit("cache_clear", s.user, ip_of(request))
     return no_store(JSONResponse({"ok": True}))
+
+
+@app.get("/api/admin/perf")
+async def admin_perf(_: Session = Depends(require_admin)):
+    return no_store(JSONResponse(Perf.summary()))
+
+
+@app.post("/api/admin/bench", dependencies=[Depends(require_csrf)])
+async def admin_bench(_: Session = Depends(require_admin)):
+    """Генерирует эскизы для случайных файлов каждого типа (мимо кэша) и меряет этапы.
+    Отдельно — сколько файлов в секунду выдаёт сервер, если грузить все потоки сразу."""
+    if not await PC.is_up():
+        return _bad("компьютер выключен", 409)
+    by_fmt: dict = {}
+    for p in library.by_id.values():
+        by_fmt.setdefault(_fmt_class(p), []).append(p)
+    sample = []
+    for fmt, ps in by_fmt.items():
+        sample += [(fmt, p) for p in random.sample(ps, min(6, len(ps)))]
+    results = []
+    for fmt, p in sample:                       # по одному — чистые времена этапов
+        tm: dict = {}
+        t = time.perf_counter()
+        try:
+            async with sched.slot(PRIO_GRID):
+                data = await run_in_threadpool(_produce, p, S.thumb_small_size, S.thumb_quality, tm)
+            tm["total"] = (time.perf_counter() - t) * 1000
+            results.append({"fmt": fmt, "name": p.name, "mb": round(p.size / 1048576, 1),
+                            "kb": round(len(data) / 1024, 1), **{k: round(v, 1) for k, v in tm.items()}})
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).strip()
+            results.append({"fmt": fmt, "name": p.name,
+                            "error": type(e).__name__ + (f": {msg[:120]}" if msg else "")})
+    # параллельно: N файлов на всех потоках
+    jpegs = [p for p in by_fmt.get("jpeg", []) or list(library.by_id.values()) if not p.video][:400]
+    par = random.sample(jpegs, min(S.workers * 6, len(jpegs)))
+
+    async def one(p):
+        async with sched.slot(PRIO_GRID):
+            await run_in_threadpool(_produce, p, S.thumb_small_size, S.thumb_quality, {})
+    t = time.perf_counter()
+    await asyncio.gather(*(one(p) for p in par), return_exceptions=True)
+    dt = time.perf_counter() - t
+    return no_store(JSONResponse({"items": results, "workers": S.workers,
+                                  "parallel": {"files": len(par), "sec": round(dt, 2),
+                                               "per_sec": round(len(par) / dt, 1) if dt else None}}))
 
 
 @app.get("/api/admin/logs")

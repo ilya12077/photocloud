@@ -247,7 +247,8 @@ const origUrl = (ph, dl) => `/img/o/${encodeURIComponent(ph[0])}${dl ? '?dl=1' :
 
 function thumbKind() {
   // сколько реальных пикселей занимает плитка -> ближайший размер эскиза
-  const dpr = Math.min(window.devicePixelRatio || 1, eco() ? 1.5 : 3);
+  // плотность экрана больше 2 на глаз не видна в мелких плитках, а файлы и декод — в разы тяжелее
+  const dpr = Math.min(window.devicePixelRatio || 1, eco() ? 1.5 : 2);
   const px = L.tileH * dpr;
   if (px <= Z.sizes.s * 1.15) return 's';
   if (px <= Z.sizes.t * 1.15) return 't';
@@ -383,11 +384,12 @@ function scrollToIndex(i, offset = 0) {
 function draw(force) {
   if ($('main').hidden || !st.lib) return;
   const y = window.scrollY, gt = gridTop(), vh = window.innerHeight;
-  const dy = Math.abs(y - L.lastY); L.lastY = y;
-  // быстрая прокрутка (ползунок, «швырок»): картинки не грузим, пока не остановимся
-  L.fast = !force && dy > vh * 1.5;
+  L.lastY = y;
+  // картинки грузим прямо во время прокрутки; пауза только пока тащат ползунок по датам
+  // (там за кадр пролетают тысячи строк, и запросы были бы впустую)
+  L.fast = L.scrubbing;
   clearTimeout(L.idleT);
-  L.idleT = setTimeout(() => { L.fast = false; loadVisible(); }, 120);
+  if (L.fast) L.idleT = setTimeout(() => { L.fast = false; loadVisible(true); }, 120);
 
   const y0 = y - gt - vh * BUFFER, y1 = y - gt + vh * (1 + BUFFER);
   const a = firstRowAt(Math.max(0, y0));
@@ -397,7 +399,15 @@ function draw(force) {
     if (!L.rendered.has(k)) { const node = buildRow(L.rows[k]); L.rendered.set(k, node); $('grid').append(node); }
   }
   for (const [k, node] of L.rendered) if (!keep.has(k)) { cancelImgs(node); node.remove(); L.rendered.delete(k); }
-  if (!L.fast) loadVisible();
+  if (!L.fast) {
+    loadVisible(false);
+    clearTimeout(L.bufT); L.bufT = setTimeout(() => loadVisible(true), 200);
+  }
+  // недогруженные плитки, уехавшие далеко за экран, отменяем сразу — освобождаем очередь
+  for (const [, node] of L.rendered) {
+    const r = node.getBoundingClientRect();
+    if (r.bottom < -vh * 0.5 || r.top > vh * 1.5) cancelImgs(node);
+  }
   pill(a);
 }
 
@@ -424,9 +434,21 @@ function buildRow(r) {
   return row;
 }
 
-function loadVisible() {
+function loadVisible(withBuffer) {
   if (L.fast) return;
-  for (const [, node] of L.rendered) for (const img of node.querySelectorAll('img')) if (!img.getAttribute('src')) img.src = img.dataset.src;
+  // во время прокрутки запрашиваем только то, что на экране; запас сверху/снизу — когда
+  // прокрутка замрёт на 200 мс. Иначе сервер тратит время на то, мимо чего уже пролистали.
+  const vh = window.innerHeight, margin = withBuffer ? vh * BUFFER : vh * 0.25;
+  for (const [, node] of L.rendered) {
+    const r = node.getBoundingClientRect();
+    if (r.bottom < -margin || r.top > vh + margin) continue;
+    const onScreen = r.bottom > 0 && r.top < vh;
+    for (const img of node.querySelectorAll('img')) {
+      if (img.getAttribute('src')) continue;
+      img.fetchPriority = onScreen ? 'high' : 'low';
+      img.src = img.dataset.src;
+    }
+  }
 }
 
 function cancelImgs(node) {
@@ -474,7 +496,7 @@ function updateScrub() {
 }
 (() => {
   const h = $('scrub-handle'); let drag = false;
-  h.addEventListener('pointerdown', (e) => { drag = true; h.setPointerCapture(e.pointerId); h.classList.add('drag'); e.preventDefault(); });
+  h.addEventListener('pointerdown', (e) => { drag = true; L.scrubbing = true; h.setPointerCapture(e.pointerId); h.classList.add('drag'); e.preventDefault(); });
   h.addEventListener('pointermove', (e) => {
     if (!drag) return;
     const { top, span } = scrubRange();
@@ -484,7 +506,7 @@ function updateScrub() {
     const r = L.rows[ri];
     $('scrub-label').textContent = r && st.sort !== 'name' ? `${MONTHS_SHORT[r.month % 12]} ${Math.floor(r.month / 12)}` : '';
   });
-  const end = () => { drag = false; h.classList.remove('drag'); $('scrub-label').textContent = ''; };
+  const end = () => { drag = false; L.scrubbing = false; h.classList.remove('drag'); $('scrub-label').textContent = ''; L.fast = false; loadVisible(true); };
   h.addEventListener('pointerup', end); h.addEventListener('pointercancel', end);
 })();
 
@@ -568,12 +590,59 @@ function openViewer(i) {
 }
 
 function stopVideo() {
-  $('v-note').hidden = true; const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true; }
+  $('v-note').hidden = true; $('v-origwrap').hidden = true;
+  if (V.hls) { V.hls.destroy(); V.hls = null; }
+  const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true;
+}
+
+// HLS: Safari/iOS играют сами, остальным помогает hls.js (грузится только при первом видео)
+let hlsLib = null;
+function loadHls() {
+  if (!hlsLib) hlsLib = new Promise((ok, fail) => {
+    const s = document.createElement('script'); s.src = '/static/vendor/hls.light.min.js';
+    s.onload = () => ok(window.Hls); s.onerror = fail; document.head.append(s);
+  });
+  return hlsLib;
+}
+
+async function playVideo(ph, tok, startAt) {
+  const v = $('v-video');
+  const canTranscode = st.me && st.me.transcode;
+  const orig = !canTranscode || store('pc.vorig') === '1';
+  $('v-origwrap').hidden = !canTranscode; $('v-origchk').checked = orig;
+  $('v-note').hidden = !(orig && (ph[6] & F_NOPLAY));
+  if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
+  if (orig) { v.src = origUrl(ph, false); return; }
+  const url = `/vid/${encodeURIComponent(ph[0])}/${eco() ? 'eco' : 'hq'}/index.m3u8?v=${ph[4]}`;
+  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; return; }
+  try {
+    const Hls = await loadHls();
+    if (tok !== V.token) return;
+    if (!Hls || !Hls.isSupported()) { v.src = origUrl(ph, false); return; }
+    V.hls = new Hls({ enableWorker: false, maxBufferLength: 20, backBufferLength: 30 });
+    V.hls.on(Hls.Events.ERROR, (_e, d) => {
+      if (!d.fatal || tok !== V.token) return;
+      // перекодированный поток не пошёл — показываем оригинал, чтобы видео всё равно открылось
+      if (V.hls) { V.hls.destroy(); V.hls = null; }
+      v.src = origUrl(ph, false);
+    });
+    V.hls.loadSource(url); V.hls.attachMedia(v);
+  } catch (_) { v.src = origUrl(ph, false); }
+}
+
+$('v-origchk').addEventListener('change', (e) => {
+  store('pc.vorig', e.target.checked ? '1' : '0');
+  const ph = st.list[V.i]; if (!ph) return;
+  const v = $('v-video'), t = v.currentTime, playing = !v.paused;
+  if (V.hls) { V.hls.destroy(); V.hls = null; }
+  v.removeAttribute('src'); v.load();
+  playVideo(ph, V.token, t).then(() => { if (playing) v.play().catch(() => {}); });
+});
 
 function show(i) {
   if (i < 0 || i >= st.list.length) return;
   V.i = i; const ph = st.list[i]; const tok = ++V.token;
-  const isVideo = !!(ph[6] & F_VIDEO) && !(ph[6] & F_NOPLAY);
+  const isVideo = !!(ph[6] & F_VIDEO) && (!(ph[6] & F_NOPLAY) || (st.me && st.me.transcode));
   $('v-name').textContent = ph[2];
   const fromMeta = ph[6] & F_TAKEN, fromName = ph[6] & F_NAME;
   let meta = (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Изменён ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
@@ -588,9 +657,9 @@ function show(i) {
   hi.classList.remove('ok'); hi.removeAttribute('src');
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
   if (isVideo) {
-    // оригинал без перекодирования: на медленном канале лучше скачать
-    const v = $('v-video'); v.hidden = false; v.poster = imgUrl('m', ph); v.src = origUrl(ph, false);
+    const v = $('v-video'); v.hidden = false; v.poster = imgUrl('m', ph);
     low.style.visibility = 'hidden'; $('v-spin').hidden = true;
+    playVideo(ph, tok, 0);
   } else {
     $('v-spin').hidden = false;
     const pre = new Image();

@@ -139,6 +139,9 @@ class Settings:
     data_dir: Path = PROJECT_ROOT / "data"
     tz: object = None
     ffmpeg: str = ""
+    transcode: bool = True
+    transcode_cache_mb: int = 256
+    transcode_slots: int = 1
     meta_threads: int = 8
 
     # производительность
@@ -245,6 +248,9 @@ def load() -> Settings:
     except Exception:  # noqa: BLE001
         raise ConfigError(f"TIMEZONE: неизвестный часовой пояс {tzname!r} (на Windows нужен пакет tzdata)") from None
     s.ffmpeg = _get("FFMPEG", "") or ""
+    s.transcode = _bool("TRANSCODE", True)
+    s.transcode_cache_mb = _int("TRANSCODE_CACHE_MB", 256, 16, 4096)
+    s.transcode_slots = _int("TRANSCODE_SLOTS", 1, 1, 8)
     s.meta_threads = _int("META_THREADS", 8, 1, 32)
 
     s.image_format = (_get("IMAGE_FORMAT", "webp") or "").lower()
@@ -261,7 +267,9 @@ def load() -> Settings:
     s.preview_cache_mb = _int("PREVIEW_CACHE_MB", 64, 0, 4096)
     s.max_decode_mb = _int("MAX_DECODE_MB", 150, 1, 2048)
     # по умолчанию на 1 ядро меньше, чем есть (но не больше 3) — чтобы HA рядом не тормозил
-    s.workers = _int("WORKERS", max(1, min(3, (os.cpu_count() or 2) - 1)), 1, 32)
+    # декодирование в Pillow отпускает GIL, так что потоки реально работают параллельно;
+    # по умолчанию ядер − 1 (одно оставляем остальным сервисам), но не больше 8
+    s.workers = _int("WORKERS", max(1, min(8, (os.cpu_count() or 2) - 1)), 1, 32)
     s.index_ttl = _int("INDEX_TTL", 600, 30, 86400)
     load_overrides(s)   # то, что поменяли в админке, важнее .env
     return s

@@ -65,10 +65,11 @@
 
 <div id="viewer" class="viewer" hidden>
   <div class="v-top">
-    <button id="v-close" class="icon" type="button" aria-label="Закрыть">✕</button>
-    <div class="v-meta"><div id="v-name"></div><div id="v-date" class="dim"></div></div>
     <a id="v-orig" class="icon" target="_blank" rel="noopener" title="Оригинал в новой вкладке" aria-label="Оригинал">⤢</a>
     <a id="v-dl" class="icon" title="Скачать оригинал" aria-label="Скачать">⤓</a>
+    <label class="v-origchk" id="v-origwrap" hidden title="Смотреть исходный файл без перекодирования (тяжелее для канала)"><input type="checkbox" id="v-origchk"> Оригинал</label>
+    <div class="v-meta"><div id="v-name"></div><div id="v-date" class="dim"></div></div>
+    <button id="v-close" class="icon" type="button" aria-label="Закрыть">✕</button>
   </div>
   <div class="v-stage" id="v-stage">
     <div id="v-zoom" class="v-zoom">

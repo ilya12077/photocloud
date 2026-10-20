@@ -34,28 +34,71 @@ def _exists(p: str) -> bool:
     return Path(p).is_file()
 
 
+# Варианты вывода кадра. Формат пикселей задаём ровно тот, что родной для кодировщика:
+# ffmpeg 7.1 больше не подменяет его сам и падает с -22 (Invalid argument), если попросить
+# «чужой» (например rgb24 для bmp или 10-битный yuv для mjpeg). Сжатие в WebP делает Pillow.
+_OUTPUTS = [
+    ("bgr24", "bmp", b"BM"),           # без сжатия — быстрее всего
+    ("rgb24", "png", b"\x89PNG"),       # запасной вариант
+]
+_preferred = 0                         # вариант вывода, который сработал последним
+
+# Способы достать кадр, от быстрого к надёжному:
+#   fast  — только ключевые кадры, 1-я секунда (на 4K HEVC ~0.2 с вместо ~0.8 с)
+#   exact — честный поиск 1-й секунды (декодирует промежуточные кадры)
+#   first — самый первый кадр без поиска (короткие ролики, странные таймстемпы)
+# У части телефонных роликов (B-кадры + edit list) «только ключевые» не даёт ни одного
+# кадра — тогда идём дальше. Если fast подряд не срабатывает, начинаем сразу с exact.
+_MODES = {
+    "fast": ["-skip_frame", "nokey", "-ss", "1"],
+    "exact": ["-ss", "1"],
+    "first": [],
+}
+_fast_fail = 0
+
+
+def _signed(code: int) -> int:
+    """Windows отдаёт код возврата беззнаковым: 4294967274 == -22."""
+    return code - (1 << 32) if code > 0x7FFFFFFF else code
+
+
 def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: int) -> bytes:
-    """Кадр (BMP) с длинной стороной <= box. src — 'file:<путь>' или http-URL."""
+    """Кадр (BMP/PNG) с длинной стороной <= box. src — 'file:<путь>' или http-URL."""
+    global _preferred, _fast_fail
     fmt = DEMUXER.get(ext)
     if not fmt:
         raise ValueError("unsupported video")
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    for seek in ("1", "0"):                             # короче секунды — берём первый кадр
-        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
-               "-protocol_whitelist", protocols, "-f", fmt,
-               "-ss", seek, "-i", src, "-map", "0:v:0", "-frames:v", "1",
-               # кадр отдаём несжатым BMP в RGB: mjpeg-кодировщик ffmpeg 7.x отказывается от
-               # 10-битного HDR/HEVC с телефонов и «неполного» диапазона цветов (ошибка -22),
-               # а сжатие в WebP всё равно делает Pillow
-               "-vf", f"scale={box}:{box}:force_original_aspect_ratio=decrease,format=rgb24",
-               "-f", "image2", "-c:v", "bmp", "pipe:1"]
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
-                           creationflags=flags)
-        if r.returncode == 0 and r.stdout[:2] == b"BM":
-            return r.stdout
-    if r.returncode < 0 or r.returncode > 128:
-        log.warning("ffmpeg аварийно завершился (код %s) на %s — попробуй другую сборку ffmpeg (FFMPEG=...)",
-                    r.returncode, ext)
-    else:
-        log.info("ffmpeg не смог взять кадр: %s", r.stderr[-300:].decode("utf-8", "replace").strip())
+    modes = ["exact", "first"] if _fast_fail >= 5 else ["fast", "exact", "first"]
+    order = [_preferred] + [i for i in range(len(_OUTPUTS)) if i != _preferred]
+    last = None
+    for oi in order:
+        pix, codec, magic = _OUTPUTS[oi]
+        for mode in modes:
+            cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                   "-protocol_whitelist", protocols, "-threads", "1",
+                   "-f", fmt, *_MODES[mode], "-i", src,
+                   "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
+                   "-vf", f"scale={box}:{box}:force_original_aspect_ratio=decrease:flags=bilinear,format={pix}",
+                   "-f", "image2pipe", "-c:v", codec, "pipe:1"]
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                               creationflags=flags)
+            if r.returncode == 0 and r.stdout[:len(magic)] == magic:
+                if oi != _preferred:
+                    log.info("кадры видео: переключился на вывод %s/%s", codec, pix)
+                    _preferred = oi
+                if mode == "fast":
+                    _fast_fail = max(0, _fast_fail - 1)
+                elif "fast" in modes:
+                    _fast_fail += 1
+                    if _fast_fail == 5:
+                        log.info("кадры видео: быстрый способ не подходит этим файлам, использую точный")
+                return r.stdout
+            last = r
+            if r.returncode != 0:
+                break                       # ошибка формата вывода — пробуем следующий вариант вывода
+            # код 0, но кадра нет — пробуем следующий способ
+    code = _signed(last.returncode)
+    err = last.stderr[-400:].decode("utf-8", "replace").replace("\r", "").strip().replace("\n", " | ")
+    log.warning("ffmpeg не смог взять кадр из %s (код %s): %s", ext, code, err or "—")
     raise ValueError("no frame")

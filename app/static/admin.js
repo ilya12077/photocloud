@@ -54,6 +54,7 @@ async function boot() {
   let me;
   try { me = await api('/api/me'); } catch (_) { $('denied').hidden = false; return; }
   if (me.role !== 'admin') { $('denied-text').textContent = 'У этой учётной записи нет прав администратора.'; $('denied').hidden = false; return; }
+  if (me.name) { $('adm-title').textContent = me.name; document.title = `Админка · ${me.name}`; }
   $('panel').hidden = false;
   showTab('overview');
 }
@@ -73,7 +74,7 @@ function showSetup(token) {
 
 // ================================================================== вкладки
 
-const loaders = { overview: loadOverview, users: loadUsers, security: loadSecurity, settings: loadSettings, logs: loadLogs };
+const loaders = { overview: loadOverview, users: loadUsers, security: loadSecurity, settings: loadSettings, perf: loadPerf, logs: loadLogs };
 function showTab(name) {
   for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.tab === name);
   for (const p of document.querySelectorAll('[data-pane]')) p.hidden = p.dataset.pane !== name;
@@ -215,6 +216,47 @@ $('settings').addEventListener('submit', async (e) => {
   const r = await act(() => api('/api/admin/settings', body));
   if (r) toast(r.changed.length ? 'Сохранено: ' + r.changed.length : 'Без изменений');
 });
+
+// ================================================================== скорость
+
+const KIND = { s: 'эскиз 240', t: 'эскиз 400', m: 'эскиз 900', e: 'превью 1280', p: 'превью 2048' };
+const ms = (v) => (v == null ? '—' : v >= 1000 ? (v / 1000).toFixed(1) + ' с' : Math.round(v) + '');
+
+async function loadPerf() {
+  const r = await act(() => api('/api/admin/perf')); if (!r) return;
+  $('perf-meta').textContent = `потоков: ${r.workers} · из кэша: ${r.hit_ratio ?? '—'}% из ${r.requests} · сейчас в работе: ${r.inflight}`;
+  const tb = $('perf').tBodies[0];
+  if (!r.rows.length) { const tr = el('tr'); const td = el('td', 'dim2', 'пока нет данных — полистай ленту или запусти тест'); td.colSpan = 11; tr.append(td); tb.replaceChildren(tr); return; }
+  tb.replaceChildren(...r.rows.map((x) => {
+    const tr = el('tr');
+    for (const v of [KIND[x.kind] || x.kind, x.fmt, x.n, ms(x.queue), ms(x.read), ms(x.decode), ms(x.resize), ms(x.encode), ms(x.total), ms(x.total_p90), x.kb == null ? '—' : x.kb.toFixed(1)]) tr.append(el('td', null, String(v)));
+    return tr;
+  }));
+}
+$('perf-refresh').onclick = loadPerf;
+
+$('bench-run').onclick = async () => {
+  $('bench-run').disabled = true; $('bench-verdict').textContent = 'Идёт тест…';
+  const r = await act(() => api('/api/admin/bench', {}));
+  $('bench-run').disabled = false;
+  if (!r) { $('bench-verdict').textContent = ''; return; }
+  $('bench').tBodies[0].replaceChildren(...r.items.map((x) => {
+    const tr = el('tr');
+    const cells = x.error ? [x.fmt, x.name, '', 'ошибка: ' + x.error, '', '', '', '', ''] :
+      [x.fmt, x.name, x.mb, ms(x.read), ms(x.decode), ms(x.resize), ms(x.encode), ms(x.total), x.kb];
+    for (const v of cells) tr.append(el('td', null, String(v)));
+    return tr;
+  }));
+  // вывод: какой этап съедает больше всего времени
+  const ok = r.items.filter((x) => !x.error);
+  const sum = (k) => ok.reduce((a, x) => a + (x[k] || 0), 0);
+  const parts = { 'чтение файла (диск/сеть)': sum('read'), 'декодирование исходника': sum('decode'), 'уменьшение': sum('resize'), 'сжатие в WebP': sum('encode') };
+  const all = Object.values(parts).reduce((a, b) => a + b, 0) || 1;
+  const top = Object.entries(parts).sort((a, b) => b[1] - a[1])[0];
+  $('bench-verdict').textContent = `Больше всего времени уходит на: ${top[0]} — ${Math.round(top[1] / all * 100)}%. ` +
+    `Все ${r.workers} потоков вместе: ${r.parallel.per_sec ?? '—'} эскизов/с (${r.parallel.files} файлов за ${r.parallel.sec} с).`;
+  loadPerf();
+};
 
 // ================================================================== журнал
 

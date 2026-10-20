@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import io
 import threading
+import time
 import warnings
 from collections import OrderedDict
 
-from PIL import Image, ImageFile, ImageOps
+from PIL import ExifTags, Image, ImageFile, ImageOps
 
 try:  # HEIC с айфонов
     from pillow_heif import register_heif_opener
@@ -64,26 +65,106 @@ def read_limited(f, limit: int) -> bytes:
     return data
 
 
-def render(data: bytes, box: int, quality: int, fmt: str = "webp") -> bytes:
-    """WebP/JPEG с длинной стороной <= box, с учётом EXIF-поворота, без метаданных."""
+_TRANSPOSE = {2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180, 4: Image.Transpose.FLIP_TOP_BOTTOM,
+              5: Image.Transpose.TRANSPOSE, 6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE,
+              8: Image.Transpose.ROTATE_90}
+HEAD_BYTES = 256 * 1024          # EXIF и заголовок JPEG почти всегда в первых десятках КБ
+
+
+def _aspect_ok(a: tuple, b: tuple) -> bool:
+    ra, rb = a[0] / a[1], b[0] / b[1]
+    return abs(ra - rb) / rb < 0.03          # эскиз с чёрными полосами или от другой картинки — мимо
+
+
+def embedded_jpeg(head: bytes, box: int):
+    """Готовый эскиз из EXIF (IFD1), который кладут телефоны и камеры. Обычно 160–512 px.
+    Декод занимает 1–3 мс вместо 50+ мс на полный JPEG. None — если нет или он мельче нужного."""
+    try:
+        with Image.open(io.BytesIO(head)) as im:
+            if im.format != "JPEG":
+                return None
+            size = im.size
+            raw = im.info.get("exif") or b""
+            ex = im.getexif()
+            orient = ex.get(0x0112, 1)
+            ifd1 = ex.get_ifd(ExifTags.IFD.IFD1)
+        off, ln = ifd1.get(0x0201), ifd1.get(0x0202)
+        if not (isinstance(off, int) and isinstance(ln, int)) or not (0 < ln <= 200_000):
+            return None
+        base = 6 if raw.startswith(b"Exif\0\0") else 0
+        tb = raw[base + off: base + off + ln]
+        if len(tb) != ln or tb[:2] != b"\xff\xd8":
+            return None
+        t = Image.open(io.BytesIO(tb))
+        t.load()
+        if max(t.size) < box * 0.9 or not _aspect_ok(t.size, size):
+            return None
+        t = t.convert("RGB")
+        if orient in _TRANSPOSE:                 # эскиз хранится без поворота
+            t = t.transpose(_TRANSPOSE[orient])
+        return t
+    except Exception:  # noqa: BLE001 — любой мусор в EXIF: просто идём полным путём
+        return None
+
+
+def embedded_heic(data: bytes, box: int):
+    """Встроенный эскиз HEIC (у iPhone ~320 px): ~30 мс вместо 1.5–2 с на полный декод."""
+    try:
+        import pillow_heif
+        h = pillow_heif.open_heif(io.BytesIO(data), convert_hdr_to_8bit=True)
+        img = h[0] if hasattr(h, "__getitem__") else h
+        sizes = img.info.get("thumbnails") or []
+        ok = [(sz, i) for i, sz in enumerate(sizes) if sz and sz >= box * 0.9]
+        if not ok:
+            return None
+        th = img.get_thumbnail(min(ok)[1]).to_pillow()   # libheif уже применил поворот
+        if not _aspect_ok(th.size, img.size):
+            return None
+        return th.convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def finish(im, box: int, quality: int, fmt: str, tm: dict | None, t_decoded: float) -> bytes:
+    """Уменьшение + сжатие уже декодированной картинки."""
+    t1 = t_decoded
+    im.thumbnail((box, box), Image.Resampling.LANCZOS if box <= 512 else Image.Resampling.BICUBIC)
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.getchannel("A"))
+        im = bg
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    t2 = time.perf_counter()
+    out = io.BytesIO()
+    if fmt == "webp":
+        # method 2: в 2–3 раза быстрее method 4, размер на эскизах почти тот же
+        im.save(out, "WEBP", quality=quality, method=2)
+    else:
+        im.save(out, "JPEG", quality=quality, optimize=False, progressive=box > 1000)
+    if tm is not None:
+        tm["resize"] = (t2 - t1) * 1000
+        tm["encode"] = (time.perf_counter() - t2) * 1000
+    return out.getvalue()
+
+
+def render(data: bytes, box: int, quality: int, fmt: str = "webp", tm: dict | None = None) -> bytes:
+    """WebP/JPEG с длинной стороной <= box, с учётом EXIF-поворота, без метаданных.
+    tm — словарь, куда пишутся длительности этапов (мс) для диагностики."""
+    t0 = time.perf_counter()
     with Image.open(io.BytesIO(data)) as im:
         if getattr(im, "n_frames", 1) > 1:
             im.seek(0)
-        # draft: JPEG декодируется сразу в 1/2..1/8 масштаба — в разы быстрее и меньше памяти
-        im.draft("RGB", (box, box))
+        # draft: JPEG декодируется сразу в 1/2..1/8 масштаба — в разы быстрее и меньше памяти.
+        # Просим ровно столько, чтобы ДЛИННАЯ сторона была >= box (а не обе), — так draft
+        # чаще берёт 1/8 вместо 1/4.
+        w, h = im.size
+        req = (box, max(1, box * h // w)) if w >= h else (max(1, box * w // h), box)
+        im.draft("RGB", req)
         im = ImageOps.exif_transpose(im)
-        im.thumbnail((box, box), Image.Resampling.LANCZOS if box <= 512 else Image.Resampling.BICUBIC)
-        if im.mode in ("RGBA", "LA", "P"):
-            im = im.convert("RGBA")
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            bg.paste(im, mask=im.getchannel("A"))
-            im = bg
-        elif im.mode != "RGB":
-            im = im.convert("RGB")
-        out = io.BytesIO()
-        if fmt == "webp":
-            # method: 4 для мелких (лучше сжатие), 2 для крупных (быстрее кодирование)
-            im.save(out, "WEBP", quality=quality, method=4 if box <= 1000 else 2)
-        else:
-            im.save(out, "JPEG", quality=quality, optimize=False, progressive=box > 1000)
-        return out.getvalue()
+        im.load()
+        t1 = time.perf_counter()
+        if tm is not None:
+            tm["decode"] = tm.get("decode", 0) + (t1 - t0) * 1000
+        return finish(im, box, quality, fmt, tm, t1)
