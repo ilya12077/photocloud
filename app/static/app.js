@@ -583,6 +583,7 @@ function show(i) {
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
+  resetZoom(false); VZ.kind = isVideo ? '' : previewKind(); VZ.tap = null;
   $('v-note').hidden = !(ph[6] & F_NOPLAY);
   hi.classList.remove('ok'); hi.removeAttribute('src');
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
@@ -607,7 +608,7 @@ function show(i) {
 
 function closeViewer(silent) {
   if ($('viewer').hidden) return;
-  stopVideo();
+  stopVideo(); resetZoom(false);
   $('viewer').hidden = true; document.body.style.overflow = '';
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;
   if (V.pushed && !silent) { V.pushed = false; history.back(); }
@@ -622,20 +623,183 @@ window.addEventListener('popstate', () => { if (!$('viewer').hidden) { V.pushed 
 $('v-close').addEventListener('click', () => closeViewer());
 $('v-prev').addEventListener('click', () => show(V.i - 1));
 $('v-next').addEventListener('click', () => show(V.i + 1));
-document.addEventListener('keydown', (e) => {
-  if ($('viewer').hidden) return;
-  if (e.key === 'Escape') closeViewer();
-  else if (e.key === 'ArrowLeft') show(V.i - 1);
-  else if (e.key === 'ArrowRight') show(V.i + 1);
-});
-let tx = 0, ty = 0;
-$('v-stage').addEventListener('touchstart', (e) => { tx = e.touches[0].clientX; ty = e.touches[0].clientY; }, { passive: true });
-$('v-stage').addEventListener('touchend', (e) => {
+// ================================================================== масштаб в просмотре
+// Щипок / растяжение, двойной тап или двойной клик, Ctrl+колесо (жест трекпада), перетаскивание.
+// Свайпы влево/вправо/вниз работают только при обычном масштабе.
+
+const VZ = { s: 1, tx: 0, ty: 0, pinch: null, pan: null, tap: null, moved: false, kind: '' };
+const MAX_ZOOM = 8;
+const stage = $('v-stage'), zoomEl = $('v-zoom');
+
+function zoomActive() { return !$('viewer').hidden && $('v-video').hidden; }
+
+function imgRect() {
+  // где лежит картинка внутри экрана при масштабе 1 (object-fit: contain)
+  const W = stage.clientWidth, H = stage.clientHeight;
+  const im = $('v-img').naturalWidth ? $('v-img') : $('v-low');
+  const iw = im.naturalWidth || W, ih = im.naturalHeight || H;
+  const k = Math.min(W / iw, H / ih);
+  const w = iw * k, h = ih * k;
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h, W, H };
+}
+
+function clampPan() {
+  const r = imgRect(), s = VZ.s;
+  const fit = (t, pos, len, view) => {
+    const size = len * s;
+    if (size <= view) return (view - size) / 2 - pos * s;              // меньше экрана — по центру
+    return clamp(t, view - (pos + len) * s, -pos * s);                  // больше — без пустых полей
+  };
+  VZ.tx = fit(VZ.tx, r.x, r.w, r.W);
+  VZ.ty = fit(VZ.ty, r.y, r.h, r.H);
+}
+
+function applyZoom(anim) {
+  zoomEl.classList.toggle('anim', !!anim);
+  zoomEl.style.transform = VZ.s === 1 ? '' : `translate(${VZ.tx}px, ${VZ.ty}px) scale(${VZ.s})`;
+  stage.classList.toggle('zoomed', VZ.s > 1);
+}
+
+function resetZoom(anim) { VZ.s = 1; VZ.tx = 0; VZ.ty = 0; applyZoom(anim); }
+
+function zoomAt(s, fx, fy, anim) {
+  // fx, fy — точка в координатах stage, которая остаётся под пальцем/курсором
+  s = clamp(s, 1, MAX_ZOOM);
+  VZ.tx = fx - (fx - VZ.tx) * (s / VZ.s);
+  VZ.ty = fy - (fy - VZ.ty) * (s / VZ.s);
+  VZ.s = s;
+  if (s <= 1.01) { resetZoom(anim); return; }
+  clampPan(); applyZoom(anim);
+}
+
+function stagePoint(cx, cy) { const b = stage.getBoundingClientRect(); return [cx - b.left, cy - b.top]; }
+
+function toggleZoom(cx, cy) {
+  const [fx, fy] = stagePoint(cx, cy);
+  if (VZ.s > 1) resetZoom(true); else zoomAt(2.5, fx, fy, true);
+  upgradeQuality();
+}
+
+// при сильном увеличении подгружаем картинку подробнее
+function upgradeQuality() {
+  const ph = st.list[V.i]; if (!ph || VZ.s < 1.6) return;
+  const ext = ph[2].slice(ph[2].lastIndexOf('.')).toLowerCase();
+  const browserCan = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
+  let want = VZ.kind === 'e' ? 'p' : '';
+  if (VZ.s >= 2.5 && !eco() && browserCan && ph[5] < 25 * 1024) want = 'o';   // оригинал до 25 МБ
+  if (!want || want === VZ.kind || (VZ.kind === 'o')) return;
+  const tok = V.token, hi = $('v-img');
+  const url = want === 'o' ? origUrl(ph, false) : imgUrl(want, ph);
+  const pre = new Image();
+  pre.onload = () => { if (tok === V.token) { hi.src = url; VZ.kind = want; } };
+  pre.src = url; VZ.kind = want;                 // помечаем сразу, чтобы не запрашивать повторно
+}
+
+const tdist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+const tmid = (t) => stagePoint((t[0].clientX + t[1].clientX) / 2, (t[0].clientY + t[1].clientY) / 2);
+
+stage.addEventListener('touchstart', (e) => {
+  VZ.lastTouch = Date.now();
   if (e.target.tagName === 'VIDEO') return;
-  const dx = e.changedTouches[0].clientX - tx, dy = e.changedTouches[0].clientY - ty;
+  if (e.touches.length === 2 && zoomActive()) {
+    const [mx, my] = tmid(e.touches);
+    VZ.pinch = { d0: tdist(e.touches) || 1, s0: VZ.s, mx, my, tx0: VZ.tx, ty0: VZ.ty };
+    VZ.pan = null; VZ.moved = true;
+  } else if (e.touches.length === 1) {
+    const t = e.touches[0];
+    VZ.pan = { x: t.clientX, y: t.clientY, tx0: VZ.tx, ty0: VZ.ty, t: Date.now() };
+    VZ.moved = false;
+  }
+}, { passive: true });
+
+stage.addEventListener('touchmove', (e) => {
+  if (e.target.tagName === 'VIDEO') return;
+  if (VZ.pinch && e.touches.length === 2) {
+    e.preventDefault();
+    const p = VZ.pinch, s = clamp(p.s0 * tdist(e.touches) / p.d0, 0.8, MAX_ZOOM);
+    const [mx, my] = tmid(e.touches);
+    // точка, бывшая под пальцами, остаётся под ними (и двигается вместе с ними)
+    VZ.tx = mx - (p.mx - p.tx0) * (s / p.s0);
+    VZ.ty = my - (p.my - p.ty0) * (s / p.s0);
+    VZ.s = s; applyZoom(false);
+  } else if (VZ.pan && e.touches.length === 1) {
+    const t = e.touches[0], dx = t.clientX - VZ.pan.x, dy = t.clientY - VZ.pan.y;
+    if (Math.abs(dx) + Math.abs(dy) > 8) VZ.moved = true;
+    if (VZ.s > 1) { e.preventDefault(); VZ.tx = VZ.pan.tx0 + dx; VZ.ty = VZ.pan.ty0 + dy; clampPan(); applyZoom(false); }
+  }
+}, { passive: false });
+
+stage.addEventListener('touchend', (e) => {
+  if (e.target.tagName === 'VIDEO') return;
+  if (VZ.pinch) {
+    if (e.touches.length < 2) {
+      VZ.pinch = null;
+      if (VZ.s < 1.05) resetZoom(true); else { clampPan(); applyZoom(true); upgradeQuality(); }
+      // оставшийся палец продолжает двигать картинку, а не листать
+      if (e.touches.length === 1) { const t = e.touches[0]; VZ.pan = { x: t.clientX, y: t.clientY, tx0: VZ.tx, ty0: VZ.ty, t: Date.now() }; VZ.moved = true; }
+    }
+    return;
+  }
+  if (!VZ.pan || e.touches.length) return;
+  const t = e.changedTouches[0], dx = t.clientX - VZ.pan.x, dy = t.clientY - VZ.pan.y;
+  const quick = Date.now() - VZ.pan.t < 300;
+  VZ.pan = null;
+  if (!VZ.moved && quick && zoomActive()) {
+    // двойной тап: второе касание рядом с первым в течение 300 мс
+    const now = Date.now();
+    if (VZ.tap && now - VZ.tap.t < 300 && Math.hypot(t.clientX - VZ.tap.x, t.clientY - VZ.tap.y) < 40) {
+      VZ.tap = null; toggleZoom(t.clientX, t.clientY); return;
+    }
+    VZ.tap = { t: now, x: t.clientX, y: t.clientY };
+    return;
+  }
+  if (VZ.s > 1) return;                                     // при увеличении свайпы не листают
   if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) show(V.i + (dx < 0 ? 1 : -1));
   else if (dy > 90 && Math.abs(dy) > Math.abs(dx) * 1.5) closeViewer();
 }, { passive: true });
+
+// мышь / трекпад
+stage.addEventListener('dblclick', (e) => {
+  // на тач-экранах браузер сам шлёт dblclick после двойного тапа — его уже обработали выше
+  if (Date.now() - (VZ.lastTouch || 0) < 1000) return;
+  if (zoomActive() && e.target.tagName !== 'VIDEO') toggleZoom(e.clientX, e.clientY);
+});
+stage.addEventListener('wheel', (e) => {
+  if (!zoomActive()) return;
+  e.preventDefault();
+  const [fx, fy] = stagePoint(e.clientX, e.clientY);
+  if (e.ctrlKey) {                                          // щипок трекпада / Ctrl+колесо
+    zoomAt(VZ.s * Math.exp(-e.deltaY * 0.01), fx, fy, false);
+    clearTimeout(VZ.wt); VZ.wt = setTimeout(upgradeQuality, 200);
+  } else if (VZ.s > 1) {                                    // прокрутка двигает увеличенную картинку
+    VZ.tx -= e.deltaX; VZ.ty -= e.deltaY; clampPan(); applyZoom(false);
+  }
+}, { passive: false });
+stage.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'mouse' || VZ.s <= 1 || e.button !== 0) return;
+  VZ.drag = { x: e.clientX, y: e.clientY, tx0: VZ.tx, ty0: VZ.ty };
+  stage.setPointerCapture(e.pointerId); stage.classList.add('drag');
+});
+stage.addEventListener('pointermove', (e) => {
+  if (!VZ.drag) return;
+  VZ.tx = VZ.drag.tx0 + e.clientX - VZ.drag.x; VZ.ty = VZ.drag.ty0 + e.clientY - VZ.drag.y; clampPan(); applyZoom(false);
+});
+const endDrag = () => { VZ.drag = null; stage.classList.remove('drag'); };
+stage.addEventListener('pointerup', endDrag); stage.addEventListener('pointercancel', endDrag);
+// Safari: свои жесты зума страницы в просмотрщике не нужны
+for (const ev of ['gesturestart', 'gesturechange']) document.addEventListener(ev, (e) => { if (!$('viewer').hidden) e.preventDefault(); }, { passive: false });
+window.addEventListener('resize', () => { if (VZ.s > 1) { clampPan(); applyZoom(false); } });
+
+document.addEventListener('keydown', (e) => {
+  if ($('viewer').hidden) return;
+  const cx = stage.clientWidth / 2, cy = stage.clientHeight / 2;
+  if (e.key === 'Escape') { if (VZ.s > 1) resetZoom(true); else closeViewer(); }
+  else if (e.key === 'ArrowLeft' && VZ.s === 1) show(V.i - 1);
+  else if (e.key === 'ArrowRight' && VZ.s === 1) show(V.i + 1);
+  else if ((e.key === '+' || e.key === '=') && zoomActive()) { zoomAt(VZ.s * 1.5, cx, cy, true); upgradeQuality(); }
+  else if (e.key === '-' && zoomActive()) zoomAt(VZ.s / 1.5, cx, cy, true);
+  else if (e.key === '0' && zoomActive()) resetZoom(true);
+});
 
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('main').hidden) poll(); });
 

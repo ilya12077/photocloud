@@ -118,7 +118,10 @@ a { color: inherit; text-decoration: none; }
 .v-meta { flex: 1; min-width: 0; font-size: 14px; }
 .v-meta div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dim { color: #aaa; font-size: 12px; }
-.v-stage { grid-row: 1 / -1; position: relative; overflow: hidden; }
+.v-stage { grid-row: 1 / -1; position: relative; overflow: hidden; touch-action: none; }
+.v-zoom { position: absolute; inset: 0; transform-origin: 0 0; will-change: transform; }
+.v-zoom.anim { transition: transform .22s ease-out; }
+.v-stage.zoomed { cursor: grab; } .v-stage.zoomed.drag { cursor: grabbing; }
 .v-stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
 #v-low { filter: blur(6px); transform: scale(1.01); }
 #v-img { opacity: 0; transition: opacity .15s; }
