@@ -426,7 +426,7 @@ function buildRow(r) {
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
     const img = el('img'); img.alt = ''; img.decoding = 'async'; img.dataset.src = imgUrl(kind, ph);
     img.onload = () => { img.classList.add('ok'); img.dataset.loaded = '1'; b.classList.remove('broken'); };
-    img.onerror = () => { if (img.getAttribute('src')) { b.classList.add('broken'); img.dataset.err = '1'; } };
+    img.onerror = () => { if (img.getAttribute('src')) thumbFailed(img); };
     b.append(img);
     if (ph[6] & F_VIDEO) b.append(el('span', 'vbadge', '▶'));
     else if (ph[6] & F_LIVE) b.append(el('span', 'lbadge'));
@@ -457,9 +457,36 @@ function cancelImgs(node) {
   for (const img of node.querySelectorAll('img')) if (!img.dataset.loaded && img.getAttribute('src')) img.removeAttribute('src');
 }
 
+// Эскиз не загрузился (компьютер был занят, сеть моргнула) — повторяем аккуратно:
+// через 1 / 3 / 8 с, не больше двух повторов одновременно и только для плиток,
+// которые всё ещё на экране. После трёх неудач показываем ⚠.
+const RETRY_DELAYS = [1000, 3000, 8000];
+const RQ = { queue: [], active: 0 };
+function thumbFailed(img) {
+  const n = +(img.dataset.tries || 0);
+  img.removeAttribute('src');
+  if (n >= RETRY_DELAYS.length) { img.parentElement.classList.add('broken'); img.dataset.err = '1'; return; }
+  img.dataset.tries = n + 1;
+  setTimeout(() => { RQ.queue.push(img); pumpRetries(); }, RETRY_DELAYS[n]);
+}
+function pumpRetries() {
+  while (RQ.active < 2 && RQ.queue.length) {
+    const img = RQ.queue.shift();
+    if (!img.isConnected || img.dataset.loaded) continue;       // плитка уже уехала из ленты
+    const r = img.getBoundingClientRect();
+    if (r.bottom < -innerHeight || r.top > innerHeight * 2) {    // далеко от экрана — загрузится, когда вернёмся
+      continue;
+    }
+    RQ.active++;
+    const done = () => { RQ.active--; img.removeEventListener('load', done); img.removeEventListener('error', done); pumpRetries(); };
+    img.addEventListener('load', done); img.addEventListener('error', done);
+    img.src = img.dataset.src;
+  }
+}
+
 function retryBroken() {
   for (const [, node] of L.rendered) for (const img of node.querySelectorAll('img[data-err]')) {
-    delete img.dataset.err; img.parentElement.classList.remove('broken'); img.src = img.dataset.src + '&r=' + Date.now();
+    delete img.dataset.err; delete img.dataset.tries; img.parentElement.classList.remove('broken'); img.src = img.dataset.src;
   }
 }
 

@@ -151,8 +151,8 @@ def finish(im, box: int, quality: int, fmt: str, tm: dict | None, t_decoded: flo
     t2 = time.perf_counter()
     out = io.BytesIO()
     if fmt == "webp":
-        # method 2: в 2–3 раза быстрее method 4, размер на эскизах почти тот же
-        im.save(out, "WEBP", quality=quality, method=2)
+        # эскизы: method 2; превью (крупные): method 0 — почти вдвое быстрее, размер тот же
+        im.save(out, "WEBP", quality=quality, method=2 if box <= 1000 else 0)
     else:
         im.save(out, "JPEG", quality=quality, optimize=False, progressive=box > 1000)
     if tm is not None:
