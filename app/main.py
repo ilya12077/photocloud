@@ -444,6 +444,8 @@ class PC:
     checked = 0.0
     wake_at = 0.0
     wake_notified = False
+    revived = False      # ПК снова в сети — перечитать папки и дочитать даты
+    checked_once = False
     _lock = asyncio.Lock()
 
     @classmethod
@@ -451,8 +453,11 @@ class PC:
         async with cls._lock:
             if time.time() - cls.checked > 3:
                 was = cls.up
-                cls.up = await run_in_threadpool(storage.reachable)
+                cls.up = await _probe()
                 cls.checked = time.time()
+                if cls.up and not was and cls.checked_once:
+                    cls.revived = True
+                cls.checked_once = True
                 if was and not cls.up and hasattr(storage, "reset"):
                     # в отдельном потоке и без ожидания: статус и кнопка включения не должны зависеть от сброса
                     threading.Thread(target=storage.reset, name="smb-reset", daemon=True).start()
@@ -462,6 +467,23 @@ class PC:
     def suspect(cls) -> None:
         """Запрос к ПК упал по таймауту/обрыву — следующая проверка пойдёт сразу, а не через 3 с."""
         cls.checked = 0.0
+
+
+async def _probe() -> bool:
+    """Отвечает ли ПК. Для SMB — прямо в цикле событий, без пула потоков: если потоки
+    заняты зависшими запросами к выключенному ПК, проверка всё равно проходит,
+    и статус с кнопкой включения продолжают работать."""
+    host = getattr(storage, "host", None)
+    if not host:
+        return await run_in_threadpool(storage.reachable)
+    try:
+        _, w = await asyncio.wait_for(asyncio.open_connection(host, storage.port), 1.5)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    w.close()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(w.wait_closed(), 1)
+    return True
 
 
 loop: asyncio.AbstractEventLoop
@@ -477,8 +499,9 @@ async def status(_: Session = Depends(require_user)):
     up = await PC.is_up()
     if up:
         PC.wake_at = 0
-        if library.stale(S.index_ttl):
-            library.start_build(storage, _index_error)
+        if PC.revived or library.stale(S.index_ttl):
+            if library.start_build(storage, _index_error):
+                PC.revived = False
         pc = "up"
     elif PC.wake_at and time.time() - PC.wake_at < S.wake_timeout:
         pc = "waking"
@@ -672,6 +695,10 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                     await lane.acquire(PRIO_GRID if kind in "stm" else PRIO_VIEWER, request)
                 except Gone:
                     raise ClientGone from None
+                if not await PC.is_up():
+                    # ПК выключился, пока запрос стоял в очереди
+                    lane.release()
+                    raise HTTPException(503, "pc")
                 try:
                     tm = {"queue": (time.perf_counter() - tq) * 1000}
                     t0 = time.perf_counter()
