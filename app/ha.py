@@ -13,6 +13,9 @@ import httpx
 log = logging.getLogger("photocloud.ha")
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_SERVICE_RE = re.compile(r"^notify\.[a-z0-9_]+$")
+# если в настройке не сервис, а сущность — имя сервиса берём из её состояния
+ENTITY_DOMAINS = {"input_text", "input_select", "sensor", "text", "select"}
 
 
 def clean(text: str, limit: int = 64) -> str:
@@ -33,6 +36,7 @@ class HomeAssistant:
             follow_redirects=False,
         )
         self._last_notify: dict[str, float] = {}
+        self._resolved: tuple[str, str, float] = ("", "", 0.0)   # (настройка, сервис, когда)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -48,6 +52,33 @@ class HomeAssistant:
             log.warning("HA %s: HTTP %s", service, r.status_code)
             return False
         return True
+
+    async def notify_service(self) -> str:
+        """Сервис уведомлений. В настройке может быть либо сам сервис (notify.mobile_app_x),
+        либо сущность HA (input_text.notify_ilya), в состоянии которой лежит имя сервиса.
+        Из сущности принимаем только notify.* — значение из HA не может заставить
+        приложение вызвать что-то другое (замок, сигнализацию)."""
+        cfg = self.s.ha_notify_service
+        if not cfg or cfg.split(".", 1)[0] not in ENTITY_DOMAINS:
+            return cfg
+        src, svc, t = self._resolved
+        if src == cfg and time.time() - t < 60:
+            return svc
+        svc = ""
+        try:
+            r = await self._client.get(f"/api/states/{cfg}")
+            if r.status_code == 200:
+                val = str(r.json().get("state", "")).strip().strip("\"'").strip()
+                if _SERVICE_RE.match(val):
+                    svc = val
+                else:
+                    log.warning("в %s не сервис уведомлений (%r) — ожидается notify.…", cfg, val[:60])
+            else:
+                log.warning("не прочитать %s из HA: HTTP %s", cfg, r.status_code)
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("не прочитать %s из HA: %s", cfg, type(e).__name__)
+        self._resolved = (cfg, svc, time.time())
+        return svc
 
     async def wake(self) -> bool:
         if not (self.s.ha_token and self.s.ha_wake_service):
@@ -65,7 +96,10 @@ class HomeAssistant:
         self._last_notify[key] = now
         if len(self._last_notify) > 500:
             self._last_notify = {k: v for k, v in self._last_notify.items() if now - v < 3600}
-        await self.call(self.s.ha_notify_service, {
+        svc = await self.notify_service()
+        if not svc:
+            return
+        await self.call(svc, {
             "title": self.s.public_name,
             "message": message,
             "data": {"tag": f"photocloud-{event}", "group": "photocloud"},

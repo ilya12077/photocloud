@@ -93,6 +93,8 @@ def _networks(name: str) -> list[ipaddress._BaseNetwork]:
 
 
 _SERVICE_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+# уведомления: либо сервис notify.*, либо сущность, в которой записано имя такого сервиса
+_NOTIFY_RE = re.compile(r"^(notify|input_text|input_select|sensor|text|select)\.[a-z0-9_]+$")
 
 ALL_NOTIFY_EVENTS = {"login", "login_new_ip", "login_failed", "lockout", "wake", "wake_timeout", "index_error"}
 
@@ -182,6 +184,9 @@ def load() -> Settings:
     if s.storage == "smb":
         if not (s.smb_host and s.smb_share and s.smb_user and s.smb_password):
             raise ConfigError("для STORAGE=smb нужны SMB_HOST, SMB_SHARE, SMB_USER, SMB_PASSWORD")
+        if s.smb_share == s.smb_host or re.fullmatch(r"[\d.]+", s.smb_share):
+            raise ConfigError(f"SMB_SHARE: здесь только имя шары (например «фото»), а не адрес компа — "
+                              f"адрес уже в SMB_HOST. Сейчас: {s.smb_share!r}")
         if any(c in s.smb_share for c in "\\/:*?\"<>|"):
             raise ConfigError("SMB_SHARE: только имя шары, без слэшей")
         if ".." in re.split(r"[\\/]", s.smb_subdir):
@@ -200,6 +205,8 @@ def load() -> Settings:
         v = getattr(s, n)
         if v and not _SERVICE_RE.match(v):
             raise ConfigError(f"{n.upper()}: формат domain.service")
+    if s.ha_notify_service and not _NOTIFY_RE.match(s.ha_notify_service):
+        raise ConfigError("HA_NOTIFY_SERVICE: notify.… или сущность с его именем (input_text.…)")
     raw = _get("HA_WAKE_DATA", "") or ""
     if raw:
         try:
@@ -295,6 +302,8 @@ def validate_override(s: Settings, key: str, val):
     if key in ("ha_notify_service", "ha_wake_service"):
         if not isinstance(val, str) or (val and not _SERVICE_RE.match(val)):
             raise ConfigError("сервис HA: формат domain.service")
+        if key == "ha_notify_service" and val and not _NOTIFY_RE.match(val):
+            raise ConfigError("уведомления: notify.… или сущность с его именем (input_text.…)")
         if key == "ha_wake_service" and not val and s.storage == "smb":
             raise ConfigError("сервис пробуждения обязателен")
         return val

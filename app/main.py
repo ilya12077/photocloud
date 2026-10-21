@@ -41,6 +41,9 @@ log = logging.getLogger("photocloud")
 
 S = config.load()
 logs.install()
+# служебные библиотеки пишут каждый шаг SMB/HTTP — в журнале нужны только их предупреждения
+for _name in ("smbprotocol", "smbclient", "httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 audit = logs.Audit(S.data_dir / "audit.log")
 STARTED = time.time()
 STATIC = Path(__file__).parent / "static"
@@ -184,9 +187,11 @@ async def lifespan(_app):
     else:
         log.warning("ffmpeg не найден — у видео не будет эскизов (pip install imageio-ffmpeg)")
     if SETUP_TOKEN:
-        host = "localhost" if S.bind in ("0.0.0.0", "127.0.0.1") else S.bind
+        # ссылка — на внешний адрес сайта, если он известен (через NPM), иначе на localhost
+        base = S.public_url or (sorted(S.allowed_origins)[0] if S.allowed_origins else "") \
+            or f"http://{'localhost' if S.bind in ('0.0.0.0', '127.0.0.1') else S.bind}:{S.port}"
         log.warning("Пользователей нет. Создай администратора по ссылке (одноразовая, только в этой консоли):\n"
-                    "    http://%s:%d/admin#setup=%s", host, S.port, SETUP_TOKEN)
+                    "    %s/admin#setup=%s", base, SETUP_TOKEN)
     if S.storage == "local":
         log.warning("ТЕСТОВЫЙ РЕЖИМ: фото читаются из локальной папки %s", S.local_root)
     if not S.cookie_secure:
@@ -1078,7 +1083,10 @@ async def admin_settings_save(request: Request, s: Session = Depends(require_adm
 async def admin_notify_test(s: Session = Depends(require_admin)):
     if not S.ha_notify_service or not S.ha_token:
         return _bad("не задан сервис уведомлений или токен HA")
-    ok = await ha.call(S.ha_notify_service, {"title": S.public_name, "message": f"Тестовое уведомление от {s.user}"})
+    svc = await ha.notify_service()
+    if not svc:
+        return _bad(f"не удалось получить сервис уведомлений из {S.ha_notify_service} (см. журнал)", 502)
+    ok = await ha.call(svc, {"title": S.public_name, "message": f"Тестовое уведомление от {s.user} → {svc}"})
     return no_store(JSONResponse({"ok": ok}) if ok else _bad("HA не принял вызов (см. логи)", 502))
 
 
