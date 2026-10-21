@@ -15,7 +15,7 @@ const st = {
   children: null, totals: null, cover: null, folderIdx: null, parent: null,
   folder: '', sort: 'new', rec: true,
   list: [],           // текущий отсортированный список
-  pc: 'unknown', autoWoke: false, pollTimer: 0, newVersion: null,
+  pc: 'unknown', pollTimer: 0, newVersion: null,
 };
 const Z = { cols: 3, pinch: null, wheel: 0, sizes: { s: 240, t: 400, m: 900 } };
 const L = { rows: [], height: 0, tileH: 0, gap: 3, rendered: new Map(), lastY: 0, idleT: 0, fast: false };
@@ -88,7 +88,6 @@ async function enter() {
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
   $('login').hidden = true; $('main').hidden = false;
-  st.autoWoke = false;
   readRoute(); initZoom(); updateEcoUi();
   poll();
   const early = await st.libPromise; st.libPromise = null;
@@ -106,12 +105,15 @@ function autoEco() {
   const c = navigator.connection;
   return !!(c && (c.saveData || ['slow-2g', '2g', '3g'].includes(c.effectiveType) || (c.downlink && c.downlink < 4)));
 }
-function eco() { const v = store('pc.eco'); return v === '1' ? true : v === '0' ? false : autoEco(); }
+// ручной выбор живёт только до перезагрузки страницы, потом снова авто
+let ecoManual = null;
+try { localStorage.removeItem('pc.eco'); } catch {}   // старые версии запоминали навсегда
+function eco() { return ecoManual ?? autoEco(); }
 function updateEcoUi() {
   $('eco').checked = eco();
-  $('eco-auto').textContent = store('pc.eco') == null ? '(авто)' : '';
+  $('eco-auto').textContent = ecoManual === null ? '(авто)' : '';
 }
-$('eco').addEventListener('change', (e) => { store('pc.eco', e.target.checked ? '1' : '0'); updateEcoUi(); relayout(true); });
+$('eco').addEventListener('change', (e) => { ecoManual = e.target.checked; updateEcoUi(); relayout(true); });
 
 // ================================================================== статус / пробуждение
 
@@ -150,8 +152,10 @@ async function poll(delay) {
   const metaBusy = ix.meta && ix.meta[1] > 0 && ix.meta[0] < ix.meta[1];
 
   if (s.pc === 'down') {
-    if (!st.autoWoke) { st.autoWoke = true; wake(); return; }
-    banner('Компьютер выключен и не отвечает' + (ix.count ? ' — показываю последний список, превью могут не грузиться' : ''), 'Разбудить', wake, true);
+    // сами не будим: включает только пользователь по кнопке
+    banner((s.wake_failed ? 'Компьютер так и не включился' : 'Компьютер выключен') +
+      (ix.count ? ' — показываю последний список, новые превью не загрузятся' : ''),
+      s.wake_failed ? 'Попробовать ещё раз' : 'Запустить компьютер', wake, true);
     next = 10000;
   } else if (s.pc === 'waking') {
     banner(`Компьютер просыпается… (ещё до ${s.wake_left} с)`); next = 2000;
@@ -472,9 +476,20 @@ function cancelImgs(node) {
 // которые всё ещё на экране. После трёх неудач показываем ⚠.
 const RETRY_DELAYS = [1000, 3000, 8000];
 const RQ = { queue: [], active: 0 };
+let checkT = 0;
+function checkPcSoon() {
+  // эскиз не пришёл — возможно, компьютер выключили: проверяем сразу, а не через 30 с
+  if (checkT || st.pc === 'down' || st.pc === 'waking') return;
+  checkT = setTimeout(() => { checkT = 0; poll(); }, 300);
+}
 function thumbFailed(img) {
   const n = +(img.dataset.tries || 0);
   img.removeAttribute('src');
+  if (st.pc === 'down' || st.pc === 'waking') {
+    // компьютер выключен: не тратим попытки, перезапросим всё разом, когда он включится
+    img.dataset.err = '1'; return;
+  }
+  checkPcSoon();
   if (n >= RETRY_DELAYS.length) { img.parentElement.classList.add('broken'); img.dataset.err = '1'; return; }
   img.dataset.tries = n + 1;
   setTimeout(() => { RQ.queue.push(img); pumpRetries(); }, RETRY_DELAYS[n]);
@@ -742,7 +757,7 @@ function playLive(vid, tok) {
     });
   };
   lv.onerror = () => lv.classList.remove('on');
-  lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4`;
+  lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4?q=${eco() ? 'eco' : 'hq'}`;
   lv.load();
 }
 // если браузер не разрешил звук без нажатия — первое касание фото включает звук и переигрывает
