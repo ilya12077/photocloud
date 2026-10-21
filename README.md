@@ -49,3 +49,42 @@ ffmpeg для эскизов видео: если в системе есть `ff
 - За nginx: `TRUSTED_PROXIES` — реальный IP из `X-Real-IP`, прямые запросы мимо прокси → 403.
 
 Репозиторий публичный: `.env`, `data/` (пользователи, журнал), ключи — в `.gitignore`. В примерах только `example.com` и типовые адреса.
+
+## Сервер (Docker / Portainer на Home Assistant)
+
+В контейнере работает только режим SMB, локальная папка — для теста на компе.
+
+**1. ПК с Windows (откуда берутся файлы)**
+- Отдельный локальный пользователь только для чтения, например `photoviewer`, с длинным паролем.
+- Общий доступ к папке с фото: Свойства → Доступ → Расширенная настройка → Разрешения: `photoviewer` — только «Чтение», «Все» — убрать.
+- Брандмауэр: входящие на TCP 445 только с IP сервера (PowerShell от администратора):
+  `New-NetFirewallRule -DisplayName "SMB from HA" -Direction Inbound -Protocol TCP -LocalPort 445 -RemoteAddress <IP_HA> -Action Allow -Profile Private`
+
+**2. Portainer → Stacks → Add stack**
+- *Repository*: URL этого репозитория, Compose path `docker-compose.yml` (Portainer соберёт образ сам), или *Web editor* — вставить `docker-compose.yml` и собрать образ заранее.
+- *Environment variables* (в репозиторий не попадают):
+
+| Переменная | Пример |
+|---|---|
+| `SMB_HOST` | IP компа в локалке |
+| `SMB_SHARE` / `SMB_SUBDIR` | имя шары / подпапка внутри (необязательно) |
+| `SMB_USER` / `SMB_PASSWORD` | `photoviewer` / пароль |
+| `ALLOWED_ORIGINS` | `https://<ваш поддомен>` |
+| `TRUSTED_PROXIES` | по умолчанию `172.30.32.0/23,127.0.0.1/32` (сеть аддонов HA) |
+| `HA_TOKEN` | долгосрочный токен пользователя HA |
+| `HA_WAKE_SERVICE` | `script.<ваш_скрипт_wol>` |
+| `HA_NOTIFY_SERVICE` | `notify.mobile_app_<телефон>` (необязательно) |
+| `PUBLIC_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | для входа через Google (необязательно) |
+
+- Deploy. В логах контейнера появится одноразовая ссылка `…/admin#setup=…` — открыть её через домен (заменив `http://localhost:8099` на `https://<поддомен>`) и создать администратора.
+
+**3. NPM**: Proxy Host → `http`, хост = IP Home Assistant, порт `8099`; SSL + Force SSL + HTTP/2; в Advanced:
+```nginx
+proxy_set_header X-Real-IP $remote_addr;
+proxy_buffering off;
+proxy_read_timeout 120s;
+client_max_body_size 64k;
+```
+Проверка: в `/admin` → «Сессии» должен быть ваш внешний IP. Если там IP вида `172.30.x.x` или вход не открывается с 403 — поправить `TRUSTED_PROXIES` под фактический адрес NPM (его видно в журнале «Сессии»/логах).
+
+Контейнер: пользователь без прав, файловая система только для чтения (кроме тома `/data`), все capabilities сброшены, лимит памяти 1.5 ГБ. Данные (пользователи, сессии, кэш дат, журнал) — в томе `photocloud-data`.

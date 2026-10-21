@@ -166,6 +166,8 @@ def load() -> Settings:
     s.storage = _get("STORAGE", "smb")
     if s.storage not in ("smb", "local"):
         raise ConfigError("STORAGE: smb или local")
+    if s.storage == "local" and os.environ.get("PHOTOCLOUD_DOCKER") == "1":
+        raise ConfigError("в контейнере доступен только STORAGE=smb (локальный режим — для теста на компе)")
     s.local_root = _get("LOCAL_ROOT", s.local_root)
     if s.storage == "local" and not Path(s.local_root).is_dir():
         raise ConfigError(f"LOCAL_ROOT: папка не найдена: {s.local_root}")

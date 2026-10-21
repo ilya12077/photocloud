@@ -1,4 +1,5 @@
 """Запуск: python -m app  (настройки — из .env рядом с проектом)."""
+import os
 import shutil
 import sys
 
@@ -7,7 +8,7 @@ from . import config
 
 def main() -> None:
     env = config.PROJECT_ROOT / ".env"
-    if not env.exists():
+    if not env.exists() and os.environ.get("PHOTOCLOUD_DOCKER") != "1":
         shutil.copy(config.PROJECT_ROOT / ".env.example", env)
         print(f"Создан {env}\nЗаполни его (как минимум LOCAL_ROOT) и запусти снова.")
         sys.exit(1)

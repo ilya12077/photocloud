@@ -1,0 +1,48 @@
+# Стек для Portainer: Stacks -> Add stack -> Repository (этот репозиторий) или Web editor.
+# Значения ${...} задаются в Portainer в разделе «Environment variables» — в репозиторий не попадают.
+services:
+  photocloud:
+    build: .
+    image: photocloud:latest
+    container_name: photocloud
+    restart: unless-stopped
+    # сеть хоста: контейнер видит ПК в локалке (SMB) и Home Assistant на 127.0.0.1,
+    # а NPM ходит к нему по адресу HA:8099. Мимо NPM запросы получают 403 (TRUSTED_PROXIES).
+    network_mode: host
+    environment:
+      PORT: ${PORT:-8099}
+      SMB_HOST: ${SMB_HOST}
+      SMB_SHARE: ${SMB_SHARE}
+      SMB_SUBDIR: ${SMB_SUBDIR:-}
+      SMB_USER: ${SMB_USER}
+      SMB_PASSWORD: ${SMB_PASSWORD}
+      SMB_ENCRYPT: ${SMB_ENCRYPT:-true}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.32.0/23,127.0.0.1/32}
+      HA_URL: ${HA_URL:-http://127.0.0.1:8123}
+      HA_TOKEN: ${HA_TOKEN}
+      HA_WAKE_SERVICE: ${HA_WAKE_SERVICE}
+      HA_NOTIFY_SERVICE: ${HA_NOTIFY_SERVICE:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+      PUBLIC_NAME: ${PUBLIC_NAME:-Фотоархив}
+      WORKERS: ${WORKERS:-3}
+    volumes:
+      - photocloud-data:/data      # пользователи, сессии, кэш дат, журнал
+    # защита контейнера
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1536m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  photocloud-data:

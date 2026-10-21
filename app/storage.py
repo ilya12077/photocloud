@@ -150,7 +150,7 @@ class SMBStorage:
             while stack:
                 prefix, d = stack.pop()
                 try:
-                    entries = list(self._smb.scandir(d))
+                    entries = list(self._smb.scandir(d, port=self.port))
                 except OSError as e:
                     if not _not_connection_error(e):
                         raise
@@ -177,7 +177,7 @@ class SMBStorage:
 
     def open(self, rel: str) -> BinaryIO:
         path = self.base + "\\" + "\\".join(_check_rel(rel))
-        return self._retry(lambda: self._smb.open_file(path, mode="rb", share_access="rw"))
+        return self._retry(lambda: self._smb.open_file(path, mode="rb", share_access="rw", port=self.port))
 
 
 def make_storage(s):
