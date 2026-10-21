@@ -7,7 +7,7 @@ const MONTHS = ['Январь','Февраль','Март','Апрель','Ма�
 const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 const HEAD_H = 46;          // высота заголовка месяца, px
 const BUFFER = 1.2;         // сколько экранов рендерим сверху/снизу
-const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16;
+const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16, F_FOLDER = 32;
 
 const st = {
   me: null,
@@ -78,8 +78,11 @@ async function enter() {
   let err = null;
   const m = location.hash.match(/^#err=([a-z-]+)$/);
   if (m) { err = LOGIN_ERRORS[m[1]] || 'Ошибка входа'; history.replaceState(null, '', location.pathname); }
+  // список файлов запрашиваем сразу, параллельно с проверкой входа — на медленном канале
+  // это экономит пару «туда-обратно» до первых эскизов
+  st.libPromise = fetch('/api/library', { credentials: 'same-origin', cache: 'no-cache' }).catch(() => null);
   const r = await api('/api/me', { allow401: true });
-  if (r.status === 401) { showLogin(err); return; }
+  if (r.status === 401) { st.libPromise = null; showLogin(err); return; }
   const me = await r.json(); st.me = me;
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
@@ -88,6 +91,8 @@ async function enter() {
   st.autoWoke = false;
   readRoute(); initZoom(); updateEcoUi();
   poll();
+  const early = await st.libPromise; st.libPromise = null;
+  if (early && early.ok && !st.lib) await loadLibrary(early);
 }
 
 // ================================================================== меню / настройки клиента
@@ -160,7 +165,7 @@ async function poll(delay) {
     banner('Список файлов обновился', 'Показать', () => { st.newVersion = null; loadLibrary(); });
   } else banner(null);
 
-  if (ix.v && !st.lib) await loadLibrary();
+  if (ix.v && !st.lib && !st.libPromise) await loadLibrary();
   else if (ix.v && st.lib && ix.v !== st.lib.v && ix.state !== 'building') {
     // молча обновляем, только если пользователь ещё не начал листать
     if (window.scrollY < 50 && $('viewer').hidden) await loadLibrary();
@@ -191,10 +196,15 @@ function decode(j) {
   return { v: j.v, folders: j.folders, photos: out, live: j.live || {} };
 }
 
-async function loadLibrary() {
+async function loadLibrary(pre) {
+  if (st.libLoading) return;
+  st.libLoading = true;
+  try { await loadLibraryInner(pre); } finally { st.libLoading = false; }
+}
+async function loadLibraryInner(pre) {
   if (!st.lib) banner('Загружаю список файлов…');
   // cache:'no-cache' — браузер хранит копию и спрашивает сервер по ETag (304 = 0 байт)
-  const r = await api('/api/library', { cache: 'no-cache' });
+  const r = pre || await api('/api/library', { cache: 'no-cache' });
   if (!r.ok) return;
   const j = await r.json();
   if (!j.v) return;
@@ -673,7 +683,10 @@ function show(i) {
   const isVideo = !!(ph[6] & F_VIDEO) && (!(ph[6] & F_NOPLAY) || (st.me && st.me.transcode));
   $('v-name').textContent = ph[2];
   const fromMeta = ph[6] & F_TAKEN, fromName = ph[6] & F_NAME;
-  let meta = (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Изменён ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
+  let meta = (ph[6] & F_FOLDER)
+    ? `${new Date(ph[3] * 1000).getFullYear()} год (по названию папки) · ${sizeStr(ph[5])}`
+    : (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Изменён ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
+  if (ph[6] & F_FOLDER) meta += ' · файл изменён ' + fmt.format(new Date(ph[4] * 1000));
   if ((fromMeta || fromName) && Math.abs(ph[4] - ph[3]) > 86400) meta += ' · файл изменён ' + fmt.format(new Date(ph[4] * 1000));
   $('v-date').textContent = meta;
   $('v-orig').href = origUrl(ph, false);

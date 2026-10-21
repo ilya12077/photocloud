@@ -209,7 +209,7 @@ def _mp4_date(f, size: int) -> float | None:
 #   Screenshot_2023-01-01-12-00-00-123_com.app.png   1675859348723.jpg (Unix-время в мс)
 _NAME_DT = re.compile(
     r"(?<!\d)((?:19|20)\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])"
-    r"(?:(?:[-_. T]|\s+at\s+)?([01]\d|2[0-3])[-_.:h]?([0-5]\d)[-_.:m]?([0-5]\d)(?:[-_.]?\d{1,3})?)?(?!\d)")
+    r"(?:(?:[-_. T]|\s+at\s+)?([01]\d|2[0-3])[-_.:h]?([0-5]\d)(?:[-_.:m]?([0-5]\d))?(?:[-_.]?\d{1,3})?)?(?!\d)")
 # суффикс копии — только через разделитель или в скобках: «1675859348723_1», «1675859348723 (2)»
 _NAME_UNIX = re.compile(r"^(\d{10}|\d{13})(?:[-_ ]\(?\d{1,3}\)?|\(\d{1,3}\))?$")
 
@@ -226,6 +226,8 @@ def name_date(name: str, tz: ZoneInfo) -> float | None:
         h, mi, s = (int(m.group(i)) if m.group(i) else None for i in (4, 5, 6))
         if h is None:
             h, mi, s = 12, 0, 0
+        elif s is None:                 # YYYYMMDDHHMM — без секунд
+            s = 0
         try:
             ts = dt.datetime(y, mo, d, h, mi, s, tzinfo=tz).timestamp()
         except ValueError:          # 31 февраля и т.п.
@@ -233,6 +235,20 @@ def name_date(name: str, tz: ZoneInfo) -> float | None:
         ts = _plausible(ts)
         if ts:
             return ts
+    return None
+
+
+_FOLDER_YEAR = re.compile(r"(?<!\d)(19[89]\d|20\d{2})(?!\d)")
+
+
+def folder_year(rel: str) -> int | None:
+    """Год из названия папки: «фотки/2006», «Photos from 2013», «Фото 2012 г_».
+    Берётся ближайшая к файлу папка, где есть год 1980–текущий."""
+    now = dt.datetime.now().year
+    for part in reversed(rel.split("/")[:-1]):
+        years = [int(y) for y in _FOLDER_YEAR.findall(part) if 1980 <= int(y) <= now]
+        if len(years) == 1:
+            return years[0]
     return None
 
 
