@@ -72,6 +72,8 @@ limiter = LoginLimiter()
 thumb_cache = LRUBytes(S.thumb_cache_mb * 1024 * 1024)
 preview_cache = LRUBytes(S.preview_cache_mb * 1024 * 1024)
 sched = Scheduler(S.workers)
+# кадры из видео — отдельная очередь: они в 10 раз дольше фото и не должны держать ленту
+sched_video = Scheduler(2)
 login_sem = asyncio.Semaphore(2)              # argon2 ест ~64 МБ RAM на проверку
 inflight: dict[tuple, asyncio.Future] = {}
 # файлы, которые не удалось декодировать: не мучаем ffmpeg/Pillow повторно 10 минут
@@ -600,7 +602,7 @@ class Perf:
             rows.append(row)
         total = cls.hits + cls.misses
         return {"rows": rows, "hit_ratio": round(cls.hits / total * 100) if total else None,
-                "requests": total, "workers": S.workers, "inflight": len(inflight), "waiting": sched.waiting}
+                "requests": total, "workers": S.workers, "inflight": len(inflight), "waiting": sched.waiting + sched_video.waiting}
 
 
 async def rendered(request: Request, kind: str, pid: str) -> Response:
@@ -637,7 +639,8 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                 tq = time.perf_counter()
                 try:
                     # просмотрщик — вне очереди; в сетке — сначала самые свежие запросы
-                    await sched.acquire(PRIO_GRID if kind in "stm" else PRIO_VIEWER, request)
+                    lane = sched_video if p.video else sched
+                    await lane.acquire(PRIO_GRID if kind in "stm" else PRIO_VIEWER, request)
                 except Gone:
                     raise ClientGone from None
                 try:
@@ -646,7 +649,7 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                     data = await run_in_threadpool(_produce, p, box, q, tm)
                     tm["total"] = (time.perf_counter() - t0) * 1000
                 finally:
-                    sched.release()
+                    lane.release()
                 Perf.misses += 1
                 Perf.recs.append({"kind": kind, "fmt": _fmt_class(p), "kb": len(data) / 1024, **tm})
                 # видно в браузере: DevTools -> Network -> запрос -> Timing
