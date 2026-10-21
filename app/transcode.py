@@ -95,15 +95,26 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
     return r.stdout
 
 
-def live_clip(ffmpeg: str, src: str, protocols: str, demuxer: str) -> bytes:
-    """Ролик живого фото -> MP4 (H.264 + AAC, до 720 px по короткой стороне, ≤ 10 с).
+LIVE_PROFILES = {
+    # короткая сторона, crf, потолок битрейта, звук
+    "hq":  {"h": 720, "crf": 26, "max": "1500k", "buf": "3000k", "a": "96k"},
+    "eco": {"h": 480, "crf": 29, "max": "600k",  "buf": "1200k", "a": "48k"},
+}
+
+
+def live_clip(ffmpeg: str, src: str, protocols: str, demuxer: str, profile: str = "hq") -> bytes:
+    """Ролик живого фото -> MP4 (H.264 + AAC, ≤ 10 с, ≤ 30 к/с).
     Фрагментированный MP4: его можно писать в трубу, а браузеры играют его как обычный."""
+    p = LIVE_PROFILES[profile]
+    h = p["h"]
     cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
            "-protocol_whitelist", protocols, "-f", demuxer, "-i", src, "-t", "10",
            "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-           "-vf", "scale='if(gt(iw,ih),-2,min(720,iw))':'if(gt(iw,ih),min(720,ih),-2)',format=yuv420p",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-profile:v", "high", "-level", "4.1",
-           "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+           "-vf", f"scale='if(gt(iw,ih),-2,min({h},iw))':'if(gt(iw,ih),min({h},ih),-2)':flags=bilinear,format=yuv420p",
+           "-fpsmax", "30",
+           "-c:v", "libx264", "-preset", "superfast", "-crf", str(p["crf"]),
+           "-maxrate", p["max"], "-bufsize", p["buf"], "-profile:v", "high", "-level", "4.1",
+           "-c:a", "aac", "-b:a", p["a"], "-ac", "2",
            "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
     from .video import run_ff
     r = run_ff(cmd, src, protocols, demuxer, 120)

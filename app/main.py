@@ -456,6 +456,11 @@ class PC:
                     await run_in_threadpool(storage.reset)
             return cls.up
 
+    @classmethod
+    def suspect(cls) -> None:
+        """Запрос к ПК упал по таймауту/обрыву — следующая проверка пойдёт сразу, а не через 3 с."""
+        cls.checked = 0.0
+
 
 loop: asyncio.AbstractEventLoop
 
@@ -483,6 +488,7 @@ async def status(_: Session = Depends(require_user)):
     return no_store(JSONResponse({
         "pc": pc,
         "wake_left": max(0, int(S.wake_timeout - (time.time() - PC.wake_at))) if pc == "waking" else 0,
+        "wake_failed": pc == "down" and bool(PC.wake_at),
         "index": {"state": library.state, "count": len(library.by_id), "progress": library.progress,
                   "built_at": int(library.built_at), "v": library.version,
                   "meta": [library.meta_done, library.meta_total]},
@@ -650,6 +656,9 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                     break
                 except ClientGone:
                     continue   # тот, кто генерировал, ушёл — попробуем сами
+            if not await PC.is_up():
+                # ПК выключен: отвечаем сразу, а не ждём таймаутов SMB на каждой плитке
+                raise HTTPException(503, "pc")
             fut = loop.create_future()
             fut.add_done_callback(lambda f: f.cancelled() or f.exception())
             inflight[key] = fut
@@ -687,7 +696,8 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
         return Response(status_code=499)
     except TooLarge:
         raise HTTPException(413) from None
-    except ConnectionError:
+    except (ConnectionError, TimeoutError):
+        PC.suspect()
         raise HTTPException(503, "pc") from None
     except (UnidentifiedImageError, Image.DecompressionBombWarning, Image.DecompressionBombError,
             OSError, ValueError, SyntaxError, MemoryError, video.subprocess.TimeoutExpired) as e:
@@ -714,10 +724,13 @@ def _size(f) -> int:
 
 async def serve_file(request: Request, p, extra: dict) -> Response:
     """Отдача оригинала с поддержкой Range (нужно для перемотки видео и iOS Safari)."""
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
     try:
         f = await run_in_threadpool(storage.open, p.rel)
         size = await run_in_threadpool(_size, f)
     except Exception:  # noqa: BLE001
+        PC.suspect()
         raise HTTPException(503, "pc") from None
     start, end, status = 0, size - 1, 200
     headers = {"accept-ranges": "bytes", **extra}
@@ -836,7 +849,8 @@ async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
 
 
 @app.get("/vid/{pid}/live.mp4")
-async def vid_live(request: Request, pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
+async def vid_live(request: Request, pid: str = PathParam(pattern=ID_RE), q: str = "hq",
+                   _: Session = Depends(require_user)):
     """Ролик живого фото: целиком, H.264 + звук — играет в любом браузере.
     Пара секунд видео перекодируется за доли секунды и живёт в RAM-кэше."""
     p = library.get(pid)
@@ -844,10 +858,13 @@ async def vid_live(request: Request, pid: str = PathParam(pattern=ID_RE), _: Ses
         raise HTTPException(404)
     if not TRANSCODE:
         return await serve_file(request, p, {"cache-control": "private, max-age=3600"})
+    q = q if q in transcode.LIVE_PROFILES else "hq"
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
     src, prot = _video_src(p)
     try:
-        data = await transcoder.get((pid, int(p.mtime), p.size, "live-a"),
-                                    lambda: transcode.live_clip(FFMPEG, src, prot, video.DEMUXER[p.ext]))
+        data = await transcoder.get((pid, int(p.mtime), p.size, "live-" + q),
+                                    lambda: transcode.live_clip(FFMPEG, src, prot, video.DEMUXER[p.ext], q))
     except ValueError:
         raise HTTPException(415) from None
     except Exception:  # noqa: BLE001
@@ -925,13 +942,14 @@ async def admin_setup_needed():
 @app.get("/api/admin/overview")
 async def admin_overview(_: Session = Depends(require_admin)):
     up = await PC.is_up()
-    photos = list(library.by_id.values())
-    videos = sum(1 for p in photos if p.video and not p.live)
-    lives = sum(1 for p in photos if p.live and not p.video)
+    # считаем только то, что видно в ленте: ролики живых фото — часть снимка, а не отдельный файл
+    photos = [p for p in library.by_id.values() if not (p.video and p.live)]
+    videos = sum(1 for p in photos if p.video)
+    lives = sum(1 for p in photos if p.live)
     return no_store(JSONResponse({
         "uptime": int(time.time() - STARTED),
         "pc": "up" if up else ("waking" if PC.wake_at else "down"),
-        "index": {"state": library.state, "error": library.error, "files": len(photos) - lives, "videos": videos, "live": lives,
+        "index": {"state": library.state, "error": library.error, "files": len(photos), "videos": videos, "live": lives,
                   "with_date": sum(1 for p in photos if p.taken), "with_name_date": sum(1 for p in photos if not p.taken and p.named),
                   "with_folder_year": sum(1 for p in photos if p.folder_only()),
                   "built_at": int(library.built_at),
