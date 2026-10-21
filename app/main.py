@@ -14,9 +14,11 @@ import mimetypes
 import re
 import secrets
 import random
+import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
 
@@ -469,6 +471,67 @@ class PC:
         cls.checked = 0.0
 
 
+# ---------------------------------------------------------------- потоки для работы с ПК
+# Всё, что читает файлы с ПК, идёт в отдельный пул. Если ПК пропал посреди запросов и
+# потоки повисли, это не задевает вход, страницы и админку (у них свой пул), а сам
+# HTTP-запрос не ждёт дольше тайм-аута. Если же пул повис целиком и не оживает,
+# процесс завершается — Docker (restart: unless-stopped) поднимает его заново.
+SMB_THREADS = 24
+STALL_EXIT = 150          # с: все потоки заняты и ни один не завершился
+_smb_pool = ThreadPoolExecutor(SMB_THREADS, thread_name_prefix="pc")
+
+
+class SmbPool:
+    busy = 0
+    last_done = time.monotonic()
+    mu = threading.Lock()
+
+
+def _tracked(fn, *a):
+    with SmbPool.mu:
+        SmbPool.busy += 1
+    try:
+        return fn(*a)
+    finally:
+        with SmbPool.mu:
+            SmbPool.busy -= 1
+            SmbPool.last_done = time.monotonic()
+
+
+async def on_pc(fn, *a, timeout: float = 60):
+    """Выполнить fn в пуле «ПК» не дольше timeout. Тайм-аут = ПК не отвечает."""
+    fut = loop.run_in_executor(_smb_pool, _tracked, fn, *a)
+    try:
+        return await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        PC.suspect()
+        log.warning("запрос к компьютеру не завершился за %d с", timeout)
+        if hasattr(storage, "reset"):
+            threading.Thread(target=storage.reset, name="smb-reset", daemon=True).start()
+        raise ConnectionError("PC timeout") from None
+
+
+def _stall_guard() -> None:
+    import faulthandler
+    import sys
+    while True:
+        time.sleep(10)
+        with SmbPool.mu:
+            busy, idle_for = SmbPool.busy, time.monotonic() - SmbPool.last_done
+        if busy >= SMB_THREADS and idle_for > STALL_EXIT:
+            log.error("все %d потоков чтения с компьютера висят %d с — перезапускаю сервер. "
+                      "Стеки потоков ниже (пришли их разработчику):", busy, idle_for)
+            for h in logging.getLogger().handlers:
+                with contextlib.suppress(Exception):
+                    h.flush()
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            sys.stderr.flush()
+            os._exit(70)
+
+
+threading.Thread(target=_stall_guard, name="stall-guard", daemon=True).start()
+
+
 async def _probe() -> bool:
     """Отвечает ли ПК. Для SMB — прямо в цикле событий, без пула потоков: если потоки
     заняты зависшими запросами к выключенному ПК, проверка всё равно проходит,
@@ -702,7 +765,7 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                 try:
                     tm = {"queue": (time.perf_counter() - tq) * 1000}
                     t0 = time.perf_counter()
-                    data = await run_in_threadpool(_produce, p, box, q, tm)
+                    data = await on_pc(_produce, p, box, q, tm, timeout=240 if p.video else 60)
                     tm["total"] = (time.perf_counter() - t0) * 1000
                 finally:
                     lane.release()
@@ -756,8 +819,8 @@ async def serve_file(request: Request, p, extra: dict) -> Response:
     if not await PC.is_up():
         raise HTTPException(503, "pc")
     try:
-        f = await run_in_threadpool(storage.open, p.rel)
-        size = await run_in_threadpool(_size, f)
+        f = await on_pc(storage.open, p.rel, timeout=30)
+        size = await on_pc(_size, f, timeout=30)
     except Exception:  # noqa: BLE001
         PC.suspect()
         raise HTTPException(503, "pc") from None
@@ -771,22 +834,25 @@ async def serve_file(request: Request, p, extra: dict) -> Response:
         else:
             start, end = max(0, size - int(m.group(2))), size - 1
         if start > end or start >= size:
-            f.close()
+            await on_pc(f.close, timeout=10)
             return Response(status_code=416, headers={"content-range": f"bytes */{size}"})
         status = 206
         headers["content-range"] = f"bytes {start}-{end}/{size}"
     headers["content-length"] = str(end - start + 1)
 
-    def gen():
-        with f:
+    async def gen():
+        try:
             f.seek(start)
             left = end - start + 1
             while left > 0:
-                chunk = f.read(min(256 * 1024, left))
+                chunk = await on_pc(f.read, min(256 * 1024, left), timeout=45)
                 if not chunk:
                     break
                 left -= len(chunk)
                 yield chunk
+        finally:
+            with contextlib.suppress(Exception):
+                await on_pc(f.close, timeout=10)
 
     return StreamingResponse(gen(), status_code=status,
                              media_type=CONTENT_TYPES.get(p.ext, "application/octet-stream"), headers=headers)
@@ -1190,7 +1256,7 @@ async def admin_bench(_: Session = Depends(require_admin)):
         t = time.perf_counter()
         try:
             async with sched.slot(PRIO_GRID):
-                data = await run_in_threadpool(_produce, p, S.thumb_small_size, S.thumb_quality, tm)
+                data = await on_pc(_produce, p, S.thumb_small_size, S.thumb_quality, tm)
             tm["total"] = (time.perf_counter() - t) * 1000
             results.append({"fmt": fmt, "name": p.name, "mb": round(p.size / 1048576, 1),
                             "kb": round(len(data) / 1024, 1), **{k: round(v, 1) for k, v in tm.items()}})
@@ -1204,7 +1270,7 @@ async def admin_bench(_: Session = Depends(require_admin)):
 
     async def one(p):
         async with sched.slot(PRIO_GRID):
-            await run_in_threadpool(_produce, p, S.thumb_small_size, S.thumb_quality, {})
+            await on_pc(_produce, p, S.thumb_small_size, S.thumb_quality, {})
     t = time.perf_counter()
     await asyncio.gather(*(one(p) for p in par), return_exceptions=True)
     dt = time.perf_counter() - t
