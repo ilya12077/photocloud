@@ -187,7 +187,7 @@ def _is_credit_error(e: BaseException) -> bool:
     return "credits" in str(e) and "available" in str(e)
 
 
-_active: dict[int, float] = {}          # операция -> когда началась (для сторожа)
+_active: dict[int, float] = {}          # операция -> к какому моменту должна закончиться (для сторожа)
 _active_mu = threading.Lock()
 GATE_WAIT = 30                          # дольше не ждём свободного слота — отдаём ошибку, клиент повторит
 HANG_AFTER = 40                         # сетевая операция дольше — считаем, что SMB завис
@@ -200,7 +200,7 @@ def _gated(fn, *a, **kw):
             raise GateBusy("SMB: все слоты заняты")
         key = id(threading.current_thread()) ^ int(time.monotonic() * 1e6)
         with _active_mu:
-            _active[key] = time.monotonic()
+            _active[key] = time.monotonic() + HANG_AFTER
         try:
             return fn(*a, **kw)
         except Exception as e:  # noqa: BLE001
@@ -253,8 +253,10 @@ class SMBStorage:
         self._creds = dict(username=s.smb_user, password=s.smb_password, port=s.smb_port,
                            encrypt=s.smb_encrypt, connection_timeout=5, require_signing=True)
         self._registered = False
-        self._mu = threading.RLock()
+        self._mu = threading.RLock()        # только регистрация сессии
+        self._reset_mu = threading.Lock()   # сброс: короткий, без сети — не ждёт регистрацию
         self._reset_at = 0.0
+        self._down_until = 0.0
         self._warned = 0.0
         threading.Thread(target=self._watchdog, name="smb-watchdog", daemon=True).start()
 
@@ -263,13 +265,12 @@ class SMBStorage:
         и занятые слоты блокируют всё приложение. Сторож рвёт такое соединение — зависшие
         вызовы получают ошибку, клиенты повторяют запрос уже по новому подключению."""
         while True:
-            time.sleep(5)
+            time.sleep(2)
             with _active_mu:
-                oldest = min(_active.values(), default=None)
-            if oldest is not None and time.monotonic() - oldest > HANG_AFTER:
-                log.warning("SMB: запрос висит дольше %d с — сбрасываю соединение", HANG_AFTER)
-                with self._mu:
-                    self._reset_locked()
+                due = min(_active.values(), default=None)
+            if due is not None and time.monotonic() > due:
+                log.warning("SMB: компьютер не отвечает на запрос — сбрасываю соединение")
+                self._reset_locked()
                 with _active_mu:
                     _active.clear()
 
@@ -282,14 +283,17 @@ class SMBStorage:
 
     def reset(self) -> None:
         """После сна ПК соединение мёртвое — сбрасываем кэш подключений."""
-        with self._mu:
-            self._reset_locked()
+        self._reset_locked()
 
     def _reset_locked(self) -> None:
         """Рвём соединения без вежливого «выхода»: штатный reset_connection_cache()
         сначала закрывает файлы и сессию и ждёт ответа сервера — у выключенного ПК
         это ожидание бесконечное, и вместе с ним зависало всё приложение.
         Закрытие сокета будит все потоки, ждущие ответа, — они сразу получают ошибку."""
+        with self._reset_mu:
+            self._reset_now()
+
+    def _reset_now(self) -> None:
         try:
             from smbclient import _pool
             cache = _pool._SMB_CONNECTIONS
@@ -306,12 +310,54 @@ class SMBStorage:
         self._reset_at = time.time()
 
     def _session(self) -> None:
-        with self._mu:
-            if not self._registered:
+        if self._registered:
+            return
+        if time.monotonic() < self._down_until:
+            # только что не смогли подключиться — не стучимся снова каждым потоком по 5 с
+            raise ConnectionError("SMB: компьютер недоступен")
+        # Вход на ПК: если тот выключился посреди рукопожатия, smbprotocol ждёт ответа
+        # вечно — раньше это держало замок, и вставало всё приложение. Теперь ждём замок
+        # ограниченно, а само рукопожатие стережёт сторож (сброс будит ждущий поток).
+        if not self._mu.acquire(timeout=15):
+            raise ConnectionError("SMB: подключение к компьютеру не устанавливается")
+        try:
+            if self._registered:
+                return
+            key = id(threading.current_thread()) ^ int(time.monotonic() * 1e6) ^ 1
+            with _active_mu:
+                _active[key] = time.monotonic() + 15
+            try:
                 self._smb.register_session(self.host, **self._creds)
-                self._registered = True
+            except ValueError as e:
+                # smbprotocol сообщает «не удалось подключиться» как ValueError — для остального
+                # кода это обрыв связи, а не битый файл (иначе эскиз попал бы в «не декодируется»)
+                if isinstance(e.__cause__, OSError):
+                    self._down_until = time.monotonic() + 5
+                    raise ConnectionError(f"SMB: компьютер недоступен ({e.__cause__})") from e
+                raise
+            except (OSError, TimeoutError) as e:
+                if not _not_connection_error(e):
+                    self._down_until = time.monotonic() + 5
+                raise
+            finally:
+                with _active_mu:
+                    _active.pop(key, None)
+            self._registered = True
+        finally:
+            self._mu.release()
 
     def _retry(self, fn):
+        try:
+            return self._retry_inner(fn)
+        except ValueError as e:
+            # smbclient сам переподключается внутри вызова и сообщает «не удалось
+            # подключиться» как ValueError — для нас это недоступный ПК, а не битый файл
+            if isinstance(e.__cause__, OSError):
+                self._down_until = time.monotonic() + 5
+                raise ConnectionError(f"SMB: компьютер недоступен ({e.__cause__})") from e
+            raise
+
+    def _retry_inner(self, fn):
         self._session()
         try:
             return fn()
@@ -327,10 +373,9 @@ class SMBStorage:
             if isinstance(e, GateBusy) or _not_connection_error(e) or _is_credit_error(e):
                 raise
             # переподключаемся не чаще раза в 10 с и одним потоком: остальные просто повторяют
-            with self._mu:
-                if time.time() - self._reset_at > 10:
-                    log.info("SMB: переподключение (%s)", type(e).__name__)
-                    self._reset_locked()
+            if time.time() - self._reset_at > 10:
+                log.info("SMB: переподключение (%s)", type(e).__name__)
+                self._reset_locked()
             self._session()
             return fn()
 
@@ -342,7 +387,7 @@ class SMBStorage:
             while stack:
                 prefix, d = stack.pop()
                 try:
-                    entries = _gated(lambda: list(self._smb.scandir(d, port=self.port)))
+                    entries = _gated(lambda: list(self._smb.scandir(d, **self._creds)))
                 except OSError as e:
                     # корень шары недоступен (нет шары, нет прав, лимит подключений) — это ошибка
                     # индексации целиком; недоступная подпапка — просто пропускаем её
@@ -372,7 +417,7 @@ class SMBStorage:
     def open(self, rel: str) -> BinaryIO:
         path = self.base + "\\" + "\\".join(_check_rel(rel))
         return _SMBFile(self._retry(
-            lambda: _gated(self._smb.open_file, path, mode="rb", share_access="rw", port=self.port)))
+            lambda: _gated(self._smb.open_file, path, mode="rb", share_access="rw", **self._creds)))
 
 
 def make_storage(s):
