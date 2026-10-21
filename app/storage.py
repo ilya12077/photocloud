@@ -132,7 +132,55 @@ class LocalStorage:
 # одновременных сетевых операций — не больше SMB_PARALLEL, а нехватку кредитов
 # пережидаем короткой паузой (это не обрыв связи — переподключаться нельзя).
 SMB_PARALLEL = 6
-_gate = threading.BoundedSemaphore(SMB_PARALLEL)
+SMB_BACKGROUND = 4     # фоновое чтение дат/обход папок — не больше стольких слотов
+
+
+class GateBusy(TimeoutError):
+    """Все слоты заняты дольше GATE_WAIT. Это перегрузка, а не обрыв: переподключаться нельзя."""
+
+
+class _Gate:
+    """Слоты для сетевых операций с приоритетом: эскизы и просмотр (то, что ждёт человек)
+    всегда проходят первыми, а фоновое чтение дат занимает не больше SMB_BACKGROUND слотов
+    и уступает, пока кто-то из «живых» запросов ждёт."""
+
+    def __init__(self, n: int, bg_max: int):
+        self.n, self.bg_max = n, bg_max
+        self.used = self.bg_used = self.fg_waiting = 0
+        self.cv = threading.Condition()
+
+    def acquire(self, bg: bool, timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        with self.cv:
+            if not bg:
+                self.fg_waiting += 1
+            try:
+                while True:
+                    if self.used < self.n and (not bg or (self.bg_used < self.bg_max and not self.fg_waiting)):
+                        self.used += 1
+                        self.bg_used += bg
+                        return True
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self.cv.wait(left)
+            finally:
+                if not bg:
+                    self.fg_waiting -= 1
+
+    def release(self, bg: bool) -> None:
+        with self.cv:
+            self.used -= 1
+            self.bg_used -= bg
+            self.cv.notify_all()
+
+
+_gate = _Gate(SMB_PARALLEL, SMB_BACKGROUND)
+
+
+def _background() -> bool:
+    # потоки индексации: обход папок («index») и чтение дат съёмки («meta…»)
+    return threading.current_thread().name.startswith(("index", "meta"))
 
 
 def _is_credit_error(e: BaseException) -> bool:
@@ -146,9 +194,10 @@ HANG_AFTER = 40                         # сетевая операция дол
 
 
 def _gated(fn, *a, **kw):
+    bg = _background()
     for attempt in range(6):
-        if not _gate.acquire(timeout=GATE_WAIT):
-            raise TimeoutError("SMB: все слоты заняты")
+        if not _gate.acquire(bg, GATE_WAIT * (4 if bg else 1)):
+            raise GateBusy("SMB: все слоты заняты")
         key = id(threading.current_thread()) ^ int(time.monotonic() * 1e6)
         with _active_mu:
             _active[key] = time.monotonic()
@@ -160,7 +209,7 @@ def _gated(fn, *a, **kw):
         finally:
             with _active_mu:
                 _active.pop(key, None)
-            _gate.release()
+            _gate.release(bg)
         time.sleep(0.05 * (attempt + 1))
 
 
@@ -237,8 +286,20 @@ class SMBStorage:
             self._reset_locked()
 
     def _reset_locked(self) -> None:
+        """Рвём соединения без вежливого «выхода»: штатный reset_connection_cache()
+        сначала закрывает файлы и сессию и ждёт ответа сервера — у выключенного ПК
+        это ожидание бесконечное, и вместе с ним зависало всё приложение.
+        Закрытие сокета будит все потоки, ждущие ответа, — они сразу получают ошибку."""
         try:
-            self._smb.reset_connection_cache(fail_on_error=False)
+            from smbclient import _pool
+            cache = _pool._SMB_CONNECTIONS
+            for name in list(cache.keys()):
+                conn = cache.pop(name, None)
+                if conn is not None:
+                    try:
+                        conn.disconnect(close=False)
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception:  # noqa: BLE001
             pass
         self._registered = False
@@ -263,7 +324,7 @@ class SMBStorage:
                                 "Windows 10/11 допускает ~20 входящих SMB-сессий — закрой лишние "
                                 "подключения к шаре или перезагрузи ПК")
                 raise
-            if _not_connection_error(e) or _is_credit_error(e):
+            if isinstance(e, GateBusy) or _not_connection_error(e) or _is_credit_error(e):
                 raise
             # переподключаемся не чаще раза в 10 с и одним потоком: остальные просто повторяют
             with self._mu:

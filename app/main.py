@@ -14,6 +14,7 @@ import mimetypes
 import re
 import secrets
 import random
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -453,7 +454,8 @@ class PC:
                 cls.up = await run_in_threadpool(storage.reachable)
                 cls.checked = time.time()
                 if was and not cls.up and hasattr(storage, "reset"):
-                    await run_in_threadpool(storage.reset)
+                    # в отдельном потоке и без ожидания: статус и кнопка включения не должны зависеть от сброса
+                    threading.Thread(target=storage.reset, name="smb-reset", daemon=True).start()
             return cls.up
 
     @classmethod

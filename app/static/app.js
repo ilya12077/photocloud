@@ -26,6 +26,7 @@ function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.
 
 async function api(path, opts = {}) {
   const init = { credentials: 'same-origin', cache: opts.cache || 'no-store', headers: {} };
+  if (opts.timeout && window.AbortSignal && AbortSignal.timeout) init.signal = AbortSignal.timeout(opts.timeout);
   if (opts.method && opts.method !== 'GET') {
     init.method = opts.method;
     init.headers['X-Requested-With'] = 'photocloud';
@@ -141,7 +142,7 @@ async function poll(delay) {
   stopPoll();
   if (delay) { st.pollTimer = setTimeout(() => poll(), delay); return; }
   let s;
-  try { s = await (await api('/api/status')).json(); }
+  try { s = await (await api('/api/status', { timeout: 15000 })).json(); }
   catch (e) {
     if (e.message !== 'auth') { banner('Сервер недоступен, пробую снова…', null, null, true); st.pollTimer = setTimeout(() => poll(), 5000); }
     return;
