@@ -186,7 +186,6 @@ async function reindex() {
   try { await api('/api/reindex', { method: 'POST' }); } catch (_) {}
   poll(500);
 }
-$('refresh').addEventListener('click', reindex);
 
 // ================================================================== библиотека
 
