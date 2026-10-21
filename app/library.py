@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import threading
+import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ F_TAKEN = 2   # дата из EXIF/метаданных
 F_NAME = 4    # дата из имени файла
 F_NOPLAY = 8  # видео, которое браузер не воспроизведёт
 F_LIVE = 16   # «живое фото»: у снимка есть короткий ролик-пара
+F_FOLDER = 32 # известен только год — из названия папки
 
 LIVE_IMG = {".jpg", ".jpeg", ".heic", ".heif"}
 LIVE_VID = {".mp4", ".mov"}
@@ -54,11 +56,22 @@ class Photo:
     taken: float = 0.0     # из метаданных; 0 = неизвестно
     live: str = ""         # у фото: id ролика-пары; у ролика: id фото, к которому он относится
     named: float = 0.0     # из имени файла; 0 = нет
+    year: int = 0          # из названия папки; 0 = нет
+    year_ts: float = 0.0   # 1 января этого года, полдень (в часовом поясе архива)
 
     @property
     def date(self) -> float:
-        # приоритет: метаданные -> имя файла -> дата изменения
-        return self.taken or self.named or self.mtime
+        # приоритет: метаданные -> имя файла -> год папки -> дата изменения
+        if self.taken or self.named:
+            return self.taken or self.named
+        if self.year and time.localtime(self.mtime).tm_year != self.year:
+            # дата изменения из другого года (файл копировали) — ставим 1 января года из папки
+            return self.year_ts
+        return self.mtime
+
+    def folder_only(self) -> bool:
+        return not (self.taken or self.named) and bool(self.year) and \
+            time.localtime(self.mtime).tm_year != self.year
 
     def flags(self) -> int:
         f = 0
@@ -70,6 +83,8 @@ class Photo:
             f |= F_TAKEN
         elif self.named:
             f |= F_NAME
+        elif self.folder_only():
+            f |= F_FOLDER
         return f
 
     @property
@@ -204,7 +219,7 @@ class Library:
         body = json.dumps({"folders": folder_list, **cols}, ensure_ascii=False, separators=(",", ":"))
         version = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
         payload = ('{"v":"%s",' % version + body[1:]).encode("utf-8", "replace")
-        gz = gzip.compress(payload, compresslevel=6)
+        gz = gzip.compress(payload, compresslevel=9)
         # атомарная подмена: читатели видят либо старую, либо новую версию целиком
         self.by_id = {p.id: p for p in everything}
         self.payload, self.payload_gz, self.version = payload, gz, version
@@ -237,6 +252,9 @@ class Library:
                 seen.add(pid)
                 p = Photo(pid, rel, folders[folder], name, size, mtime, os.path.splitext(name)[1].lower())
                 p.named = meta.name_date(name, self.tz) or 0.0
+                p.year = meta.folder_year(rel) or 0
+                if p.year:
+                    p.year_ts = datetime.datetime(p.year, 1, 1, 12, tzinfo=self.tz).timestamp()
                 c = self.cache.get(p.cache_key())
                 if c:
                     p.taken = c

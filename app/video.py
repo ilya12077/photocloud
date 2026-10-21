@@ -142,7 +142,7 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                    "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
                    "-vf", f"scale={box}:{box}:force_original_aspect_ratio=decrease:flags=bilinear,format={pix}",
                    "-f", "image2pipe", "-c:v", codec, "pipe:1"]
-            r = run_ff(cmd, src, protocols, fmt, 60)
+            r = run_ff(cmd, src, protocols, fmt, 25)
             if r.returncode == 0 and r.stdout[:len(magic)] == magic:
                 if oi != _preferred:
                     log.info("кадры видео: переключился на вывод %s/%s", codec, pix)

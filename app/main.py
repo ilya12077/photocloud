@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import contextlib
 import ipaddress
 import json
@@ -274,24 +275,41 @@ def no_store(resp: Response) -> Response:
 
 # ---------------------------------------------------------------- страницы
 
+def _versioned_html(name: str) -> bytes:
+    """HTML с версиями у ссылок на статику (?v=хэш файла). Тогда браузер хранит
+    js/css «навсегда» и не тратит запросы на проверку — а после обновления файла
+    меняется хэш, и новая версия скачивается сама."""
+    html = (STATIC / name).read_text(encoding="utf-8")
+
+    def ver(m):
+        f = STATIC / m.group(2)
+        try:
+            h = hashlib.blake2b(f.read_bytes(), digest_size=5).hexdigest()
+        except OSError:
+            return m.group(0)
+        return f'{m.group(1)}/static/{m.group(2)}?v={h}"'
+    return re.sub(r'((?:src|href)=")/static/([A-Za-z0-9_./-]+\.(?:js|css))"', ver, html).encode()
+
+
+PAGES = {"/": _versioned_html("index.html"), "/admin": _versioned_html("admin.html")}
+
+
 @app.get("/", include_in_schema=False)
 async def index_page():
-    r = FileResponse(STATIC / "index.html", media_type="text/html; charset=utf-8")
-    r.headers["cache-control"] = "no-cache"
-    return r
+    return Response(PAGES["/"], media_type="text/html; charset=utf-8", headers={"cache-control": "no-cache"})
 
 
 @app.get("/admin", include_in_schema=False)
 async def admin_page():
-    r = FileResponse(STATIC / "admin.html", media_type="text/html; charset=utf-8")
-    r.headers["cache-control"] = "no-cache"
-    return r
+    return Response(PAGES["/admin"], media_type="text/html; charset=utf-8", headers={"cache-control": "no-cache"})
 
 
 class _Static(StaticFiles):
     async def get_response(self, path, scope):
         r = await super().get_response(path, scope)
-        r.headers["cache-control"] = "no-cache"
+        q = scope.get("query_string", b"")
+        # с версией в адресе — кэш на год; без неё (hls.js грузится по прямому адресу) — с проверкой
+        r.headers["cache-control"] = "public, max-age=31536000, immutable" if q.startswith(b"v=") else "no-cache"
         return r
 
 
@@ -915,6 +933,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
         "pc": "up" if up else ("waking" if PC.wake_at else "down"),
         "index": {"state": library.state, "error": library.error, "files": len(photos) - lives, "videos": videos, "live": lives,
                   "with_date": sum(1 for p in photos if p.taken), "with_name_date": sum(1 for p in photos if not p.taken and p.named),
+                  "with_folder_year": sum(1 for p in photos if p.folder_only()),
                   "built_at": int(library.built_at),
                   "meta": [library.meta_done, library.meta_total]},
         "cache": {"thumb": [thumb_cache.size, thumb_cache.max], "preview": [preview_cache.size, preview_cache.max]},
@@ -1157,4 +1176,19 @@ async def admin_logs(request: Request, _: Session = Depends(require_admin)):
 
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
-app = Guard(app)  # type: ignore[assignment]
+class StaticGzip:
+    """gzip только для страниц и статики (html/js/css ~ в 3–4 раза меньше).
+    Картинки и видео уже сжаты — их не трогаем, чтобы не тратить процессор."""
+
+    def __init__(self, app):
+        from starlette.middleware.gzip import GZipMiddleware
+        self.app, self.gz = app, GZipMiddleware(app, minimum_size=1024, compresslevel=6)
+
+    async def __call__(self, scope, receive, send):
+        p = scope.get("path", "") if scope["type"] == "http" else ""
+        if p in ("/", "/admin") or (p.startswith("/static/")):
+            return await self.gz(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+app = Guard(StaticGzip(app))  # type: ignore[assignment]

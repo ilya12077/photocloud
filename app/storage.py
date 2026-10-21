@@ -139,14 +139,28 @@ def _is_credit_error(e: BaseException) -> bool:
     return "credits" in str(e) and "available" in str(e)
 
 
+_active: dict[int, float] = {}          # операция -> когда началась (для сторожа)
+_active_mu = threading.Lock()
+GATE_WAIT = 30                          # дольше не ждём свободного слота — отдаём ошибку, клиент повторит
+HANG_AFTER = 40                         # сетевая операция дольше — считаем, что SMB завис
+
+
 def _gated(fn, *a, **kw):
     for attempt in range(6):
-        with _gate:
-            try:
-                return fn(*a, **kw)
-            except Exception as e:  # noqa: BLE001
-                if not _is_credit_error(e) or attempt == 5:
-                    raise
+        if not _gate.acquire(timeout=GATE_WAIT):
+            raise TimeoutError("SMB: все слоты заняты")
+        key = id(threading.current_thread()) ^ int(time.monotonic() * 1e6)
+        with _active_mu:
+            _active[key] = time.monotonic()
+        try:
+            return fn(*a, **kw)
+        except Exception as e:  # noqa: BLE001
+            if not _is_credit_error(e) or attempt == 5:
+                raise
+        finally:
+            with _active_mu:
+                _active.pop(key, None)
+            _gate.release()
         time.sleep(0.05 * (attempt + 1))
 
 
@@ -193,6 +207,22 @@ class SMBStorage:
         self._mu = threading.RLock()
         self._reset_at = 0.0
         self._warned = 0.0
+        threading.Thread(target=self._watchdog, name="smb-watchdog", daemon=True).start()
+
+    def _watchdog(self) -> None:
+        """Если Windows перестала отвечать посреди запроса, smbprotocol ждёт ответа вечно,
+        и занятые слоты блокируют всё приложение. Сторож рвёт такое соединение — зависшие
+        вызовы получают ошибку, клиенты повторяют запрос уже по новому подключению."""
+        while True:
+            time.sleep(5)
+            with _active_mu:
+                oldest = min(_active.values(), default=None)
+            if oldest is not None and time.monotonic() - oldest > HANG_AFTER:
+                log.warning("SMB: запрос висит дольше %d с — сбрасываю соединение", HANG_AFTER)
+                with self._mu:
+                    self._reset_locked()
+                with _active_mu:
+                    _active.clear()
 
     def reachable(self, timeout: float = 1.5) -> bool:
         try:
