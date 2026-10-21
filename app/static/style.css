@@ -200,5 +200,15 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .v-origchk { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 10px; border-radius: 9px;
   background: #ffffff14; border: 1px solid #ffffff22; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
 .v-origchk input { accent-color: var(--accent); margin: 0; }
+/* живое фото: ролик лежит поверх снимка, ведёт себя как картинка (масштаб, свайпы) */
+#v-live { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none;
+  opacity: 0; transition: opacity .25s; background: transparent; }
+#v-live.on { opacity: 1; }
+.live-ico { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid currentColor;
+  box-shadow: inset 0 0 0 2px transparent; position: relative; }
+.live-ico::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: currentColor; }
+.lbadge { position: absolute; left: 6px; top: 5px; width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid #fff;
+  box-shadow: 0 0 3px #0008; pointer-events: none; }
+.lbadge::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #fff; }
 .v-note { position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 2;
   background: #000b; color: #fff; padding: 8px 14px; border-radius: 10px; font-size: 14px; text-align: center; max-width: 90%; }

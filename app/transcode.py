@@ -21,6 +21,8 @@ PROFILES = {
     "eco": {"h": 720, "crf": "26", "maxrate": "1800k", "bufsize": "3600k", "ab": "96k"},
     "hq": {"h": 1080, "crf": "21", "maxrate": "8M", "bufsize": "16M", "ab": "160k"},
 }
+_FPS_RE = re.compile(rb"Video:.*?(\d+(?:\.\d+)?) fps")
+fps_of: dict[str, float] = {}     # src -> частота кадров (из того же вызова ffmpeg -i)
 _DUR_RE = re.compile(rb"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 _FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
@@ -38,6 +40,11 @@ def probe_duration(ffmpeg: str, src: str, protocols: str, demuxer: str) -> float
     """Длительность из вывода `ffmpeg -i` (ffprobe в pip-сборке нет)."""
     r = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-protocol_whitelist", protocols,
                         "-f", demuxer, "-i", src], capture_output=True, timeout=30, creationflags=_FLAGS)
+    f = _FPS_RE.search(r.stderr)
+    if f:
+        if len(fps_of) > 5000:
+            fps_of.clear()
+        fps_of[src] = float(f.group(1))
     m = _DUR_RE.search(r.stderr)
     if not m:
         return None
@@ -67,9 +74,11 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
            "-protocol_whitelist", protocols, "-f", demuxer,
            "-ss", f"{start:.3f}", "-i", src, "-t", f"{length:.3f}",
            "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-           # не больше p["h"] по короткой стороне (вертикальные ролики тоже), чётные размеры, 8 бит
-           "-vf", f"scale='if(gt(iw,ih),-2,min({p['h']},iw))':'if(gt(iw,ih),min({p['h']},ih),-2)',format=yuv420p",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", p["crf"],
+           # 60 к/с -> 30 (для просмотра хватает, а кодирование вдвое легче; кадры отбрасываются
+           # до уменьшения, так что и масштабировать вдвое меньше). Не больше p["h"] по короткой
+           # стороне (вертикальные тоже), чётные размеры, 8 бит.
+           "-vf", ("fps=30," if fps_of.get(src, 0) > 32 else "") + f"scale='if(gt(iw,ih),-2,min({p['h']},iw))':'if(gt(iw,ih),min({p['h']},ih),-2)':flags=bilinear,format=yuv420p",
+           "-c:v", "libx264", "-preset", "superfast", "-crf", p["crf"],
            "-maxrate", p["maxrate"], "-bufsize", p["bufsize"],
            "-profile:v", "high", "-level", "4.1", "-g", "48",
            "-force_key_frames", "expr:eq(n,0)",              # каждый кусок начинается с ключевого кадра
@@ -77,11 +86,31 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
            # метки времени — как в полном ролике, чтобы куски шли встык
            "-output_ts_offset", f"{start:.3f}", "-muxdelay", "0", "-muxpreload", "0",
            "-f", "mpegts", "pipe:1"]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, creationflags=_FLAGS)
+    from .video import run_ff
+    r = run_ff(cmd, src, protocols, demuxer, 120)
     if r.returncode != 0 or len(r.stdout) < 188:
-        err = r.stderr[-300:].decode("utf-8", "replace").replace("\r", "").strip().replace("\n", " | ")
-        log.warning("перекодирование куска %d не удалось: %s", index, err or r.returncode)
+        from .video import _clean_err
+        log.warning("перекодирование куска %d не удалось: %s", index, _clean_err(r.stderr))
         raise ValueError("transcode failed")
+    return r.stdout
+
+
+def live_clip(ffmpeg: str, src: str, protocols: str, demuxer: str) -> bytes:
+    """Ролик живого фото -> MP4 (H.264 + AAC, до 720 px по короткой стороне, ≤ 10 с).
+    Фрагментированный MP4: его можно писать в трубу, а браузеры играют его как обычный."""
+    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+           "-protocol_whitelist", protocols, "-f", demuxer, "-i", src, "-t", "10",
+           "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+           "-vf", "scale='if(gt(iw,ih),-2,min(720,iw))':'if(gt(iw,ih),min(720,ih),-2)',format=yuv420p",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-profile:v", "high", "-level", "4.1",
+           "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+           "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+    from .video import run_ff
+    r = run_ff(cmd, src, protocols, demuxer, 120)
+    if r.returncode != 0 or len(r.stdout) < 1000:
+        from .video import _clean_err
+        log.warning("ролик живого фото не перекодирован: %s", _clean_err(r.stderr))
+        raise ValueError("live clip failed")
     return r.stdout
 
 

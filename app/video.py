@@ -57,6 +57,67 @@ _MODES = {
 _fast_fail = 0
 
 
+def _clean_err(b: bytes, limit: int = 700) -> str:
+    """Начало ошибки ffmpeg — самое важное (там причина), хвост — следствия."""
+    t = b.decode("utf-8", "replace").replace("\r", "").strip()
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    t = " | ".join(lines)
+    return (t[:limit] + " …") if len(t) > limit else (t or "—")
+
+
+def describe(ffmpeg: str, src: str, protocols: str, demuxer: str) -> str:
+    """Какие потоки внутри файла (кодек, размер, пиксели) — для диагностики в логе."""
+    try:
+        r = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-protocol_whitelist", protocols,
+                            "-f", demuxer, "-i", src], capture_output=True, timeout=30,
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stderr.decode("utf-8", "replace")
+        keep = [ln.strip() for ln in out.splitlines() if "Stream #" in ln or "Duration:" in ln
+                or "displaymatrix" in ln.lower() or "rotation" in ln.lower()]
+        return " | ".join(keep)[:700] or "—"
+    except Exception as e:  # noqa: BLE001
+        return f"не удалось описать ({type(e).__name__})"
+
+
+# --- «битые» цветовые метки. Некоторые телефоны пишут в H.264/HEVC цветовую матрицу
+# со значением «reserved». ffmpeg 7.1 такие кадры отвергает («Invalid color space»).
+# Лечим без перекодирования исходника: битстрим-фильтр на входе переписывает метку
+# на обычную smpte170m (как и записано у них в transfer). Делается только для таких файлов.
+_colorfix: dict[str, list[str]] = {}
+_BAD_COLOR = (b"Invalid color space", b"Invalid color primaries", b"Invalid color trc")
+
+
+def colorfix_args(ffmpeg: str, src: str, protocols: str, demuxer: str) -> list[str]:
+    if src in _colorfix:
+        return _colorfix[src]
+    info = describe(ffmpeg, src, protocols, demuxer)
+    bsf = "hevc_metadata" if "Video: hevc" in info else "h264_metadata" if "Video: h264" in info else ""
+    args = ["-bsf:v", f"{bsf}=matrix_coefficients=6:colour_primaries=6:transfer_characteristics=6"] if bsf else []
+    if len(_colorfix) > 2000:
+        _colorfix.clear()
+    _colorfix[src] = args
+    return args
+
+
+def run_ff(cmd: list[str], src: str, protocols: str, demuxer: str, timeout: int):
+    """Запуск ffmpeg; при «Invalid color space» — один повтор с исправлением метки цвета."""
+    ffmpeg = cmd[0]
+    pre = _colorfix.get(src)
+    if pre:
+        i = cmd.index("-i")
+        cmd = cmd[:i] + pre + cmd[i:]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    if pre is None and r.returncode != 0 and any(m in r.stderr for m in _BAD_COLOR):
+        fix = colorfix_args(ffmpeg, src, protocols, demuxer)
+        if fix:
+            i = cmd.index("-i")
+            r = subprocess.run(cmd[:i] + fix + cmd[i:], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=timeout,
+                               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    return r
+
+
 def _signed(code: int) -> int:
     """Windows отдаёт код возврата беззнаковым: 4294967274 == -22."""
     return code - (1 << 32) if code > 0x7FFFFFFF else code
@@ -81,8 +142,7 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                    "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
                    "-vf", f"scale={box}:{box}:force_original_aspect_ratio=decrease:flags=bilinear,format={pix}",
                    "-f", "image2pipe", "-c:v", codec, "pipe:1"]
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
-                               creationflags=flags)
+            r = run_ff(cmd, src, protocols, fmt, 60)
             if r.returncode == 0 and r.stdout[:len(magic)] == magic:
                 if oi != _preferred:
                     log.info("кадры видео: переключился на вывод %s/%s", codec, pix)
@@ -99,6 +159,6 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                 break                       # ошибка формата вывода — пробуем следующий вариант вывода
             # код 0, но кадра нет — пробуем следующий способ
     code = _signed(last.returncode)
-    err = last.stderr[-400:].decode("utf-8", "replace").replace("\r", "").strip().replace("\n", " | ")
-    log.warning("ffmpeg не смог взять кадр из %s (код %s): %s", ext, code, err or "—")
+    log.warning("ffmpeg не смог взять кадр из %s (код %s): %s || файл: %s", ext, code,
+                _clean_err(last.stderr), describe(ffmpeg, src, protocols, fmt))
     raise ValueError("no frame")

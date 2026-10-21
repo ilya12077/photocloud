@@ -26,6 +26,7 @@ from PIL import Image, UnidentifiedImageError
 
 from . import config
 from . import logs
+from .db import DB
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
 from .ha import HomeAssistant, clean
 from .images import HEAD_BYTES, LRUBytes, TooLarge, embedded_heic, embedded_jpeg, finish, read_limited, render
@@ -48,7 +49,8 @@ OAUTH_COOKIE = "__Host-pc_oauth" if S.cookie_secure else "pc_oauth"
 ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
-library = Library(S.data_dir, S.tz, S.meta_threads)
+db = DB(S.data_dir / "photocloud.db")
+library = Library(S.data_dir, S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
 transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
@@ -62,7 +64,7 @@ except (OSError, ValueError) as e:
     raise SystemExit(f"Не читается {S.data_dir / 'users.json'}: {e}") from None
 # пока нет ни одного пользователя — первичная настройка по одноразовому токену из консоли
 SETUP_TOKEN = secrets.token_urlsafe(24) if users.empty() else ""
-sessions = SessionStore(S.session_idle_hours * 3600, S.session_max_hours * 3600)
+sessions = SessionStore(S.session_idle_hours * 3600, S.session_max_hours * 3600, db)
 limiter = LoginLimiter()
 thumb_cache = LRUBytes(S.thumb_cache_mb * 1024 * 1024)
 preview_cache = LRUBytes(S.preview_cache_mb * 1024 * 1024)
@@ -807,6 +809,44 @@ async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
     return Response(data, media_type="video/mp2t", headers={"cache-control": "private, max-age=3600"})
 
 
+@app.get("/vid/{pid}/live.mp4")
+async def vid_live(request: Request, pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
+    """Ролик живого фото: целиком, H.264 + звук — играет в любом браузере.
+    Пара секунд видео перекодируется за доли секунды и живёт в RAM-кэше."""
+    p = library.get(pid)
+    if p is None or not p.video or not p.live:
+        raise HTTPException(404)
+    if not TRANSCODE:
+        return await serve_file(request, p, {"cache-control": "private, max-age=3600"})
+    src, prot = _video_src(p)
+    try:
+        data = await transcoder.get((pid, int(p.mtime), p.size, "live-a"),
+                                    lambda: transcode.live_clip(FFMPEG, src, prot, video.DEMUXER[p.ext]))
+    except ValueError:
+        raise HTTPException(415) from None
+    except Exception:  # noqa: BLE001
+        raise HTTPException(503, "pc") from None
+    return bytes_response(request, data, "video/mp4")
+
+
+def bytes_response(request: Request, data: bytes, ctype: str) -> Response:
+    """Ответ из памяти с поддержкой Range (Safari без неё не играет <video>)."""
+    size = len(data)
+    headers = {"accept-ranges": "bytes", "cache-control": "private, max-age=3600"}
+    m = RANGE_RE.match((request.headers.get("range") or "").strip())
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        else:
+            start, end = max(0, size - int(m.group(2))), size - 1
+        if start > end or start >= size:
+            return Response(status_code=416, headers={"content-range": f"bytes */{size}"})
+        headers["content-range"] = f"bytes {start}-{end}/{size}"
+        return Response(data[start:end + 1], status_code=206, media_type=ctype, headers=headers)
+    return Response(data, media_type=ctype, headers=headers)
+
+
 @app.get("/internal/raw/{pid}")
 async def internal_raw(request: Request, pid: str = PathParam(pattern=ID_RE)):
     if not secrets.compare_digest(request.query_params.get("k", ""), INTERNAL_TOKEN):
@@ -860,11 +900,12 @@ async def admin_setup_needed():
 async def admin_overview(_: Session = Depends(require_admin)):
     up = await PC.is_up()
     photos = list(library.by_id.values())
-    videos = sum(1 for p in photos if p.video)
+    videos = sum(1 for p in photos if p.video and not p.live)
+    lives = sum(1 for p in photos if p.live and not p.video)
     return no_store(JSONResponse({
         "uptime": int(time.time() - STARTED),
         "pc": "up" if up else ("waking" if PC.wake_at else "down"),
-        "index": {"state": library.state, "error": library.error, "files": len(photos), "videos": videos,
+        "index": {"state": library.state, "error": library.error, "files": len(photos) - lives, "videos": videos, "live": lives,
                   "with_date": sum(1 for p in photos if p.taken), "with_name_date": sum(1 for p in photos if not p.taken and p.named),
                   "built_at": int(library.built_at),
                   "meta": [library.meta_done, library.meta_total]},

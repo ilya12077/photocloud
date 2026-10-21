@@ -7,7 +7,7 @@ const MONTHS = ['Январь','Февраль','Март','Апрель','Ма�
 const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 const HEAD_H = 46;          // высота заголовка месяца, px
 const BUFFER = 1.2;         // сколько экранов рендерим сверху/снизу
-const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8;
+const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16;
 
 const st = {
   me: null,
@@ -188,7 +188,7 @@ function decode(j) {
     d = i === 0 ? j.d[0] : d - j.d[i];
     out[i] = [j.id.substr(i * 8, 8), j.f[i], j.n[i], d, d + j.m[i], j.s[i], j.x[i]];
   }
-  return { v: j.v, folders: j.folders, photos: out };
+  return { v: j.v, folders: j.folders, photos: out, live: j.live || {} };
 }
 
 async function loadLibrary() {
@@ -429,6 +429,7 @@ function buildRow(r) {
     img.onerror = () => { if (img.getAttribute('src')) { b.classList.add('broken'); img.dataset.err = '1'; } };
     b.append(img);
     if (ph[6] & F_VIDEO) b.append(el('span', 'vbadge', '▶'));
+    else if (ph[6] & F_LIVE) b.append(el('span', 'lbadge'));
     row.append(b);
   }
   return row;
@@ -653,6 +654,7 @@ function show(i) {
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
   resetZoom(false); VZ.kind = isVideo ? '' : previewKind(); VZ.tap = null;
+  setupLive(ph, tok);
   $('v-note').hidden = !(ph[6] & F_NOPLAY);
   hi.classList.remove('ok'); hi.removeAttribute('src');
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
@@ -675,9 +677,51 @@ function show(i) {
   $('v-prev').disabled = i === 0; $('v-next').disabled = i === st.list.length - 1;
 }
 
+// ---- живые фото
+function stopLive() {
+  const lv = $('v-live'); lv.classList.remove('on'); lv.pause(); lv.removeAttribute('src'); lv.load();
+}
+function setupLive(ph, tok) {
+  stopLive();
+  const vid = (ph[6] & F_LIVE) && st.lib.live[ph[0]];
+  $('v-livewrap').hidden = !vid;
+  if (!vid) return;
+  $('v-livechk').checked = store('pc.live') === '1';
+  if ($('v-livechk').checked) playLive(vid, tok);
+}
+function playLive(vid, tok) {
+  const lv = $('v-live');
+  lv.onended = () => lv.classList.remove('on');             // доиграл — снова фото
+  lv.muted = false;
+  lv.oncanplay = () => {
+    if (tok !== V.token) return;
+    lv.play().then(() => lv.classList.add('on')).catch(() => {
+      // браузер не дал играть со звуком без нажатия — играем без звука
+      lv.muted = true;
+      lv.play().then(() => lv.classList.add('on')).catch(() => {});
+    });
+  };
+  lv.onerror = () => lv.classList.remove('on');
+  lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4`;
+  lv.load();
+}
+// если браузер не разрешил звук без нажатия — первое касание фото включает звук и переигрывает
+$('v-stage').addEventListener('pointerup', () => {
+  const lv = $('v-live');
+  if (lv.muted && lv.getAttribute('src') && !$('v-livewrap').hidden) {
+    lv.muted = false; lv.currentTime = 0; lv.play().then(() => lv.classList.add('on')).catch(() => { lv.muted = true; });
+  }
+});
+$('v-livechk').addEventListener('change', (e) => {
+  store('pc.live', e.target.checked ? '1' : '0');
+  const ph = st.list[V.i]; const vid = ph && st.lib.live[ph[0]];
+  if (!vid) return;
+  if (e.target.checked) { stopLive(); playLive(vid, V.token); } else stopLive();
+});
+
 function closeViewer(silent) {
   if ($('viewer').hidden) return;
-  stopVideo(); resetZoom(false);
+  stopVideo(); stopLive(); resetZoom(false);
   $('viewer').hidden = true; document.body.style.overflow = '';
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;
   if (V.pushed && !silent) { V.pushed = false; history.back(); }

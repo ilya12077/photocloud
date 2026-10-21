@@ -164,30 +164,54 @@ class Session:
 
 
 class SessionStore:
-    """Токен живёт только в cookie; на сервере храним его SHA-256,
-    чтобы даже дамп памяти/лог не давал готовых токенов."""
+    """Токен живёт только в cookie; на сервере (и в базе) храним его SHA-256,
+    так что даже копия базы не даёт готовых токенов. Сессии переживают перезапуск.
+    В памяти — рабочая копия; время последней активности пишется в базу не чаще раза в минуту."""
 
     MAX_PER_USER = 20
+    TOUCH_EVERY = 60
 
-    def __init__(self, idle_s: int, max_s: int):
+    def __init__(self, idle_s: int, max_s: int, db=None):
         self.idle_s = idle_s
         self.max_s = max_s
+        self.db = db
         self._s: dict[str, Session] = {}
+        self._saved: dict[str, float] = {}       # last_seen, записанный в базу
         self._lock = threading.Lock()
+        if db is not None:
+            now = time.time()
+            for key, user, ip, created, last in db.run("SELECT key, user, ip, created, last_seen FROM sessions"):
+                if now - last <= idle_s and now - created <= max_s:
+                    self._s[key] = Session(user, ip, created, last)
+                    self._saved[key] = last
+            db.run("DELETE FROM sessions WHERE ? - last_seen > ? OR ? - created > ?", (now, idle_s, now, max_s))
 
     @staticmethod
     def _key(token: str) -> str:
         return hashlib.sha256(token.encode()).hexdigest()
 
+    def _db_del(self, keys: list[str]) -> None:
+        for k in keys:
+            self._saved.pop(k, None)
+        if self.db is not None and keys:
+            self.db.many("DELETE FROM sessions WHERE key = ?", [(k,) for k in keys])
+
     def create(self, user: str, ip: str) -> str:
         token = secrets.token_urlsafe(32)
         now = time.time()
+        k = self._key(token)
         with self._lock:
             self._purge(now)
-            mine = sorted((s.created, k) for k, s in self._s.items() if s.user == user)
-            for _, k in mine[: max(0, len(mine) - self.MAX_PER_USER + 1)]:
-                del self._s[k]
-            self._s[self._key(token)] = Session(user, ip, now, now)
+            mine = sorted((s.created, key) for key, s in self._s.items() if s.user == user)
+            old = [key for _, key in mine[: max(0, len(mine) - self.MAX_PER_USER + 1)]]
+            for key in old:
+                del self._s[key]
+            self._s[k] = Session(user, ip, now, now)
+            self._db_del(old)
+            if self.db is not None:
+                self.db.run("INSERT OR REPLACE INTO sessions(key, user, ip, created, last_seen) VALUES(?,?,?,?,?)",
+                            (k, user, ip, now, now))
+                self._saved[k] = now
         return token
 
     def get(self, token: str | None) -> Session | None:
@@ -201,14 +225,20 @@ class SessionStore:
                 return None
             if now - s.last_seen > self.idle_s or now - s.created > self.max_s:
                 del self._s[k]
+                self._db_del([k])
                 return None
             s.last_seen = now
+            if self.db is not None and now - self._saved.get(k, 0) > self.TOUCH_EVERY:
+                self.db.run("UPDATE sessions SET last_seen = ? WHERE key = ?", (now, k))
+                self._saved[k] = now
             return s
 
     def delete(self, token: str | None) -> None:
         if token:
+            k = self._key(token)
             with self._lock:
-                self._s.pop(self._key(token), None)
+                self._s.pop(k, None)
+                self._db_del([k])
 
     def sid(self, token: str | None) -> str:
         """Короткий публичный id сессии (для админки) — не позволяет восстановить токен."""
@@ -225,6 +255,7 @@ class SessionStore:
         with self._lock:
             for k in [k for k in self._s if k[:16] == sid]:
                 del self._s[k]
+                self._db_del([k])
                 return True
         return False
 
@@ -233,6 +264,7 @@ class SessionStore:
             ks = [k for k, s in self._s.items() if s.user == user]
             for k in ks:
                 del self._s[k]
+            self._db_del(ks)
             return len(ks)
 
     def _purge(self, now: float) -> None:
@@ -240,6 +272,7 @@ class SessionStore:
                 if now - s.last_seen > self.idle_s or now - s.created > self.max_s]
         for k in dead:
             del self._s[k]
+        self._db_del(dead)
 
 
 class LoginLimiter:

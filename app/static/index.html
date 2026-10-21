@@ -67,6 +67,7 @@
   <div class="v-top">
     <a id="v-orig" class="icon" target="_blank" rel="noopener" title="Оригинал в новой вкладке" aria-label="Оригинал">⤢</a>
     <a id="v-dl" class="icon" title="Скачать оригинал" aria-label="Скачать">⤓</a>
+    <label class="v-origchk" id="v-livewrap" hidden title="Живое фото: проигрывать ролик при открытии"><input type="checkbox" id="v-livechk"> <span class="live-ico" aria-hidden="true"></span>Live</label>
     <label class="v-origchk" id="v-origwrap" hidden title="Смотреть исходный файл без перекодирования (тяжелее для канала)"><input type="checkbox" id="v-origchk"> Оригинал</label>
     <div class="v-meta"><div id="v-name"></div><div id="v-date" class="dim"></div></div>
     <button id="v-close" class="icon" type="button" aria-label="Закрыть">✕</button>
@@ -75,6 +76,7 @@
     <div id="v-zoom" class="v-zoom">
       <img id="v-low" alt="">
       <img id="v-img" alt="">
+      <video id="v-live" muted playsinline preload="none" disablepictureinpicture disableremoteplayback></video>
     </div>
     <video id="v-video" controls playsinline preload="metadata" hidden></video>
     <div id="v-spin" class="spin" hidden></div>

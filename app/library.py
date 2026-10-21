@@ -27,6 +27,11 @@ F_VIDEO = 1
 F_TAKEN = 2   # дата из EXIF/метаданных
 F_NAME = 4    # дата из имени файла
 F_NOPLAY = 8  # видео, которое браузер не воспроизведёт
+F_LIVE = 16   # «живое фото»: у снимка есть короткий ролик-пара
+
+LIVE_IMG = {".jpg", ".jpeg", ".heic", ".heif"}
+LIVE_VID = {".mp4", ".mov"}
+LIVE_MAX = 40 * 1024 * 1024     # ролик живого фото — пара секунд, обычно 2–10 МБ
 
 
 def photo_id(rel: str, salt: int = 0) -> str:
@@ -47,6 +52,7 @@ class Photo:
     mtime: float
     ext: str
     taken: float = 0.0     # из метаданных; 0 = неизвестно
+    live: str = ""         # у фото: id ролика-пары; у ролика: id фото, к которому он относится
     named: float = 0.0     # из имени файла; 0 = нет
 
     @property
@@ -58,6 +64,8 @@ class Photo:
         f = 0
         if self.video:
             f |= F_VIDEO | (0 if self.ext in PLAYABLE_EXT else F_NOPLAY)
+        if self.live and not self.video:
+            f |= F_LIVE
         if self.taken:
             f |= F_TAKEN
         elif self.named:
@@ -73,19 +81,16 @@ class Photo:
 
 
 class MetaCache:
-    def __init__(self, path: Path):
-        self.path = path
-        self.d: dict[str, float] = {}
+    """Даты съёмки: в памяти — словарь для быстрых проверок, на диске — таблица SQLite.
+    Пишутся только новые записи (пачками), а не весь кэш целиком."""
+
+    def __init__(self, db, legacy_json: Path):
+        self.db = db
+        db.migrate_dates_json(legacy_json)
+        self.d: dict[str, float] = db.dates_load()
+        self._pending: list[tuple[str, float]] = []
         self._mu = threading.Lock()
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                self.d = {k: float(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))}
-            log.info("кэш дат: %d записей", len(self.d))
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError) as e:
-            log.warning("кэш дат не прочитан (%s), начинаю заново", type(e).__name__)
+        log.info("кэш дат: %d записей", len(self.d))
 
     def get(self, key: str):
         return self.d.get(key)
@@ -93,26 +98,30 @@ class MetaCache:
     def put(self, key: str, ts: float) -> None:
         with self._mu:
             self.d[key] = ts
+            self._pending.append((key, ts))
 
     def save(self, keep: set[str] | None = None) -> None:
         with self._mu:
+            batch, self._pending = self._pending, []
             if keep is not None:
                 self.d = {k: v for k, v in self.d.items() if k in keep}
-            data = json.dumps(self.d, ensure_ascii=False, separators=(",", ":"))
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(data, encoding="utf-8")
-            os.replace(tmp, self.path)
-        except OSError as e:
+            self.db.dates_put(batch)
+            if keep is not None:
+                gone = self.db.dates_prune(keep)
+                if gone:
+                    log.info("кэш дат: убрано %d записей об отсутствующих файлах", gone)
+        except Exception as e:  # noqa: BLE001
             log.warning("не удалось сохранить кэш дат: %s", e)
+            with self._mu:
+                self._pending = batch + self._pending
 
 
 class Library:
-    def __init__(self, data_dir: Path, tz, meta_threads: int = 8):
+    def __init__(self, data_dir: Path, tz, meta_threads: int = 8, db=None):
         self.tz = tz
         self.meta_threads = meta_threads
-        self.cache = MetaCache(data_dir / "dates-cache.json")
+        self.cache = MetaCache(db, data_dir / "dates-cache.json")
         self.state = "empty"          # empty | building | ready | error
         self.error = ""
         self.built_at = 0.0
@@ -152,7 +161,32 @@ class Library:
 
     # ------------------------------------------------------------ публикация
 
+    @staticmethod
+    def pair_live(photos: list[Photo]) -> int:
+        """Живые фото: снимок и ролик в одной папке с одинаковым именем
+        (IMG_1234.HEIC + IMG_1234.MOV у iPhone, IMG_2026…jpg + IMG_2026…MP4 у Android/Takeout).
+        Ролик прячется из ленты и показывается внутри фото."""
+        groups: dict = {}
+        for p in photos:
+            p.live = ""
+            stem = p.name.rsplit(".", 1)[0].lower()
+            groups.setdefault((p.folder, stem), []).append(p)
+        n = 0
+        for g in groups.values():
+            if len(g) != 2:
+                continue
+            img = next((p for p in g if p.ext in LIVE_IMG), None)
+            vid = next((p for p in g if p.ext in LIVE_VID), None)
+            if img and vid and vid.size <= LIVE_MAX:
+                img.live, vid.live = vid.id, img.id
+                n += 1
+        return n
+
     def _publish(self, photos: list[Photo], folder_list: list[str]) -> None:
+        self.pair_live(photos)
+        everything = photos
+        # ролики живых фото в ленту не попадают, но остаются доступны по id
+        photos = [p for p in photos if not (p.video and p.live)]
         photos = sorted(photos, key=lambda p: (int(p.date), p.name), reverse=True)
         # колоночный формат: так gzip жмёт заметно лучше, чем массив строк
         dates = [int(p.date) for p in photos]
@@ -165,13 +199,14 @@ class Library:
             "m": [int(p.mtime) - d for p, d in zip(photos, dates)],     # чаще всего 0
             "s": [(p.size + 1023) // 1024 for p in photos],              # КБ
             "x": [p.flags() for p in photos],
+            "live": {p.id: p.live for p in photos if p.live},
         }
         body = json.dumps({"folders": folder_list, **cols}, ensure_ascii=False, separators=(",", ":"))
         version = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
         payload = ('{"v":"%s",' % version + body[1:]).encode("utf-8", "replace")
         gz = gzip.compress(payload, compresslevel=6)
         # атомарная подмена: читатели видят либо старую, либо новую версию целиком
-        self.by_id = {p.id: p for p in photos}
+        self.by_id = {p.id: p for p in everything}
         self.payload, self.payload_gz, self.version = payload, gz, version
 
     # ------------------------------------------------------------ сборка
@@ -209,7 +244,8 @@ class Library:
                 self.progress = len(photos)
             self._publish(photos, folder_list)
             self.built_at, self.state, self.error = time.time(), "ready", ""
-            log.info("индекс: %d файлов, %d папок за %.1fс", len(photos), len(folder_list), time.time() - t0)
+            log.info("индекс: %d файлов, %d папок за %.1fс, живых фото: %d", len(photos), len(folder_list),
+                     time.time() - t0, sum(1 for p in photos if p.live and not p.video))
         except Exception as e:  # noqa: BLE001
             log.exception("ошибка индексации")
             self.error = type(e).__name__
@@ -248,7 +284,7 @@ class Library:
                 if ts:
                     p.taken = ts
                 self.meta_done = i
-                if i % 5000 == 0:
+                if i % 500 == 0:
                     self.cache.save()
         self.meta_done = self.meta_total
         self.cache.save(keep={p.cache_key() for p in photos})

@@ -1,0 +1,87 @@
+"""SQLite-хранилище в DATA_DIR/photocloud.db: сессии и кэш дат съёмки.
+(Позже сюда же лягут хэши файлов для резервного копирования.)
+
+Один файл, без сервера; WAL — чтение не блокирует запись. Все обращения через
+один connection под замком: нагрузка маленькая, а так нет гонок между потоками."""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+import threading
+from pathlib import Path
+
+log = logging.getLogger("photocloud.db")
+
+SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS sessions (
+         key TEXT PRIMARY KEY,          -- SHA-256 токена (сам токен не хранится)
+         user TEXT NOT NULL, ip TEXT NOT NULL,
+         created REAL NOT NULL, last_seen REAL NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user)",
+    """CREATE TABLE IF NOT EXISTS dates (
+         key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime
+         ts REAL NOT NULL)              -- дата съёмки, 0 = в файле её нет
+       WITHOUT ROWID""",
+]
+
+
+class DB:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.mu = threading.Lock()
+        self.con = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA synchronous=NORMAL")
+        for q in SCHEMA:
+            self.con.execute(q)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    def run(self, sql: str, args=()):
+        with self.mu:
+            return self.con.execute(sql, args).fetchall()
+
+    def many(self, sql: str, rows) -> None:
+        with self.mu:
+            self.con.execute("BEGIN")
+            try:
+                self.con.executemany(sql, rows)
+                self.con.execute("COMMIT")
+            except BaseException:
+                self.con.execute("ROLLBACK")
+                raise
+
+    # ------------------------------------------------------------ кэш дат
+
+    def dates_load(self) -> dict[str, float]:
+        return dict(self.run("SELECT key, ts FROM dates"))
+
+    def dates_put(self, items: list[tuple[str, float]]) -> None:
+        if items:
+            self.many("INSERT OR REPLACE INTO dates(key, ts) VALUES(?, ?)", items)
+
+    def dates_prune(self, keep: set[str]) -> int:
+        """Удалить записи о файлах, которых больше нет (переименованы, удалены, изменены)."""
+        have = [k for (k,) in self.run("SELECT key FROM dates")]
+        gone = [(k,) for k in have if k not in keep]
+        if gone:
+            self.many("DELETE FROM dates WHERE key = ?", gone)
+        return len(gone)
+
+    def migrate_dates_json(self, old: Path) -> None:
+        """Однократный перенос старого dates-cache.json."""
+        if not old.is_file():
+            return
+        try:
+            raw = json.loads(old.read_text(encoding="utf-8"))
+            items = [(k, float(v)) for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))]
+            self.dates_put(items)
+            os.replace(old, old.with_suffix(".json.migrated"))
+            log.info("кэш дат перенесён в базу: %d записей", len(items))
+        except (OSError, ValueError) as e:
+            log.warning("старый кэш дат не перенесён (%s)", type(e).__name__)

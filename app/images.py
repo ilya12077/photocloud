@@ -59,10 +59,22 @@ class LRUBytes:
 
 
 def read_limited(f, limit: int) -> bytes:
-    data = f.read(limit + 1)
-    if len(data) > limit:
+    """Дочитать файл до конца, но не больше limit байт.
+    Размер узнаём заранее: f.read(limit + 1) с limit в 150 МБ заставлял Python каждый раз
+    выделять буфер на 150 МБ — это ~10–17 мс на КАЖДЫЙ файл, даже на 5-килобайтный."""
+    pos = f.tell()
+    size = f.seek(0, 2)
+    f.seek(pos)
+    left = size - pos
+    if left > limit:
         raise TooLarge
-    return data
+    data = f.read(left)
+    if len(data) < left:            # файл укоротился, пока читали
+        return data
+    extra = f.read(1)               # файл растёт прямо сейчас — проверяем, что не вышли за лимит
+    if extra and len(data) + 1 > limit:
+        raise TooLarge
+    return data + extra
 
 
 _TRANSPOSE = {2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180, 4: Image.Transpose.FLIP_TOP_BOTTOM,
