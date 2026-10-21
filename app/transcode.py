@@ -91,6 +91,9 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
     if r.returncode != 0 or len(r.stdout) < 188:
         from .video import _clean_err
         log.warning("перекодирование куска %d не удалось: %s", index, _clean_err(r.stderr))
+        from .video import _source_unavailable
+        if _source_unavailable(r.stderr):
+            raise ConnectionError("video source unavailable")
         raise ValueError("transcode failed")
     return r.stdout
 
@@ -121,6 +124,9 @@ def live_clip(ffmpeg: str, src: str, protocols: str, demuxer: str, profile: str 
     if r.returncode != 0 or len(r.stdout) < 1000:
         from .video import _clean_err
         log.warning("ролик живого фото не перекодирован: %s", _clean_err(r.stderr))
+        from .video import _source_unavailable
+        if _source_unavailable(r.stderr):
+            raise ConnectionError("video source unavailable")
         raise ValueError("live clip failed")
     return r.stdout
 

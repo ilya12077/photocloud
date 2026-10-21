@@ -123,6 +123,12 @@ def _signed(code: int) -> int:
     return code - (1 << 32) if code > 0x7FFFFFFF else code
 
 
+def _source_unavailable(err: bytes) -> bool:
+    e = err or b""
+    return any(x in e for x in (b"Server returned 5", b"Connection refused", b"Connection reset",
+                                b"Connection timed out"))
+
+
 def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: int) -> bytes:
     """Кадр (BMP/PNG) с длинной стороной <= box. src — 'file:<путь>' или http-URL."""
     global _preferred, _fast_fail
@@ -155,6 +161,10 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                         log.info("кадры видео: быстрый способ не подходит этим файлам, использую точный")
                 return r.stdout
             last = r
+            if r.returncode != 0 and _source_unavailable(r.stderr):
+                # исходник не отдался (ПК выключен/не отвечает) — файл тут ни при чём:
+                # не перебираем способы и не помечаем видео как «не декодируется»
+                raise ConnectionError("video source unavailable")
             if r.returncode != 0:
                 break                       # ошибка формата вывода — пробуем следующий вариант вывода
             # код 0, но кадра нет — пробуем следующий способ
