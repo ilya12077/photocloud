@@ -1195,10 +1195,14 @@ stage.addEventListener('wheel', (e) => {
   if (!zoomActive()) return;
   e.preventDefault();
   const [fx, fy] = stagePoint(e.clientX, e.clientY);
+  // колесо мыши — щелчками по ~100 (или строками); тачпад — мелкими шагами и со сдвигом вбок
+  const mouseWheel = e.deltaMode === 1 || (Math.abs(e.deltaY) >= 40 && e.deltaX === 0);
   if (e.ctrlKey) {                                          // щипок трекпада / Ctrl+колесо
     zoomAt(VZ.s * Math.exp(-e.deltaY * 0.01), fx, fy, false);
     clearTimeout(VZ.wt); VZ.wt = setTimeout(upgradeQuality, 200);
-  } else if (VZ.s > 1) {                                    // прокрутка двигает увеличенную картинку
+  } else if (mouseWheel) {                                  // колесо мыши: щелчок — ×1.25 к курсору
+    zoomAt(VZ.s * (e.deltaY < 0 ? 1.25 : 0.8), fx, fy, true);
+  } else if (VZ.s > 1) {                                    // прокрутка тачпадом двигает увеличенную картинку
     VZ.tx -= e.deltaX; VZ.ty -= e.deltaY; clampPan(); applyZoom(false);
   }
 }, { passive: false });
