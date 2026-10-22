@@ -99,8 +99,8 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
 
 
 LIVE_PROFILES = {
-    # короткая сторона, crf, потолок битрейта, звук
-    "hq":  {"h": 720, "crf": 26, "max": "1500k", "buf": "3000k", "a": "96k"},
+    # короткая сторона, crf, потолок битрейта, звук; eco — превью-ролик, hq — после него
+    "hq":  {"h": 1080, "crf": 23, "max": "5000k", "buf": "10000k", "a": "128k"},
     "eco": {"h": 480, "crf": 29, "max": "600k",  "buf": "1200k", "a": "48k"},
 }
 

@@ -255,8 +255,8 @@ function thumbKind() {
   if (px <= Z.sizes.t * 1.15) return 't';
   return 'm';
 }
-// экономия трафика всегда: на весь экран — 1280; 2048 и оригинал — только при увеличении
-const previewKind = () => 'e';
+// на весь экран: сначала быстрое превью 960, затем 2048; при увеличении — оригинал
+const previewKind = () => 'p';
 
 // ================================================================== отрисовка: шапка, папки
 
@@ -716,7 +716,7 @@ function show(i) {
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
-  resetZoom(false); VZ.shown = 0; VZ.want = ''; VZ.tap = null;
+  resetZoom(false); VZ.shown = 0; VZ.want = ''; VZ.tap = null; VZ.zoomedOnce = false;
   cancelLoads();
   const liveVid = setupLive(ph);
   $('v-note').hidden = !(ph[6] & F_NOPLAY);
@@ -731,15 +731,14 @@ function show(i) {
     // загрузки только мешают друг другу):
     //   1) быстрая сильно сжатая версия (~20–40 КБ) — фото видно почти сразу;
     //   2) у живого фото — ролик (он и так закрывает фото, пока играет);
-    //   3) полная версия: 1280 при экономии, 2048 без неё; сервер готовит её
-    //      заранее вместе с быстрой, из того же декода;
-    //   4) соседние фото (быстрые версии, без экономии — и полная следующего).
-    // При увеличении — версия подробнее / оригинал (upgradeQuality).
+    //   3) полная версия 2048 — сервер готовит её заранее вместе с быстрой, из того же декода;
+    //   4) соседние фото (быстрые версии).
+    // Начали увеличивать — всё недогруженное обрывается и сразу грузится оригинал (goOriginal).
     $('v-spin').hidden = false;
     const full = previewKind();
     loadStep(ph, tok, 'q', `&n=${full}`).then(() => {
       if (tok !== V.token) return;
-      const rest = () => loadStep(ph, tok, full, '').then(() => { if (tok === V.token) prefetchNear(i, tok); });
+      const rest = () => { if (!VZ.zoomedOnce) loadStep(ph, tok, full, '').then(() => { if (tok === V.token && !VZ.zoomedOnce) prefetchNear(i, tok); }); };
       if (liveVid) playLive(liveVid, tok, rest); else rest();
     });
   }
@@ -766,7 +765,7 @@ function loadStep(ph, tok, kind, extra) {
       if (tok === V.token && RANK[kind] > VZ.shown) {
         const hi = $('v-img');
         hi.src = url; hi.classList.add('ok'); VZ.shown = RANK[kind];
-        if (kind === 'o') $('v-name').textContent = 'Без сжатия • ' + ph[2];
+        setLabel();
         $('v-spin').hidden = true;
         setTimeout(() => { if (tok === V.token) $('v-low').style.visibility = 'hidden'; }, 200);
       }
@@ -796,9 +795,29 @@ async function prefetchNear(i, tok) {
   }
 }
 
+// ---- подпись: «Превью •» пока показана быстрая версия (или играет превью-ролик),
+// «Без сжатия •» — когда показан оригинал
+function setLabel() {
+  const ph = st.list[V.i]; if (!ph) return;
+  let pre = '';
+  if (V.clip && V.clip.el.classList.contains('on')) pre = V.clip.q === 'eco' ? 'Превью • ' : '';
+  else if (VZ.shown === RANK.q) pre = 'Превью • ';
+  else if (VZ.shown === RANK.o) pre = 'Без сжатия • ';
+  $('v-name').textContent = pre + ph[2];
+}
+
 // ---- живые фото
+// Два <video> друг над другом: сначала играет лёгкий превью-ролик (грузится за секунду),
+// параллельно грузится хороший; как только он готов — подменяем на том же кадре.
+const liveEls = (() => {
+  const a = $('v-live'), b = a.cloneNode(); b.id = 'v-live2'; a.after(b); return [a, b];
+})();
 function stopLive() {
-  const lv = $('v-live'); lv.classList.remove('on'); lv.pause(); lv.removeAttribute('src'); lv.load();
+  for (const lv of liveEls) {
+    lv.oncanplay = lv.oncanplaythrough = lv.onended = lv.onerror = lv.onplaying = null;
+    lv.classList.remove('on'); lv.pause(); lv.removeAttribute('src'); lv.load();
+  }
+  V.clip = null;
 }
 function setupLive(ph) {
   // -> id ролика, если его надо проиграть (сам запуск — после быстрой версии фото)
@@ -809,39 +828,63 @@ function setupLive(ph) {
   $('v-livechk').checked = store('pc.live') === '1';
   return $('v-livechk').checked ? vid : null;
 }
+const liveUrl = (vid, q) => `/vid/${encodeURIComponent(vid)}/live.mp4?q=${q}`;
 function playLive(vid, tok, after) {
-  // after — что грузить следом (полное фото): когда ролик загрузился, не смог или 5 с прошло
-  const lv = $('v-live');
+  // after — полное фото: грузим его, когда хороший ролик загрузился (или не смог / 8 с)
+  stopLive();
+  const [lo, hi] = liveEls;
   let done = false;
   const next = () => { if (done) return; done = true; if (after && tok === V.token) after(); };
-  setTimeout(next, 5000);
-  lv.oncanplaythrough = next;
-  lv.onended = () => lv.classList.remove('on');             // доиграл — снова фото
-  lv.muted = false;
-  lv.oncanplay = () => {
+  setTimeout(next, 8000);
+  V.clip = { el: lo, q: 'eco' };
+  const start = (el) => el.play().catch(() => { el.muted = true; return el.play(); });
+  lo.muted = false;
+  lo.onended = () => { lo.classList.remove('on'); setLabel(); };
+  lo.oncanplay = () => {
+    lo.oncanplay = null;
     if (tok !== V.token) return;
-    lv.play().then(() => lv.classList.add('on')).catch(() => {
-      // браузер не дал играть со звуком без нажатия — играем без звука
-      lv.muted = true;
-      lv.play().then(() => lv.classList.add('on')).catch(() => {});
-    });
+    start(lo).then(() => { lo.classList.add('on'); setLabel(); }).catch(() => {});
   };
-  lv.onerror = () => { lv.classList.remove('on'); next(); };
-  lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4?q=eco`;
-  lv.load();
+  lo.onerror = () => { lo.classList.remove('on'); setLabel(); loadHq(); };
+  lo.oncanplaythrough = () => { lo.oncanplaythrough = null; loadHq(); };
+  lo.src = liveUrl(vid, 'eco'); lo.load();
+
+  function loadHq() {
+    if (tok !== V.token || hi.getAttribute('src')) return;
+    hi.muted = lo.muted;
+    hi.onerror = () => next();
+    hi.oncanplaythrough = () => {
+      hi.oncanplaythrough = null;
+      next();
+      if (tok !== V.token) return;
+      hi.onended = () => { hi.classList.remove('on'); setLabel(); };
+      if (lo.classList.contains('on') && !lo.ended) {
+        // превью ещё играет — продолжаем с того же места уже в хорошем качестве
+        hi.currentTime = lo.currentTime; hi.muted = lo.muted;
+        hi.onplaying = () => {
+          hi.onplaying = null; hi.classList.add('on'); V.clip = { el: hi, q: 'hq' };
+          lo.classList.remove('on'); lo.pause(); setLabel();
+        };
+        start(hi).catch(() => {});
+      } else V.clip = { el: hi, q: 'hq' };       // превью уже доиграло — хороший ролик для повтора
+    };
+    hi.src = liveUrl(vid, 'hq'); hi.load();
+  }
 }
-// если браузер не разрешил звук без нажатия — первое касание фото включает звук и переигрывает
+// касание фото: включает звук (если браузер не дал) и переигрывает ролик
 $('v-stage').addEventListener('pointerup', () => {
-  const lv = $('v-live');
-  if (lv.muted && lv.getAttribute('src') && !$('v-livewrap').hidden) {
-    lv.muted = false; lv.currentTime = 0; lv.play().then(() => lv.classList.add('on')).catch(() => { lv.muted = true; });
+  const c = V.clip; if (!c || $('v-livewrap').hidden || VZ.s > 1) return;
+  const lv = c.el;
+  if (lv.muted && lv.getAttribute('src')) {
+    lv.muted = false; lv.currentTime = 0;
+    lv.play().then(() => { lv.classList.add('on'); setLabel(); }).catch(() => { lv.muted = true; });
   }
 });
 $('v-livechk').addEventListener('change', (e) => {
   store('pc.live', e.target.checked ? '1' : '0');
   const ph = st.list[V.i]; const vid = ph && st.lib.live[ph[0]];
   if (!vid) return;
-  if (e.target.checked) { stopLive(); playLive(vid, V.token); } else stopLive();
+  if (e.target.checked) playLive(vid, V.token); else { stopLive(); setLabel(); }
 });
 
 function closeViewer(silent) {
@@ -895,6 +938,7 @@ function clampPan() {
 }
 
 function applyZoom(anim) {
+  if (VZ.s > 1.02 && !VZ.zoomedOnce && !$('viewer').hidden) goOriginal();
   zoomEl.classList.toggle('anim', !!anim);
   zoomEl.style.transform = VZ.s === 1 ? '' : `translate(${VZ.tx}px, ${VZ.ty}px) scale(${VZ.s})`;
   stage.classList.toggle('zoomed', VZ.s > 1);
@@ -920,18 +964,20 @@ function toggleZoom(cx, cy) {
   upgradeQuality();
 }
 
-// при сильном увеличении подгружаем картинку подробнее
-function upgradeQuality() {
-  const ph = st.list[V.i]; if (!ph || VZ.s < 1.6) return;
+// Начали увеличивать: всё недогруженное (фото, ролик, соседи) обрываем — браузер
+// закрывает соединения, сервер снимает их запросы из очереди — и сразу грузим оригинал.
+// Если браузер не покажет оригинал (HEIC и т.п.) или он больше 25 МБ — версию 2048.
+function goOriginal() {
+  const ph = st.list[V.i];
+  if (!ph || VZ.zoomedOnce || (ph[6] & F_VIDEO)) return;
+  VZ.zoomedOnce = true;
   const ext = ph[2].slice(ph[2].lastIndexOf('.')).toLowerCase();
   const browserCan = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
-  const have = Math.max(VZ.shown, RANK[VZ.want] || 0);
-  let want = have < RANK.p ? 'p' : '';
-  if (VZ.s >= 2.5 && browserCan && ph[5] < 25 * 1024) want = 'o';   // оригинал до 25 МБ
-  if (!want || RANK[want] <= have) return;
-  VZ.want = want;                                // помечаем сразу, чтобы не запрашивать повторно
-  loadStep(ph, V.token, want, '');
+  const want = browserCan && ph[5] < 25 * 1024 ? 'o' : 'p';
+  cancelLoads(); stopLive(); setLabel();
+  if (RANK[want] > VZ.shown) { VZ.want = want; loadStep(ph, V.token, want, ''); }
 }
+function upgradeQuality() { if (VZ.s > 1.02) goOriginal(); }
 
 const tdist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
 const tmid = (t) => stagePoint((t[0].clientX + t[1].clientX) / 2, (t[0].clientY + t[1].clientY) / 2);
