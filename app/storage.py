@@ -10,7 +10,6 @@ import logging
 import os
 import threading
 import time
-import socket
 import stat as statmod
 from pathlib import Path
 from typing import BinaryIO, Iterator
@@ -237,7 +236,7 @@ class _SMBFile:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc):
         self.close()
         return False
 
@@ -273,13 +272,6 @@ class SMBStorage:
                 self._reset_locked()
                 with _active_mu:
                     _active.clear()
-
-    def reachable(self, timeout: float = 1.5) -> bool:
-        try:
-            with socket.create_connection((self.host, self.port), timeout=timeout):
-                return True
-        except OSError:
-            return False
 
     def reset(self) -> None:
         """После сна ПК соединение мёртвое — сбрасываем кэш подключений."""

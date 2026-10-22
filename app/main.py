@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -57,7 +57,7 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
-library = Library(S.data_dir, S.tz, S.meta_threads, db)
+library = Library(S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
 transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
@@ -188,7 +188,7 @@ class Guard:
 async def lifespan(_app):
     global loop
     loop = asyncio.get_running_loop()
-    bg(_indexer())
+    bg(_pc_watch())
     if FFMPEG:
         log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
     else:
@@ -558,36 +558,41 @@ def _index_error(err: str) -> None:
 
 
 
-async def _indexer() -> None:
-    """Список файлов обновляется в фоне — сразу после запуска и потом по INDEX_TTL,
-    а не когда кто-то откроет сайт. Если ПК выключен — ждём, пока появится."""
+def pc_state(up: bool) -> str:
+    """up / waking (ждём после команды включения) / down — одинаково для сайта и админки."""
+    if up:
+        return "up"
+    if PC.wake_at and time.time() - PC.wake_at < S.wake_timeout:
+        return "waking"
+    return "down"
+
+
+async def _pc_watch() -> None:
+    """Фоновый наблюдатель — работает, даже если сайт никто не открыл:
+    обновляет список файлов (сразу после запуска, потом раз в INDEX_TTL и когда ПК
+    снова в сети), завершает ожидание включения и шлёт «не проснулся»."""
     await asyncio.sleep(1)
     while True:
         try:
-            if await PC.is_up() and (PC.revived or library.stale(S.index_ttl)):
-                if library.start_build(storage, _index_error):
-                    PC.revived = False
+            up = await PC.is_up()
+            if up:
+                PC.wake_at = 0
+                if PC.revived or library.stale(S.index_ttl):
+                    if library.start_build(storage, _index_error):
+                        PC.revived = False
+            elif PC.wake_at and pc_state(False) == "down" and not PC.wake_notified:
+                PC.wake_notified = True
+                bg(ha.notify("wake_timeout", "Компьютер не проснулся после WoL"))
         except Exception:  # noqa: BLE001
-            log.exception("фоновая индексация")
-        await asyncio.sleep(15)
+            log.exception("фоновая проверка компьютера")
+        await asyncio.sleep(5 if PC.wake_at else 15)     # пока ждём включения — чаще
 
 
 @app.get("/api/status")
 async def status(_: Session = Depends(require_user)):
-    up = await PC.is_up()
-    if up:
+    pc = pc_state(await PC.is_up())
+    if pc == "up":
         PC.wake_at = 0
-        if PC.revived or library.stale(S.index_ttl):
-            if library.start_build(storage, _index_error):
-                PC.revived = False
-        pc = "up"
-    elif PC.wake_at and time.time() - PC.wake_at < S.wake_timeout:
-        pc = "waking"
-    else:
-        if PC.wake_at and not PC.wake_notified:
-            PC.wake_notified = True
-            bg(ha.notify("wake_timeout", "Компьютер не проснулся после WoL"))
-        pc = "down"
     return no_store(JSONResponse({
         "pc": pc,
         "wake_left": max(0, int(S.wake_timeout - (time.time() - PC.wake_at))) if pc == "waking" else 0,
@@ -616,7 +621,7 @@ async def wake(s: Session = Depends(require_user)):
 
 
 @app.post("/api/reindex", dependencies=[Depends(require_csrf)])
-async def reindex(_: Session = Depends(require_user)):
+async def reindex(_: Session = Depends(require_admin)):
     if not await PC.is_up():
         raise HTTPException(409, "pc down")
     library.start_build(storage, _index_error)
@@ -768,7 +773,7 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     if p is None:
         raise HTTPException(404)
     box = {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size, "q": S.preview_quick_size,
-           "e": S.preview_eco_size, "p": S.preview_size}[kind]
+           "p": S.preview_size}[kind]
     cache, q = (thumb_cache, S.thumb_quality) if kind in "stm" else (preview_cache, S.preview_quality)
     if kind == "q":
         q = S.preview_quick_quality
@@ -777,9 +782,9 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     prio = PRIO_GRID if kind in "stm" else PRIO_QUICK if kind == "q" else PRIO_VIEWER
     if prefetch and prio != PRIO_GRID:
         prio = PRIO_PREFETCH
-    # к быстрой версии сразу готовим полную (n=e|p): тот же декод, только пережать
+    # к быстрой версии сразу готовим полную 2048 (n=p): тот же файл, второй раз с ПК не читаем
     nk = request.query_params.get("n")
-    ckey = (nk, pid, p.mtime, p.size) if kind == "q" and nk in ("e", "p") and not p.video else None
+    ckey = (nk, pid, p.mtime, p.size) if kind == "q" and nk == "p" and not p.video else None
     key = (kind, pid, p.mtime, p.size)
     if time.time() - failed.get(key, 0) < FAILED_TTL:
         raise HTTPException(415)
@@ -827,7 +832,7 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                         cfut.add_done_callback(lambda f: f.cancelled() or f.exception())
                         inflight[ckey] = cfut
                         try:
-                            nbox = S.preview_eco_size if nk == "e" else S.preview_size
+                            nbox = S.preview_size
                             data, raw = await on_pc(_produce_pair, p, box, q, tm, timeout=60)
                         except BaseException:
                             cfut.set_exception(ClientGone())
@@ -944,9 +949,9 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), _: Ses
 
 
 @app.get("/img/{kind}/{pid}")
-async def image(request: Request, kind: str = PathParam(pattern=r"^[stmqep]$"),
+async def image(request: Request, kind: str = PathParam(pattern=r"^[stmqp]$"),
                 pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
-    """s/t/m — эскизы 240/400/900, q — быстрое превью 960 (сильно сжатое), e/p — превью 1280/2048."""
+    """s/t/m — эскизы 240/400/900, q — быстрое превью 720 (сильно сжатое), p — превью 2048."""
     return await rendered(request, kind, pid)
 
 
@@ -979,7 +984,7 @@ async def _duration(p) -> float:
 
 
 @app.get("/vid/{pid}/{profile}/index.m3u8")
-async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathParam(pattern=r"^(eco|hq)$"),
+async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathParam(pattern=r"^eco$"),
                        _: Session = Depends(require_user)):
     p = _vid(pid)
     if not await PC.is_up():
@@ -991,7 +996,7 @@ async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathP
 
 @app.get("/vid/{pid}/{profile}/{n}.ts")
 async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
-                      profile: str = PathParam(pattern=r"^(eco|hq)$"), n: int = PathParam(ge=0, le=100000),
+                      profile: str = PathParam(pattern=r"^eco$"), n: int = PathParam(ge=0, le=100000),
                       _: Session = Depends(require_user)):
     p = _vid(pid)
     d = await _duration(p)
@@ -1111,11 +1116,10 @@ async def admin_overview(_: Session = Depends(require_admin)):
     # считаем только то, что видно в ленте: ролики живых фото — часть снимка, а не отдельный файл
     photos = [p for p in library.by_id.values() if not (p.video and p.live)]
     videos = sum(1 for p in photos if p.video)
-    lives = sum(1 for p in photos if p.live)
     return no_store(JSONResponse({
         "uptime": int(time.time() - STARTED),
-        "pc": "up" if up else ("waking" if PC.wake_at else "down"),
-        "index": {"state": library.state, "error": library.error, "files": len(photos), "videos": videos, "live": lives,
+        "pc": pc_state(up),
+        "index": {"state": library.state, "error": library.error, "files": len(photos), "videos": videos,
                   "with_date": sum(1 for p in photos if p.taken), "with_name_date": sum(1 for p in photos if not p.taken and p.named),
                   "with_folder_year": sum(1 for p in photos if p.folder_only()),
                   "built_at": int(library.built_at),
@@ -1133,7 +1137,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
             "google_redirect": google.redirect_uri if google else "",
             "ffmpeg": FFMPEG or "", "data_dir": str(S.data_dir), "workers": S.workers,
             "timezone": str(S.tz), "format": S.image_format,
-            "sizes": f"{S.thumb_small_size}/{S.thumb_size}/{S.thumb_large_size}, превью {S.preview_eco_size}/{S.preview_size}",
+            "sizes": f"{S.thumb_small_size}/{S.thumb_size}/{S.thumb_large_size}, превью {S.preview_quick_size}/{S.preview_size}",
         },
     }))
 

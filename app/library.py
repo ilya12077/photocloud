@@ -2,7 +2,7 @@
 
 Фаза 1 — обход папок (только имя/размер/mtime), индекс сразу доступен с датами
 из кэша или по mtime. Фаза 2 — в фоне читаем дату съёмки (EXIF / mp4 mvhd) у тех
-файлов, которых нет в кэше, и публикуем новую версию. Кэш дат — маленький JSON
+файлов, которых нет в кэше, и публикуем новую версию. Кэш дат — таблица SQLite
 в DATA_DIR, ключ (путь, размер, mtime), так что повторно файлы не читаются."""
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import Path
 
 from . import meta
 from .storage import PLAYABLE_EXT, VIDEO_EXT
@@ -99,9 +98,8 @@ class MetaCache:
     """Даты съёмки: в памяти — словарь для быстрых проверок, на диске — таблица SQLite.
     Пишутся только новые записи (пачками), а не весь кэш целиком."""
 
-    def __init__(self, db, legacy_json: Path):
+    def __init__(self, db):
         self.db = db
-        db.migrate_dates_json(legacy_json)
         self.d: dict[str, float] = db.dates_load()
         self._pending: list[tuple[str, float]] = []
         self._mu = threading.Lock()
@@ -133,10 +131,10 @@ class MetaCache:
 
 
 class Library:
-    def __init__(self, data_dir: Path, tz, meta_threads: int = 8, db=None):
+    def __init__(self, tz, meta_threads: int = 4, db=None):
         self.tz = tz
         self.meta_threads = meta_threads
-        self.cache = MetaCache(db, data_dir / "dates-cache.json")
+        self.cache = MetaCache(db)
         self.state = "empty"          # empty | building | ready | error
         self.error = ""
         self.built_at = 0.0

@@ -73,6 +73,6 @@ class _Slot:
     async def __aenter__(self):
         await self.s.acquire(self.prio, self.request)
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *_exc):
         self.s.release()
         return False

@@ -31,7 +31,6 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       PUBLIC_NAME: ${PUBLIC_NAME:-Фотоархив}
-      WORKERS: ${WORKERS:-5}
     volumes:
       - photocloud-data:/data      # пользователи, сессии, кэш дат, журнал
     # защита контейнера

@@ -5,7 +5,6 @@
 один connection под замком: нагрузка маленькая, а так нет гонок между потоками."""
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sqlite3
@@ -72,16 +71,3 @@ class DB:
         if gone:
             self.many("DELETE FROM dates WHERE key = ?", gone)
         return len(gone)
-
-    def migrate_dates_json(self, old: Path) -> None:
-        """Однократный перенос старого dates-cache.json."""
-        if not old.is_file():
-            return
-        try:
-            raw = json.loads(old.read_text(encoding="utf-8"))
-            items = [(k, float(v)) for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))]
-            self.dates_put(items)
-            os.replace(old, old.with_suffix(".json.migrated"))
-            log.info("кэш дат перенесён в базу: %d записей", len(items))
-        except (OSError, ValueError) as e:
-            log.warning("старый кэш дат не перенесён (%s)", type(e).__name__)
