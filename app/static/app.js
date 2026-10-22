@@ -650,9 +650,16 @@ function openViewer(i) {
   show(i);
 }
 
+// вышли из видео / живого фото: сервер сразу бросает перекодирование этого файла,
+// и процессор с чтением с ПК достаются эскизам
+function stopServer(id) {
+  fetch(`/vid/${encodeURIComponent(id)}/stop`, { method: 'POST', keepalive: true, credentials: 'same-origin',
+    headers: { 'X-Requested-With': 'photocloud' } }).catch(() => {});
+}
 function stopVideo() {
   $('v-note').hidden = true; $('v-origwrap').hidden = true;
   if (V.hls) { V.hls.destroy(); V.hls = null; }
+  if (V.vidPid) { stopServer(V.vidPid); V.vidPid = null; }
   const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true;
 }
 
@@ -675,6 +682,7 @@ async function playVideo(ph, tok, startAt) {
   if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
   if (orig) { v.src = origUrl(ph, false); return; }
   const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // без сжатия — галочка «Оригинал»
+  V.vidPid = ph[0];
   // Сначала hls.js (через MediaSource): новый Chrome на Android заявляет «родную»
   // поддержку HLS, но наш поток в ней не играет — шкала есть, видео нет. Родной HLS —
   // только там, где hls.js не работает (старые iPhone).
@@ -824,6 +832,13 @@ const liveEls = (() => {
 })();
 const CLIPQ = { eco: 1, hq: 2, orig: 3 };
 function stopLive() {
+  // ролик ещё не готов — значит, сервер его перекодирует: просим бросить
+  const busy = new Set();
+  for (const lv of Object.values(liveEls)) {
+    const m = (lv.getAttribute('src') || '').match(/^\/vid\/([^/]+)\/live\.mp4/);
+    if (m && lv.readyState < 4) busy.add(decodeURIComponent(m[1]));
+  }
+  for (const id of busy) stopServer(id);
   for (const lv of Object.values(liveEls)) {
     lv.oncanplay = lv.oncanplaythrough = lv.onended = lv.onerror = lv.onplaying = null;
     lv.classList.remove('on'); lv.pause(); lv.removeAttribute('src'); lv.load();

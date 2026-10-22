@@ -8,6 +8,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import threading
 
 log = logging.getLogger("photocloud.video")
 
@@ -99,6 +100,69 @@ def colorfix_args(ffmpeg: str, src: str, protocols: str, demuxer: str) -> list[s
     return args
 
 
+# ---- остановка ffmpeg, когда результат больше не нужен (вышли из видео)
+# Поток, запускающий ffmpeg, может пометить себя тегом (обычно id файла); stop(tag)
+# убивает все процессы с этим тегом, и запрос заканчивается исключением Stopped.
+class Stopped(Exception):
+    """ffmpeg остановлен: результат больше никому не нужен."""
+
+
+_tls = threading.local()
+_procs: dict[str, set] = {}
+_stopped: dict[str, float] = {}
+_procs_mu = threading.Lock()
+
+
+def tagged(tag: str, fn):
+    """Выполнить fn, пометив все запущенные им ffmpeg тегом."""
+    _tls.tag = tag
+    try:
+        return fn()
+    finally:
+        _tls.tag = None
+
+
+def stop(tag: str) -> int:
+    with _procs_mu:
+        procs = list(_procs.get(tag, ()))
+        if procs:
+            _stopped[tag] = len(procs)
+    for pr in procs:
+        try:
+            pr.kill()
+        except OSError:
+            pass
+    return len(procs)
+
+
+def _run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
+    tag = getattr(_tls, "tag", None)
+    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    if tag:
+        with _procs_mu:
+            _procs.setdefault(tag, set()).add(pr)
+    try:
+        out, err = pr.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pr.kill()
+        pr.communicate()
+        raise
+    finally:
+        if tag:
+            with _procs_mu:
+                ps = _procs.get(tag)
+                if ps is not None:
+                    ps.discard(pr)
+                    if not ps:
+                        del _procs[tag]
+    if tag and pr.returncode != 0:
+        with _procs_mu:
+            if _stopped.pop(tag, None) is not None:
+                raise Stopped()
+    return subprocess.CompletedProcess(cmd, pr.returncode, out, err)
+
+
 def run_ff(cmd: list[str], src: str, protocols: str, demuxer: str, timeout: int):
     """Запуск ffmpeg; при «Invalid color space» — один повтор с исправлением метки цвета."""
     ffmpeg = cmd[0]
@@ -106,15 +170,12 @@ def run_ff(cmd: list[str], src: str, protocols: str, demuxer: str, timeout: int)
     if pre:
         i = cmd.index("-i")
         cmd = cmd[:i] + pre + cmd[i:]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    r = _run(cmd, timeout)
     if pre is None and r.returncode != 0 and any(m in r.stderr for m in _BAD_COLOR):
         fix = colorfix_args(ffmpeg, src, protocols, demuxer)
         if fix:
             i = cmd.index("-i")
-            r = subprocess.run(cmd[:i] + fix + cmd[i:], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=timeout,
-                               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            r = _run(cmd[:i] + fix + cmd[i:], timeout)
     return r
 
 
