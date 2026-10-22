@@ -119,6 +119,9 @@ a { color: inherit; text-decoration: none; }
 .v-meta div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dim { color: #aaa; font-size: 12px; }
 .v-stage { grid-row: 1 / -1; position: relative; overflow: hidden; touch-action: none; }
+.v-pane { position: absolute; inset: 0; transform-origin: 50% 50%; will-change: transform; }
+.v-side.prev { transform: translateX(calc(-100% - 24px)); }
+.v-side.next { transform: translateX(calc(100% + 24px)); }
 .v-zoom { position: absolute; inset: 0; transform-origin: 0 0; will-change: transform; }
 .v-zoom.anim { transition: transform .22s ease-out; }
 .v-stage.zoomed { cursor: grab; } .v-stage.zoomed.drag { cursor: grabbing; }
