@@ -729,7 +729,7 @@ function show(i) {
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
-  resetZoom(false); VZ.shown = 0; VZ.want = ''; VZ.tap = null; VZ.zoomedOnce = false;
+  resetZoom(false); VZ.shown = 0; VZ.want = ''; VZ.zoomedOnce = false;
   cancelLoads();
   const liveVid = setupLive(ph);
   $('v-note').hidden = !(ph[6] & F_NOPLAY);
@@ -792,6 +792,7 @@ function loadStep(ph, tok, kind, extra) {
 }
 
 // соседние фото: по одному и с низким приоритетом — открытое фото важнее
+const prefetched = new Set();         // быстрые превью, которые уже лежат в кэше браузера
 async function prefetchNear(i, tok) {
   const ctl = V.ctl = new AbortController();
   const full = previewKind();
@@ -806,6 +807,7 @@ async function prefetchNear(i, tok) {
       // X-PF: сервер ставит это в очередь после фото, которое открыто сейчас
       const r = await fetch(u, { signal: ctl.signal, priority: 'low', headers: { 'X-PF': '1' }, credentials: 'same-origin' });
       await r.arrayBuffer();
+      if (r.ok) { prefetched.add(u); if (prefetched.size > 2000) prefetched.clear(); setSides(); }
     } catch (_) { return; }
   }
 }
@@ -851,9 +853,11 @@ function setupLive(ph) {
   const vid = (ph[6] & F_LIVE) && st.lib.live[ph[0]];
   $('v-livewrap').hidden = !vid;
   if (!vid) return null;
-  $('v-livechk').checked = store('pc.live') === '1';
+  $('v-livechk').checked = liveOn();
   return $('v-livechk').checked ? vid : null;
 }
+// галочка Live: включена по умолчанию, выбор запоминается в браузере
+const liveOn = () => store('pc.live') !== '0';
 const liveUrl = (vid, q) => q === 'orig' ? `/img/o/${encodeURIComponent(vid)}` : `/vid/${encodeURIComponent(vid)}/live.mp4?q=${q}`;
 const startEl = (el) => el.play().catch(() => { el.muted = true; return el.play(); });  // без звука, если браузер не дал
 
@@ -910,23 +914,22 @@ function playLive(vid, tok, after) {
 // играет (HEVC в .mov на части телефонов) — остаётся хороший пережатый.
 function preloadOrigClip(ph, tok) {
   const vid = (ph[6] & F_LIVE) && st.lib.live[ph[0]];
-  if (!vid || tok !== V.token) return;
+  if (!vid || tok !== V.token || !liveOn()) return;            // галочка Live снята — ролики не грузим
   loadClip(vid, 'orig', tok, null, () => loadClip(vid, 'hq', tok));
 }
 
 // Касание живого фото (без сдвига; и в увеличении тоже) — проиграть ролик заново, со звуком.
-// Ждём чуть-чуть: если это первый тап двойного (масштаб), ролик не запускаем.
-let tapAt = null, tapT = 0;
+// Двойного тапа нет: масштаб — щипком и колёсиком, поэтому касание срабатывает сразу.
+let tapAt = null;
 $('v-stage').addEventListener('pointerdown', (e) => { tapAt = [e.clientX, e.clientY]; });
 $('v-stage').addEventListener('pointerup', (e) => {
   if (!tapAt || Math.hypot(e.clientX - tapAt[0], e.clientY - tapAt[1]) > 10) return;
   tapAt = null;
-  if (tapT) { clearTimeout(tapT); tapT = 0; return; }          // второй тап — это двойной тап
-  tapT = setTimeout(() => { tapT = 0; replayLive(); }, 300);
+  replayLive();
 });
 function replayLive() {
   const ph = st.list[V.i], vid = ph && (ph[6] & F_LIVE) && st.lib.live[ph[0]];
-  if (!vid || $('v-livewrap').hidden || $('viewer').hidden || DR.busy) return;
+  if (!vid || !liveOn() || $('v-livewrap').hidden || $('viewer').hidden || DR.busy) return;
   if (V.clip) { for (const x of Object.values(liveEls)) if (x !== V.clip.el) { x.classList.remove('on'); x.pause(); } playClip(V.clip.el); return; }
   // ещё ничего не загружено: превью-ролик сыграет сам, как будет готов; лучшие подменят его
   playLive(vid, V.token, null);
@@ -958,9 +961,9 @@ function setSides() {
     if (!n) { img.removeAttribute('src'); continue; }
     // фото: быстрое превью, если уже в кэше браузера (соседей мы подгружаем), иначе эскиз из
     // сетки; видео — всегда эскиз (быстрое превью для видео — лишний кадр через ffmpeg)
-    let src = imgUrl(thumbKind(), n);
-    if (!(n[6] & F_VIDEO)) { const q = new Image(); q.src = imgUrl('q', n) + '&n=p'; if (q.complete && q.naturalWidth) src = q.src; }
-    img.src = src;
+    // (сами не запрашиваем: соседи грузятся после открытого фото, в prefetchNear)
+    const q = imgUrl('q', n) + '&n=p';
+    img.src = !(n[6] & F_VIDEO) && prefetched.has(q) ? q : imgUrl(thumbKind(), n);
   }
 }
 function paneTo(x, y, s, anim) {
@@ -1056,10 +1059,10 @@ $('v-close').addEventListener('click', () => closeViewer());
 $('v-prev').addEventListener('click', () => show(V.i - 1));
 $('v-next').addEventListener('click', () => show(V.i + 1));
 // ================================================================== масштаб в просмотре
-// Щипок / растяжение, двойной тап или двойной клик, Ctrl+колесо (жест трекпада), перетаскивание.
+// Щипок / растяжение, колесо мыши, Ctrl+колесо (жест трекпада), перетаскивание. Двойного тапа нет.
 // Свайпы влево/вправо/вниз работают только при обычном масштабе.
 
-const VZ = { s: 1, tx: 0, ty: 0, pinch: null, pan: null, tap: null, moved: false, shown: 0, want: '' };
+const VZ = { s: 1, tx: 0, ty: 0, pinch: null, pan: null, moved: false, shown: 0, want: '' };
 const MAX_ZOOM = 8;
 const stage = $('v-stage'), zoomEl = $('v-zoom');
 
@@ -1106,11 +1109,6 @@ function zoomAt(s, fx, fy, anim) {
 }
 
 function stagePoint(cx, cy) { const b = stage.getBoundingClientRect(); return [cx - b.left, cy - b.top]; }
-
-function toggleZoom(cx, cy) {
-  const [fx, fy] = stagePoint(cx, cy);
-  if (VZ.s > 1) resetZoom(true); else zoomAt(2.5, fx, fy, true);   // оригинал грузит applyZoom
-}
 
 // Начали увеличивать: недогруженные картинки (версии фото, соседи) обрываем — браузер
 // закрывает соединения, сервер снимает их запросы из очереди — и сразу грузим оригинал (ролик живого фото не трогаем).
@@ -1181,25 +1179,12 @@ stage.addEventListener('touchend', (e) => {
   const t = e.changedTouches[0], dx = t.clientX - VZ.pan.x, dy = t.clientY - VZ.pan.y;
   const t0 = VZ.pan.t, quick = Date.now() - t0 < 300;
   VZ.pan = null;
-  if (!VZ.moved && quick && zoomActive()) {
-    // двойной тап: второе касание рядом с первым в течение 300 мс
-    const now = Date.now();
-    if (VZ.tap && now - VZ.tap.t < 300 && Math.hypot(t.clientX - VZ.tap.x, t.clientY - VZ.tap.y) < 40) {
-      VZ.tap = null; toggleZoom(t.clientX, t.clientY); return;
-    }
-    VZ.tap = { t: now, x: t.clientX, y: t.clientY };
-    return;
-  }
+  if (!VZ.moved && quick) return;                           // касание — его обрабатывает pointerup (живое фото)
   if (VZ.s > 1 || !DR.axis) { DR.axis = null; return; }   // при увеличении свайпы не листают
   dragEnd(dx, dy, Date.now() - t0);
 }, { passive: true });
 
 // мышь / трекпад
-stage.addEventListener('dblclick', (e) => {
-  // на тач-экранах браузер сам шлёт dblclick после двойного тапа — его уже обработали выше
-  if (Date.now() - (VZ.lastTouch || 0) < 1000) return;
-  if (zoomActive() && e.target.tagName !== 'VIDEO') toggleZoom(e.clientX, e.clientY);
-});
 stage.addEventListener('wheel', (e) => {
   if (!zoomActive()) return;
   e.preventDefault();
