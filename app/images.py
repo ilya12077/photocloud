@@ -8,7 +8,7 @@ import time
 import warnings
 from collections import OrderedDict
 
-from PIL import ExifTags, Image, ImageFile, ImageOps
+from PIL import ExifTags, Image, ImageFile, ImageFilter, ImageOps
 
 try:  # HEIC с айфонов
     from pillow_heif import register_heif_opener
@@ -149,16 +149,33 @@ def finish(im, box: int, quality: int, fmt: str, tm: dict | None, t_decoded: flo
     elif im.mode != "RGB":
         im = im.convert("RGB")
     t2 = time.perf_counter()
-    out = io.BytesIO()
-    if fmt == "webp":
-        # эскизы: method 2; превью (крупные): method 0 — почти вдвое быстрее, размер тот же
-        im.save(out, "WEBP", quality=quality, method=2 if box <= 1000 else 0)
-    else:
-        im.save(out, "JPEG", quality=quality, optimize=False, progressive=box > 1000)
+    def encode(q: int) -> bytes:
+        out = io.BytesIO()
+        if fmt == "webp":
+            # эскизы: method 2; превью (крупные): method 0 — почти вдвое быстрее, размер тот же
+            im.save(out, "WEBP", quality=q, method=2 if box <= 1000 else 0)
+        else:
+            im.save(out, "JPEG", quality=q, optimize=False, progressive=box > 1000)
+        return out.getvalue()
+
+    data = encode(quality)
+    if box > 1000:
+        # Превью на весь экран: зернистые сканы плёнки, шумные ночные снимки при том же
+        # качестве весят в 5–10 раз больше обычных (до 1 МБ на 2048 px) — на медленном
+        # канале это секунды. Если вышло больше ~1 бита на пиксель, пережимаем сильнее:
+        # на шуме разница на глаз не видна, а размер падает в разы.
+        budget = im.width * im.height // 8
+        if len(data) > budget:
+            data = encode(max(30, quality - 20))
+        if len(data) > budget:
+            # всё ещё много — это шум/зерно: чуть сглаживаем его (на экране незаметно,
+            # для деталей есть увеличение и оригинал) и сжимаем ещё раз
+            im = im.filter(ImageFilter.GaussianBlur(0.7))
+            data = min(data, encode(max(30, quality - 25)), key=len)
     if tm is not None:
         tm["resize"] = (t2 - t1) * 1000
         tm["encode"] = (time.perf_counter() - t2) * 1000
-    return out.getvalue()
+    return data
 
 
 def render(data: bytes, box: int, quality: int, fmt: str = "webp", tm: dict | None = None) -> bytes:
