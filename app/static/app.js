@@ -781,6 +781,7 @@ function show(i) {
   const liveVid = setupLive(ph);
   $('v-note').hidden = !(ph[6] & F_NOPLAY);
   hi.classList.remove('ok'); hi.removeAttribute('src');
+  if (shownBlob) { URL.revokeObjectURL(shownBlob); shownBlob = ''; }
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
   if (isVideo) {
     const v = $('v-video'); v.hidden = false; v.poster = imgUrl('m', ph);
@@ -815,33 +816,45 @@ function show(i) {
 const RANK = { q: 1, e: 2, p: 3, o: 4 };
 
 function cancelLoads() {
-  // фото пролистали — его недогруженные версии и предзагрузка больше не нужны
-  for (const im of V.loads) im.removeAttribute('src');
+  // фото пролистали / начали увеличивать — недогруженные версии и предзагрузка больше не
+  // нужны. fetch + AbortController рвёт соединение надёжно (у new Image() — не всегда).
+  for (const c of V.loads) c.abort();
   V.loads = [];
   if (V.ctl) { V.ctl.abort(); V.ctl = null; }
 }
 
-// одна ступень: грузим версию kind и показываем, если она подробнее уже показанной
-function loadStep(ph, tok, kind, extra) {
-  return new Promise((resolve) => {
-    if (tok !== V.token) { resolve(false); return; }
-    const pre = new Image(); pre.fetchPriority = 'high'; pre.decoding = 'async';
-    V.loads.push(pre);
-    const url = (kind === 'o' ? origUrl(ph, false) : imgUrl(kind, ph)) + extra;
-    pre.onload = () => {
-      if (tok === V.token && RANK[kind] > VZ.shown) {
-        const hi = $('v-img');
-        hi.src = url; hi.classList.add('ok'); VZ.shown = RANK[kind];
-        setLabel();
-        if (kind === 'o') preloadOrigClip(ph, tok);
-        $('v-spin').hidden = true;
-        setTimeout(() => { if (tok === V.token) $('v-low').style.visibility = 'hidden'; }, 200);
-      }
-      resolve(true);
-    };
-    pre.onerror = () => { if (tok === V.token && kind !== 'q') $('v-spin').hidden = true; resolve(false); };
-    pre.src = url;
-  });
+// одна ступень: грузим версию kind и показываем, если она подробнее уже показанной.
+// Ждём (resolve) всегда: и при успехе, и при ошибке, и при обрыве — цепочка не зависает.
+let shownBlob = '';
+async function loadStep(ph, tok, kind, extra) {
+  if (tok !== V.token) return false;
+  const ctl = new AbortController();
+  V.loads.push(ctl);
+  const url = (kind === 'o' ? origUrl(ph, false) : imgUrl(kind, ph)) + extra;
+  let blobUrl = '';
+  try {
+    const r = await fetch(url, { signal: ctl.signal, priority: 'high', credentials: 'same-origin' });
+    if (!r.ok) throw new Error(String(r.status));
+    blobUrl = URL.createObjectURL(await r.blob());
+    const im = new Image(); im.src = blobUrl;
+    await im.decode();                                   // показываем уже раскодированное — без мигания
+    if (tok !== V.token || RANK[kind] <= VZ.shown) { URL.revokeObjectURL(blobUrl); return true; }
+    const hi = $('v-img');
+    hi.src = blobUrl; hi.classList.add('ok'); VZ.shown = RANK[kind];
+    if (shownBlob) URL.revokeObjectURL(shownBlob);
+    shownBlob = blobUrl;
+    setLabel();
+    if (kind === 'o') preloadOrigClip(ph, tok);
+    $('v-spin').hidden = true;
+    setTimeout(() => { if (tok === V.token) $('v-low').style.visibility = 'hidden'; }, 200);
+    return true;
+  } catch (_) {
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    if (tok === V.token && kind !== 'q' && !ctl.signal.aborted) $('v-spin').hidden = true;
+    return false;
+  } finally {
+    V.loads = V.loads.filter((c) => c !== ctl);
+  }
 }
 
 // соседние фото: по одному и с низким приоритетом — открытое фото важнее
@@ -1096,6 +1109,7 @@ function closeViewer(silent) {
   stopVideo(); stopLive(); resetZoom(false); cancelLoads();
   $('viewer').hidden = true; document.body.style.overflow = ''; resetPane(); pane.style.opacity = '';
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;
+  if (shownBlob) { URL.revokeObjectURL(shownBlob); shownBlob = ''; }
   if (V.pushed && !silent) { V.pushed = false; history.back(); }
   V.pushed = false;
   // если пролистали далеко — возвращаем сетку к последнему просмотренному

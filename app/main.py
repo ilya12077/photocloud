@@ -188,6 +188,7 @@ class Guard:
 async def lifespan(_app):
     global loop
     loop = asyncio.get_running_loop()
+    log.info("Photocloud %s", config.app_version())
     bg(_pc_watch())
     if FFMPEG:
         log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
@@ -717,9 +718,23 @@ def _produce_pair(p, box_q: int, qual_q: int, tm: dict):
     return quick, data
 
 
+# Полные 2048 «впрок» делаются по одному и только для последнего открытого фото: если
+# быстро листать (или сразу увеличивать — тогда нужен оригинал), старые заготовки
+# пропускаются, а не копятся очередью на процессоре. Кому 2048 всё же понадобится —
+# запросит, и оно сделается обычным порядком.
+_companion_mu = asyncio.Semaphore(1)
+_companion_seq = 0
+
+
 async def _finish_companion(ckey, cfut, raw, box: int, quality: int) -> None:
+    global _companion_seq
+    _companion_seq += 1
+    my = _companion_seq
     try:
-        data = await on_pc(render, raw, box, quality, S.image_format, None, timeout=60)
+        async with _companion_mu:
+            if my != _companion_seq:
+                raise ClientGone()                   # есть заготовка новее — эта уже не нужна
+            data = await on_pc(render, raw, box, quality, S.image_format, None, timeout=60)
         preview_cache.put(ckey, data)
         cfut.set_result(data)
     except Exception:  # noqa: BLE001 — ждущие сделают сами
@@ -1127,6 +1142,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
     photos = [p for p in library.by_id.values() if not (p.video and p.live)]
     videos = sum(1 for p in photos if p.video)
     return no_store(JSONResponse({
+        "version": config.app_version(),
         "uptime": int(time.time() - STARTED),
         "pc": pc_state(up),
         "index": {"state": library.state, "error": library.error, "files": len(photos), "videos": videos,
