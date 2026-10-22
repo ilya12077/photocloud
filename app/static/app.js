@@ -675,20 +675,16 @@ async function playVideo(ph, tok, startAt) {
   if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
   if (orig) { v.src = origUrl(ph, false); return; }
   const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // без сжатия — галочка «Оригинал»
-  // страховка: если сжатый поток за 20 с так и не дал первый кадр — открываем оригинал
-  let ok = false;
-  v.addEventListener('loadeddata', () => { ok = true; }, { once: true });
-  setTimeout(() => {
-    if (ok || tok !== V.token || v.hidden) return;
-    console.warn('photocloud: сжатое видео не запустилось — открываю оригинал');
-    if (V.hls) { V.hls.destroy(); V.hls = null; }
-    v.src = origUrl(ph, false);
-  }, 20000);
-  if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; return; }
+  // Сначала hls.js (через MediaSource): новый Chrome на Android заявляет «родную»
+  // поддержку HLS, но наш поток в ней не играет — шкала есть, видео нет. Родной HLS —
+  // только там, где hls.js не работает (старые iPhone).
   try {
     const Hls = await loadHls();
     if (tok !== V.token) return;
-    if (!Hls || !Hls.isSupported()) { v.src = origUrl(ph, false); return; }
+    if (!Hls || !Hls.isSupported()) {
+      v.src = v.canPlayType('application/vnd.apple.mpegurl') ? url : origUrl(ph, false);
+      return;
+    }
     V.hls = new Hls({ enableWorker: false, maxBufferLength: 20, backBufferLength: 30 });
     V.hls.on(Hls.Events.ERROR, (_e, d) => {
       if (!d.fatal || tok !== V.token) return;
@@ -752,6 +748,7 @@ function show(i) {
     });
   }
   $('v-prev').disabled = i === 0; $('v-next').disabled = i === st.list.length - 1;
+  setSides();
 }
 
 const RANK = { q: 1, e: 2, p: 3, o: 4 };
@@ -902,17 +899,109 @@ $('v-livechk').addEventListener('change', (e) => {
   if (e.target.checked) playLive(vid, V.token); else { stopLive(); setLabel(); }
 });
 
+// ================================================================== жесты в просмотре (как в Google Фото)
+// Одним пальцем без увеличения: вбок — фото едет за пальцем, рядом следующее, отпустил —
+// докатывается (или возвращается); вверх/вниз — фото уменьшается за пальцем, фон
+// растворяется, отпустил дальше порога — фото улетает в свою плитку, иначе возвращается.
+const pane = el('div', 'v-pane');
+$('v-zoom').before(pane); pane.append($('v-zoom'));
+const sidePrev = el('img', 'v-side prev'), sideNext = el('img', 'v-side next');
+sidePrev.alt = sideNext.alt = ''; pane.append(sidePrev, sideNext);
+const GAP = 24;
+const DR = { axis: null, busy: false };
+const EASE = 'cubic-bezier(.2,.8,.2,1)';
+
+function setSides() {
+  for (const [img, j] of [[sidePrev, V.i - 1], [sideNext, V.i + 1]]) {
+    const n = st.list[j];
+    if (!n) { img.removeAttribute('src'); continue; }
+    // быстрое превью, если уже в кэше браузера (соседей мы подгружаем), иначе эскиз из сетки
+    const q = new Image(); q.src = imgUrl('q', n) + '&n=p';
+    img.src = !(n[6] & F_VIDEO) && q.complete && q.naturalWidth ? q.src : imgUrl(thumbKind(), n);
+  }
+}
+function paneTo(x, y, s, anim) {
+  pane.style.transition = anim ? `transform .26s ${EASE}` : 'none';
+  pane.style.transform = x || y || s !== 1 ? `translate(${x}px, ${y}px) scale(${s})` : '';
+}
+function backdrop(a, anim) {
+  const t = anim ? `.26s ${EASE}` : '0s';
+  $('viewer').style.transition = `background-color ${t}`;
+  $('viewer').style.backgroundColor = a >= 1 ? '' : `rgba(0,0,0,${a})`;
+  for (const n of [document.querySelector('.v-top'), $('v-prev'), $('v-next')]) {
+    n.style.transition = `opacity ${t}`; n.style.opacity = a >= 1 ? '' : String(Math.max(0, a * 2 - 1));
+  }
+}
+function resetPane() { paneTo(0, 0, 1, false); backdrop(1, false); DR.busy = false; }
+
+function dragMove(dx, dy) {
+  const W = stage.clientWidth, H = stage.clientHeight;
+  if (DR.axis === 'x') {
+    const edge = (dx > 0 && V.i === 0) || (dx < 0 && V.i === st.list.length - 1);
+    paneTo(edge ? dx * 0.3 : dx, 0, 1, false);                 // у края — «резинка»
+  } else {
+    const p = Math.min(1, Math.abs(dy) / H);
+    paneTo(dx, dy, 1 - p * 0.4, false);
+    backdrop(1 - Math.min(1, Math.abs(dy) / (H * 0.4)), false);
+  }
+  void W;
+}
+
+function dragEnd(dx, dy, dt) {
+  const W = stage.clientWidth;
+  if (DR.axis === 'x') {
+    const dir = dx < 0 ? 1 : -1, target = V.i + dir;
+    const fast = Math.abs(dx) / Math.max(dt, 1) > 0.6 && Math.abs(dx) > 40;
+    if ((Math.abs(dx) > W * 0.3 || fast) && st.list[target]) {
+      DR.busy = true;
+      paneTo(-dir * (W + GAP), 0, 1, true);
+      setTimeout(() => { resetPane(); show(target); }, 260);
+    } else paneTo(0, 0, 1, true);
+  } else {
+    const fast = Math.abs(dy) / Math.max(dt, 1) > 0.6 && Math.abs(dy) > 40;
+    if (Math.abs(dy) > 90 || fast) dismiss(dx, dy);
+    else { paneTo(0, 0, 1, true); backdrop(1, true); }
+  }
+  DR.axis = null;
+}
+
+// фото улетает в свою плитку; сетка становится доступна только после полного выхода
+function dismiss() {
+  DR.busy = true;
+  stopLive();
+  let tile = document.querySelector(`.tile[data-i="${V.i}"]`);
+  let t = tile && tile.getBoundingClientRect();
+  if (!t || t.bottom < 0 || t.top > window.innerHeight) {
+    scrollToIndex(V.i, window.innerHeight / 3); draw(true);
+    tile = document.querySelector(`.tile[data-i="${V.i}"]`); t = tile && tile.getBoundingClientRect();
+  }
+  const sb = stage.getBoundingClientRect(), r = imgRect();
+  if (t && r.w && r.h) {
+    const k = Math.max(t.width / r.w, t.height / r.h);
+    const ox = sb.width / 2, oy = sb.height / 2;                 // pane масштабируется от центра
+    const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    const tx = (t.left + t.width / 2 - sb.left) - (ox + (cx - ox) * k);
+    const ty = (t.top + t.height / 2 - sb.top) - (oy + (cy - oy) * k);
+    pane.style.clipPath = '';
+    paneTo(tx, ty, k, true);
+  } else {
+    paneTo(0, 0, 0.6, true); pane.style.transition += ', opacity .26s'; pane.style.opacity = '0';
+  }
+  backdrop(0, true);
+  setTimeout(() => { closeViewer(); resetPane(); pane.style.opacity = ''; }, 270);
+}
+
 function closeViewer(silent) {
   if ($('viewer').hidden) return;
   stopVideo(); stopLive(); resetZoom(false); cancelLoads();
-  $('viewer').hidden = true; document.body.style.overflow = '';
+  $('viewer').hidden = true; document.body.style.overflow = ''; resetPane(); pane.style.opacity = '';
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;
   if (V.pushed && !silent) { V.pushed = false; history.back(); }
   V.pushed = false;
   // если пролистали далеко — возвращаем сетку к последнему просмотренному
   const t = document.querySelector(`.tile[data-i="${V.i}"]`);
   const r = t && t.getBoundingClientRect();
-  if (!r || r.bottom < 0 || r.top > window.innerHeight) { scrollToIndex(V.i, -window.innerHeight / 3); draw(true); }
+  if (!r || r.bottom < 0 || r.top > window.innerHeight) { scrollToIndex(V.i, window.innerHeight / 3); draw(true); }
   loadVisible(true);      // догружаем эскизы, отменённые при открытии
   if (layoutW() !== lastW) { lastW = layoutW(); initZoom(); relayout(true); }   // повернули телефон в просмотре
 }
@@ -1004,10 +1093,11 @@ stage.addEventListener('touchstart', (e) => {
     const [mx, my] = tmid(e.touches);
     VZ.pinch = { d0: tdist(e.touches) || 1, s0: VZ.s, mx, my, tx0: VZ.tx, ty0: VZ.ty };
     VZ.pan = null; VZ.moved = true;
+    if (DR.axis) { DR.axis = null; paneTo(0, 0, 1, true); backdrop(1, true); }   // второй палец — это щипок
   } else if (e.touches.length === 1) {
     const t = e.touches[0];
     VZ.pan = { x: t.clientX, y: t.clientY, tx0: VZ.tx, ty0: VZ.ty, t: Date.now() };
-    VZ.moved = false;
+    VZ.moved = false; DR.axis = null;
   }
 }, { passive: true });
 
@@ -1025,6 +1115,11 @@ stage.addEventListener('touchmove', (e) => {
     const t = e.touches[0], dx = t.clientX - VZ.pan.x, dy = t.clientY - VZ.pan.y;
     if (Math.abs(dx) + Math.abs(dy) > 8) VZ.moved = true;
     if (VZ.s > 1) { e.preventDefault(); VZ.tx = VZ.pan.tx0 + dx; VZ.ty = VZ.pan.ty0 + dy; clampPan(); applyZoom(false); }
+    else if (!DR.busy) {
+      // направление выбираем один раз: вбок — листание, вверх/вниз — выход
+      if (!DR.axis && Math.abs(dx) + Math.abs(dy) > 10) DR.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      if (DR.axis) { e.preventDefault(); dragMove(dx, dy); }
+    }
   }
 }, { passive: false });
 
@@ -1041,7 +1136,7 @@ stage.addEventListener('touchend', (e) => {
   }
   if (!VZ.pan || e.touches.length) return;
   const t = e.changedTouches[0], dx = t.clientX - VZ.pan.x, dy = t.clientY - VZ.pan.y;
-  const quick = Date.now() - VZ.pan.t < 300;
+  const t0 = VZ.pan.t, quick = Date.now() - t0 < 300;
   VZ.pan = null;
   if (!VZ.moved && quick && zoomActive()) {
     // двойной тап: второе касание рядом с первым в течение 300 мс
@@ -1052,9 +1147,8 @@ stage.addEventListener('touchend', (e) => {
     VZ.tap = { t: now, x: t.clientX, y: t.clientY };
     return;
   }
-  if (VZ.s > 1) return;                                     // при увеличении свайпы не листают
-  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) show(V.i + (dx < 0 ? 1 : -1));
-  else if (dy > 90 && Math.abs(dy) > Math.abs(dx) * 1.5) closeViewer();
+  if (VZ.s > 1 || !DR.axis) { DR.axis = null; return; }   // при увеличении свайпы не листают
+  dragEnd(dx, dy, Date.now() - t0);
 }, { passive: true });
 
 // мышь / трекпад
