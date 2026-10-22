@@ -89,7 +89,8 @@ async function enter() {
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
   $('login').hidden = true; $('main').hidden = false;
-  readRoute(); initZoom(); updateEcoUi();
+  readRoute(); initZoom();
+  try { localStorage.removeItem('pc.eco'); } catch (_) {}
   poll();
   const early = await st.libPromise; st.libPromise = null;
   if (early && early.ok && !st.lib) await loadLibrary(early);
@@ -101,20 +102,6 @@ function hideMenu() { $('menu').hidden = true; $('menu-btn').setAttribute('aria-
 $('menu-btn').addEventListener('click', (e) => { e.stopPropagation(); const h = !$('menu').hidden; $('menu').hidden = h; $('menu-btn').setAttribute('aria-expanded', String(!h)); });
 document.addEventListener('click', (e) => { if (!$('menu').hidden && !e.target.closest('.menu-wrap')) hideMenu(); });
 
-// экономия трафика: авто по данным браузера (Chrome/Android) или вручную
-function autoEco() {
-  const c = navigator.connection;
-  return !!(c && (c.saveData || ['slow-2g', '2g', '3g'].includes(c.effectiveType) || (c.downlink && c.downlink < 4)));
-}
-// ручной выбор живёт только до перезагрузки страницы, потом снова авто
-let ecoManual = null;
-try { localStorage.removeItem('pc.eco'); } catch {}   // старые версии запоминали навсегда
-function eco() { return ecoManual ?? autoEco(); }
-function updateEcoUi() {
-  $('eco').checked = eco();
-  $('eco-auto').textContent = ecoManual === null ? '(авто)' : '';
-}
-$('eco').addEventListener('change', (e) => { ecoManual = e.target.checked; updateEcoUi(); relayout(true); });
 
 // ================================================================== статус / пробуждение
 
@@ -262,13 +249,14 @@ const origUrl = (ph, dl) => `/img/o/${encodeURIComponent(ph[0])}${dl ? '?dl=1' :
 function thumbKind() {
   // сколько реальных пикселей занимает плитка -> ближайший размер эскиза
   // плотность экрана больше 2 на глаз не видна в мелких плитках, а файлы и декод — в разы тяжелее
-  const dpr = Math.min(window.devicePixelRatio || 1, eco() ? 1.5 : 2);
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
   const px = L.tileH * dpr;
   if (px <= Z.sizes.s * 1.15) return 's';
   if (px <= Z.sizes.t * 1.15) return 't';
   return 'm';
 }
-const previewKind = () => (eco() ? 'e' : 'p');
+// экономия трафика всегда: на весь экран — 1280; 2048 и оригинал — только при увеличении
+const previewKind = () => 'e';
 
 // ================================================================== отрисовка: шапка, папки
 
@@ -595,6 +583,7 @@ document.addEventListener('touchstart', (e) => {
 }, { passive: true });
 document.addEventListener('touchmove', (e) => {
   if (!Z.pinch || e.touches.length !== 2) return;
+  if (!gridActive()) { Z.pinch = null; return; }     // открыли просмотр — щипок уже не про сетку
   e.preventDefault();
   const s = dist(e.touches) / Z.pinch.d0;
   setCols(Math.round(Z.pinch.c0 / s), (e.touches[0].clientX + e.touches[1].clientX) / 2, (e.touches[0].clientY + e.touches[1].clientY) / 2);
@@ -621,13 +610,15 @@ document.addEventListener('keydown', (e) => {
 // На телефоне при прокрутке браузер прячет/показывает адресную строку — высота окна
 // меняется, но сетка от высоты не зависит. Перестраиваем её только при смене ширины
 // (поворот, окно на компе), иначе плитки пересоздавались бы и мигали.
-let resizeT = 0, lastW = window.innerWidth;
+// ширина макета, а не видимой области: щипок-увеличение в браузере её не меняет
+const layoutW = () => document.documentElement.clientWidth;
+let resizeT = 0, lastW = layoutW();
 window.addEventListener('resize', () => {
   clearTimeout(resizeT);
   resizeT = setTimeout(() => {
-    if ($('main').hidden || !st.lib) return;
-    if (window.innerWidth === lastW) { draw(false); updateScrub(); return; }
-    lastW = window.innerWidth;
+    if ($('main').hidden || !st.lib || !$('viewer').hidden) return;   // в просмотре — проверим при выходе
+    if (layoutW() === lastW) { draw(false); updateScrub(); return; }
+    lastW = layoutW();
     initZoom(); relayout(true);
   }, 150);
 });
@@ -645,7 +636,7 @@ const sizeStr = (kb) => (kb >= 1024 ? (kb / 1024).toFixed(1) + ' МБ' : kb + ' 
 
 function openViewer(i) {
   if (!$('viewer').hidden) { show(i); return; }
-  $('viewer').hidden = false; document.body.style.overflow = 'hidden';
+  $('viewer').hidden = false; document.body.style.overflow = 'hidden'; Z.pinch = null;
   // недогруженные эскизы под просмотрщиком не нужны — отменяем, весь канал отдаём фото
   for (const [, node] of L.rendered) cancelImgs(node);
   history.pushState({ viewer: 1 }, ''); V.pushed = true;
@@ -676,7 +667,7 @@ async function playVideo(ph, tok, startAt) {
   $('v-note').hidden = !(orig && (ph[6] & F_NOPLAY));
   if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
   if (orig) { v.src = origUrl(ph, false); return; }
-  const url = `/vid/${encodeURIComponent(ph[0])}/${eco() ? 'eco' : 'hq'}/index.m3u8?v=${ph[4]}`;
+  const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // без сжатия — галочка «Оригинал»
   if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; return; }
   try {
     const Hls = await loadHls();
@@ -768,6 +759,7 @@ function loadStep(ph, tok, kind, extra) {
       if (tok === V.token && RANK[kind] > VZ.shown) {
         const hi = $('v-img');
         hi.src = url; hi.classList.add('ok'); VZ.shown = RANK[kind];
+        if (kind === 'o') $('v-name').textContent = 'Без сжатия • ' + ph[2];
         $('v-spin').hidden = true;
         setTimeout(() => { if (tok === V.token) $('v-low').style.visibility = 'hidden'; }, 200);
       }
@@ -787,8 +779,6 @@ async function prefetchNear(i, tok) {
     const n = st.list[j];
     if (n && !(n[6] & F_VIDEO)) urls.push(imgUrl('q', n) + `&n=${full}`);
   }
-  const nx = st.list[i + 1];
-  if (!eco() && nx && !(nx[6] & F_VIDEO)) urls.push(imgUrl(full, nx));
   for (const u of urls) {
     if (tok !== V.token || ctl.signal.aborted) return;
     try {
@@ -830,7 +820,7 @@ function playLive(vid, tok, after) {
     });
   };
   lv.onerror = () => { lv.classList.remove('on'); next(); };
-  lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4?q=${eco() ? 'eco' : 'hq'}`;
+  lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4?q=eco`;
   lv.load();
 }
 // если браузер не разрешил звук без нажатия — первое касание фото включает звук и переигрывает
@@ -859,6 +849,7 @@ function closeViewer(silent) {
   const r = t && t.getBoundingClientRect();
   if (!r || r.bottom < 0 || r.top > window.innerHeight) { scrollToIndex(V.i, -window.innerHeight / 3); draw(true); }
   loadVisible(true);      // догружаем эскизы, отменённые при открытии
+  if (layoutW() !== lastW) { lastW = layoutW(); initZoom(); relayout(true); }   // повернули телефон в просмотре
 }
 
 window.addEventListener('popstate', () => { if (!$('viewer').hidden) { V.pushed = false; closeViewer(true); } });
@@ -929,7 +920,7 @@ function upgradeQuality() {
   const browserCan = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
   const have = Math.max(VZ.shown, RANK[VZ.want] || 0);
   let want = have < RANK.p ? 'p' : '';
-  if (VZ.s >= 2.5 && !eco() && browserCan && ph[5] < 25 * 1024) want = 'o';   // оригинал до 25 МБ
+  if (VZ.s >= 2.5 && browserCan && ph[5] < 25 * 1024) want = 'o';   // оригинал до 25 МБ
   if (!want || RANK[want] <= have) return;
   VZ.want = want;                                // помечаем сразу, чтобы не запрашивать повторно
   loadStep(ph, V.token, want, '');
