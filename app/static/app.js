@@ -964,7 +964,8 @@ function backdrop(a, anim) {
     n.style.transition = `opacity ${t}`; n.style.opacity = a >= 1 ? '' : String(Math.max(0, a * 2 - 1));
   }
 }
-function resetPane() { paneTo(0, 0, 1, false); backdrop(1, false); DR.busy = false; }
+function sides(on) { sidePrev.style.visibility = sideNext.style.visibility = on ? '' : 'hidden'; }
+function resetPane() { paneTo(0, 0, 1, false); backdrop(1, false); sides(true); DR.busy = false; }
 
 function dragMove(dx, dy) {
   const W = stage.clientWidth, H = stage.clientHeight;
@@ -972,6 +973,7 @@ function dragMove(dx, dy) {
     const edge = (dx > 0 && V.i === 0) || (dx < 0 && V.i === st.list.length - 1);
     paneTo(edge ? dx * 0.3 : dx, 0, 1, false);                 // у края — «резинка»
   } else {
+    sides(false);                                               // при выходе — только текущее фото
     const p = Math.min(1, Math.abs(dy) / H);
     paneTo(dx, dy, 1 - p * 0.4, false);
     backdrop(1 - Math.min(1, Math.abs(dy) / (H * 0.4)), false);
@@ -992,7 +994,7 @@ function dragEnd(dx, dy, dt) {
   } else {
     const fast = Math.abs(dy) / Math.max(dt, 1) > 0.6 && Math.abs(dy) > 40;
     if (Math.abs(dy) > 90 || fast) dismiss(dx, dy);
-    else { paneTo(0, 0, 1, true); backdrop(1, true); }
+    else { paneTo(0, 0, 1, true); backdrop(1, true); setTimeout(() => { if (!DR.axis) sides(true); }, 270); }
   }
   DR.axis = null;
 }
@@ -1125,7 +1127,7 @@ stage.addEventListener('touchstart', (e) => {
     const [mx, my] = tmid(e.touches);
     VZ.pinch = { d0: tdist(e.touches) || 1, s0: VZ.s, mx, my, tx0: VZ.tx, ty0: VZ.ty };
     VZ.pan = null; VZ.moved = true;
-    if (DR.axis) { DR.axis = null; paneTo(0, 0, 1, true); backdrop(1, true); }   // второй палец — это щипок
+    if (DR.axis) { DR.axis = null; paneTo(0, 0, 1, true); backdrop(1, true); sides(true); }   // второй палец — это щипок
   } else if (e.touches.length === 1) {
     const t = e.touches[0];
     VZ.pan = { x: t.clientX, y: t.clientY, tx0: VZ.tx, ty0: VZ.ty, t: Date.now() };
