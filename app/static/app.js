@@ -618,10 +618,18 @@ document.addEventListener('keydown', (e) => {
   if (e.key === '+' || e.key === '=') setCols(Z.cols - 1, innerWidth / 2, innerHeight / 2);
   else if (e.key === '-') setCols(Z.cols + 1, innerWidth / 2, innerHeight / 2);
 });
-let resizeT = 0;
+// На телефоне при прокрутке браузер прячет/показывает адресную строку — высота окна
+// меняется, но сетка от высоты не зависит. Перестраиваем её только при смене ширины
+// (поворот, окно на компе), иначе плитки пересоздавались бы и мигали.
+let resizeT = 0, lastW = window.innerWidth;
 window.addEventListener('resize', () => {
   clearTimeout(resizeT);
-  resizeT = setTimeout(() => { if (!$('main').hidden && st.lib) { initZoom(); relayout(true); } }, 150);
+  resizeT = setTimeout(() => {
+    if ($('main').hidden || !st.lib) return;
+    if (window.innerWidth === lastW) { draw(false); updateScrub(); return; }
+    lastW = window.innerWidth;
+    initZoom(); relayout(true);
+  }, 150);
 });
 
 // высота шапки (для плашки месяца)
