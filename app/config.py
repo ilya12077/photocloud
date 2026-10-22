@@ -143,8 +143,8 @@ class Settings:
     ffmpeg: str = ""
     transcode: bool = True
     transcode_cache_mb: int = 256
-    transcode_slots: int = 1
-    meta_threads: int = 8
+    transcode_slots: int = 2
+    meta_threads: int = 4
 
     # производительность
     image_format: str = "webp"
@@ -154,13 +154,12 @@ class Settings:
     thumb_quality: int = 60
     preview_quick_size: int = 720
     preview_quick_quality: int = 32
-    preview_eco_size: int = 1280
     preview_size: int = 2048
     preview_quality: int = 72
     thumb_cache_mb: int = 128
     preview_cache_mb: int = 64
     max_decode_mb: int = 150
-    workers: int = 2
+    workers: int = 5
     index_ttl: int = 600
 
 
@@ -261,8 +260,10 @@ def load() -> Settings:
     s.ffmpeg = _get("FFMPEG", "") or ""
     s.transcode = _bool("TRANSCODE", True)
     s.transcode_cache_mb = _int("TRANSCODE_CACHE_MB", 256, 16, 4096)
-    s.transcode_slots = _int("TRANSCODE_SLOTS", 1, 1, 8)
-    s.meta_threads = _int("META_THREADS", 8, 1, 32)
+    # 2 ffmpeg одновременно: ролик живого фото не задерживает куски видео
+    s.transcode_slots = _int("TRANSCODE_SLOTS", 2, 1, 8)
+    # с ПК фоновое чтение дат идёт не больше чем в 4 потока (storage.SMB_BACKGROUND) — больше бессмысленно
+    s.meta_threads = _int("META_THREADS", 4, 1, 32)
 
     s.image_format = (_get("IMAGE_FORMAT", "webp") or "").lower()
     if s.image_format not in ("webp", "jpeg"):
@@ -273,7 +274,6 @@ def load() -> Settings:
     s.thumb_quality = _int("THUMB_QUALITY", 60, 30, 95)
     s.preview_quick_size = _int("PREVIEW_QUICK_SIZE", 720, 320, 2048)
     s.preview_quick_quality = _int("PREVIEW_QUICK_QUALITY", 32, 20, 90)
-    s.preview_eco_size = _int("PREVIEW_ECO_SIZE", 1280, 512, 4096)
     s.preview_size = _int("PREVIEW_SIZE", 2048, 512, 8192)
     s.preview_quality = _int("PREVIEW_QUALITY", 72, 30, 95)
     s.thumb_cache_mb = _int("THUMB_CACHE_MB", 128, 0, 4096)
@@ -282,7 +282,8 @@ def load() -> Settings:
     # по умолчанию на 1 ядро меньше, чем есть (но не больше 3) — чтобы HA рядом не тормозил
     # декодирование в Pillow отпускает GIL, так что потоки реально работают параллельно;
     # по умолчанию ядер − 1 (одно оставляем остальным сервисам), но не больше 8
-    s.workers = _int("WORKERS", max(1, min(8, (os.cpu_count() or 2) - 1)), 1, 32)
+    # ядра + 1: около половины времени эскиз ждёт чтения файла по сети, процессор при этом свободен
+    s.workers = _int("WORKERS", max(2, min(8, (os.cpu_count() or 2) + 1)), 1, 32)
     s.index_ttl = _int("INDEX_TTL", 600, 30, 86400)
     load_overrides(s)   # то, что поменяли в админке, важнее .env
     return s
