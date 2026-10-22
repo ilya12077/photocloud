@@ -646,6 +646,8 @@ const sizeStr = (kb) => (kb >= 1024 ? (kb / 1024).toFixed(1) + ' МБ' : kb + ' 
 function openViewer(i) {
   if (!$('viewer').hidden) { show(i); return; }
   $('viewer').hidden = false; document.body.style.overflow = 'hidden';
+  // недогруженные эскизы под просмотрщиком не нужны — отменяем, весь канал отдаём фото
+  for (const [, node] of L.rendered) cancelImgs(node);
   history.pushState({ viewer: 1 }, ''); V.pushed = true;
   show(i);
 }
@@ -727,7 +729,7 @@ function show(i) {
     playVideo(ph, tok, 0);
   } else {
     $('v-spin').hidden = false;
-    const pre = new Image();
+    const pre = new Image(); pre.fetchPriority = 'high';
     pre.onload = () => { if (tok !== V.token) return; hi.src = pre.src; hi.classList.add('ok'); $('v-spin').hidden = true; setTimeout(() => { if (tok === V.token) low.style.visibility = 'hidden'; }, 200); };
     pre.onerror = () => { if (tok === V.token) $('v-spin').hidden = true; };
     pre.src = imgUrl(previewKind(), ph);
@@ -793,6 +795,7 @@ function closeViewer(silent) {
   const t = document.querySelector(`.tile[data-i="${V.i}"]`);
   const r = t && t.getBoundingClientRect();
   if (!r || r.bottom < 0 || r.top > window.innerHeight) { scrollToIndex(V.i, -window.innerHeight / 3); draw(true); }
+  loadVisible(true);      // догружаем эскизы, отменённые при открытии
 }
 
 window.addEventListener('popstate', () => { if (!$('viewer').hidden) { V.pushed = false; closeViewer(true); } });
