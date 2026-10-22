@@ -639,7 +639,7 @@ new ResizeObserver(() => {
 
 // ================================================================== просмотр
 
-const V = { i: -1, token: 0, pushed: false };
+const V = { i: -1, token: 0, pushed: false, loads: [], ctl: null };
 const fmt = new Intl.DateTimeFormat('ru', { dateStyle: 'long', timeStyle: 'short' });
 const sizeStr = (kb) => (kb >= 1024 ? (kb / 1024).toFixed(1) + ' МБ' : kb + ' КБ');
 
@@ -718,8 +718,9 @@ function show(i) {
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
-  resetZoom(false); VZ.kind = isVideo ? '' : previewKind(); VZ.tap = null;
-  setupLive(ph, tok);
+  resetZoom(false); VZ.shown = 0; VZ.want = ''; VZ.tap = null;
+  cancelLoads();
+  const liveVid = setupLive(ph);
   $('v-note').hidden = !(ph[6] & F_NOPLAY);
   hi.classList.remove('ok'); hi.removeAttribute('src');
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
@@ -728,34 +729,96 @@ function show(i) {
     low.style.visibility = 'hidden'; $('v-spin').hidden = true;
     playVideo(ph, tok, 0);
   } else {
+    // Загрузка по ступеням, строго по очереди (на медленном канале параллельные
+    // загрузки только мешают друг другу):
+    //   1) быстрая сильно сжатая версия (~20–40 КБ) — фото видно почти сразу;
+    //   2) у живого фото — ролик (он и так закрывает фото, пока играет);
+    //   3) полная версия: 1280 при экономии, 2048 без неё; сервер готовит её
+    //      заранее вместе с быстрой, из того же декода;
+    //   4) соседние фото (быстрые версии, без экономии — и полная следующего).
+    // При увеличении — версия подробнее / оригинал (upgradeQuality).
     $('v-spin').hidden = false;
-    const pre = new Image(); pre.fetchPriority = 'high';
-    pre.onload = () => { if (tok !== V.token) return; hi.src = pre.src; hi.classList.add('ok'); $('v-spin').hidden = true; setTimeout(() => { if (tok === V.token) low.style.visibility = 'hidden'; }, 200); };
-    pre.onerror = () => { if (tok === V.token) $('v-spin').hidden = true; };
-    pre.src = imgUrl(previewKind(), ph);
-    // соседей подгружаем заранее (в режиме экономии — только следующее и после паузы)
-    setTimeout(() => {
+    const full = previewKind();
+    loadStep(ph, tok, 'q', `&n=${full}`).then(() => {
       if (tok !== V.token) return;
-      for (const j of eco() ? [i + 1] : [i + 1, i - 1]) { const n = st.list[j]; if (n && !(n[6] & F_VIDEO)) { const x = new Image(); x.src = imgUrl(previewKind(), n); } }
-    }, eco() ? 1500 : 250);
+      const rest = () => loadStep(ph, tok, full, '').then(() => { if (tok === V.token) prefetchNear(i, tok); });
+      if (liveVid) playLive(liveVid, tok, rest); else rest();
+    });
   }
   $('v-prev').disabled = i === 0; $('v-next').disabled = i === st.list.length - 1;
+}
+
+const RANK = { q: 1, e: 2, p: 3, o: 4 };
+
+function cancelLoads() {
+  // фото пролистали — его недогруженные версии и предзагрузка больше не нужны
+  for (const im of V.loads) im.removeAttribute('src');
+  V.loads = [];
+  if (V.ctl) { V.ctl.abort(); V.ctl = null; }
+}
+
+// одна ступень: грузим версию kind и показываем, если она подробнее уже показанной
+function loadStep(ph, tok, kind, extra) {
+  return new Promise((resolve) => {
+    if (tok !== V.token) { resolve(false); return; }
+    const pre = new Image(); pre.fetchPriority = 'high'; pre.decoding = 'async';
+    V.loads.push(pre);
+    const url = (kind === 'o' ? origUrl(ph, false) : imgUrl(kind, ph)) + extra;
+    pre.onload = () => {
+      if (tok === V.token && RANK[kind] > VZ.shown) {
+        const hi = $('v-img');
+        hi.src = url; hi.classList.add('ok'); VZ.shown = RANK[kind];
+        $('v-spin').hidden = true;
+        setTimeout(() => { if (tok === V.token) $('v-low').style.visibility = 'hidden'; }, 200);
+      }
+      resolve(true);
+    };
+    pre.onerror = () => { if (tok === V.token && kind !== 'q') $('v-spin').hidden = true; resolve(false); };
+    pre.src = url;
+  });
+}
+
+// соседние фото: по одному и с низким приоритетом — открытое фото важнее
+async function prefetchNear(i, tok) {
+  const ctl = V.ctl = new AbortController();
+  const full = previewKind();
+  const urls = [];
+  for (const j of [i + 1, i - 1]) {
+    const n = st.list[j];
+    if (n && !(n[6] & F_VIDEO)) urls.push(imgUrl('q', n) + `&n=${full}`);
+  }
+  const nx = st.list[i + 1];
+  if (!eco() && nx && !(nx[6] & F_VIDEO)) urls.push(imgUrl(full, nx));
+  for (const u of urls) {
+    if (tok !== V.token || ctl.signal.aborted) return;
+    try {
+      // X-PF: сервер ставит это в очередь после фото, которое открыто сейчас
+      const r = await fetch(u, { signal: ctl.signal, priority: 'low', headers: { 'X-PF': '1' }, credentials: 'same-origin' });
+      await r.arrayBuffer();
+    } catch (_) { return; }
+  }
 }
 
 // ---- живые фото
 function stopLive() {
   const lv = $('v-live'); lv.classList.remove('on'); lv.pause(); lv.removeAttribute('src'); lv.load();
 }
-function setupLive(ph, tok) {
+function setupLive(ph) {
+  // -> id ролика, если его надо проиграть (сам запуск — после быстрой версии фото)
   stopLive();
   const vid = (ph[6] & F_LIVE) && st.lib.live[ph[0]];
   $('v-livewrap').hidden = !vid;
-  if (!vid) return;
+  if (!vid) return null;
   $('v-livechk').checked = store('pc.live') === '1';
-  if ($('v-livechk').checked) playLive(vid, tok);
+  return $('v-livechk').checked ? vid : null;
 }
-function playLive(vid, tok) {
+function playLive(vid, tok, after) {
+  // after — что грузить следом (полное фото): когда ролик загрузился, не смог или 5 с прошло
   const lv = $('v-live');
+  let done = false;
+  const next = () => { if (done) return; done = true; if (after && tok === V.token) after(); };
+  setTimeout(next, 5000);
+  lv.oncanplaythrough = next;
   lv.onended = () => lv.classList.remove('on');             // доиграл — снова фото
   lv.muted = false;
   lv.oncanplay = () => {
@@ -766,7 +829,7 @@ function playLive(vid, tok) {
       lv.play().then(() => lv.classList.add('on')).catch(() => {});
     });
   };
-  lv.onerror = () => lv.classList.remove('on');
+  lv.onerror = () => { lv.classList.remove('on'); next(); };
   lv.src = `/vid/${encodeURIComponent(vid)}/live.mp4?q=${eco() ? 'eco' : 'hq'}`;
   lv.load();
 }
@@ -786,7 +849,7 @@ $('v-livechk').addEventListener('change', (e) => {
 
 function closeViewer(silent) {
   if ($('viewer').hidden) return;
-  stopVideo(); stopLive(); resetZoom(false);
+  stopVideo(); stopLive(); resetZoom(false); cancelLoads();
   $('viewer').hidden = true; document.body.style.overflow = '';
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;
   if (V.pushed && !silent) { V.pushed = false; history.back(); }
@@ -806,7 +869,7 @@ $('v-next').addEventListener('click', () => show(V.i + 1));
 // Щипок / растяжение, двойной тап или двойной клик, Ctrl+колесо (жест трекпада), перетаскивание.
 // Свайпы влево/вправо/вниз работают только при обычном масштабе.
 
-const VZ = { s: 1, tx: 0, ty: 0, pinch: null, pan: null, tap: null, moved: false, kind: '' };
+const VZ = { s: 1, tx: 0, ty: 0, pinch: null, pan: null, tap: null, moved: false, shown: 0, want: '' };
 const MAX_ZOOM = 8;
 const stage = $('v-stage'), zoomEl = $('v-zoom');
 
@@ -864,14 +927,12 @@ function upgradeQuality() {
   const ph = st.list[V.i]; if (!ph || VZ.s < 1.6) return;
   const ext = ph[2].slice(ph[2].lastIndexOf('.')).toLowerCase();
   const browserCan = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
-  let want = VZ.kind === 'e' ? 'p' : '';
+  const have = Math.max(VZ.shown, RANK[VZ.want] || 0);
+  let want = have < RANK.p ? 'p' : '';
   if (VZ.s >= 2.5 && !eco() && browserCan && ph[5] < 25 * 1024) want = 'o';   // оригинал до 25 МБ
-  if (!want || want === VZ.kind || (VZ.kind === 'o')) return;
-  const tok = V.token, hi = $('v-img');
-  const url = want === 'o' ? origUrl(ph, false) : imgUrl(want, ph);
-  const pre = new Image();
-  pre.onload = () => { if (tok === V.token) { hi.src = url; VZ.kind = want; } };
-  pre.src = url; VZ.kind = want;                 // помечаем сразу, чтобы не запрашивать повторно
+  if (!want || RANK[want] <= have) return;
+  VZ.want = want;                                // помечаем сразу, чтобы не запрашивать повторно
+  loadStep(ph, V.token, want, '');
 }
 
 const tdist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
