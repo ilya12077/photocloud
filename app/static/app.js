@@ -602,10 +602,17 @@ window.addEventListener('wheel', (e) => {
 
 $('zin').addEventListener('click', () => setCols(Z.cols - 1, innerWidth / 2, innerHeight / 2));
 $('zout').addEventListener('click', () => setCols(Z.cols + 1, innerWidth / 2, innerHeight / 2));
+// + / − и Ctrl(⌘) + / − / 0: вместо масштаба страницы браузером меняем размер плиток
+const zoomKey = (e) => (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd') ? 1
+  : (e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract') ? -1
+  : (e.key === '0' || e.code === 'Numpad0') ? 0 : null;
 document.addEventListener('keydown', (e) => {
-  if (!gridActive() || e.ctrlKey || e.metaKey || e.altKey || /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
-  if (e.key === '+' || e.key === '=') setCols(Z.cols - 1, innerWidth / 2, innerHeight / 2);
-  else if (e.key === '-') setCols(Z.cols + 1, innerWidth / 2, innerHeight / 2);
+  if (!gridActive() || e.altKey || /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+  const k = zoomKey(e);
+  if (k === null || (k === 0 && !(e.ctrlKey || e.metaKey))) return;
+  e.preventDefault();
+  if (k === 0) { store('pc.tile', null); initZoom(); relayout(true); return; }   // Ctrl+0 — размер по умолчанию
+  setCols(Z.cols - k, innerWidth / 2, innerHeight / 2);
 });
 // На телефоне при прокрутке браузер прячет/показывает адресную строку — высота окна
 // меняется, но сетка от высоты не зависит. Перестраиваем её только при смене ширины
@@ -1027,9 +1034,13 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { if (VZ.s > 1) resetZoom(true); else closeViewer(); }
   else if (e.key === 'ArrowLeft' && VZ.s === 1) show(V.i - 1);
   else if (e.key === 'ArrowRight' && VZ.s === 1) show(V.i + 1);
-  else if ((e.key === '+' || e.key === '=') && zoomActive()) { zoomAt(VZ.s * 1.5, cx, cy, true); upgradeQuality(); }
-  else if (e.key === '-' && zoomActive()) zoomAt(VZ.s / 1.5, cx, cy, true);
-  else if (e.key === '0' && zoomActive()) resetZoom(true);
+  else if (zoomKey(e) !== null && zoomActive()) {
+    e.preventDefault();                          // Ctrl + / − / 0 — масштаб фото, а не страницы
+    const k = zoomKey(e);
+    if (k === 1) { zoomAt(VZ.s * 1.5, cx, cy, true); upgradeQuality(); }
+    else if (k === -1) zoomAt(VZ.s / 1.5, cx, cy, true);
+    else resetZoom(true);
+  }
 });
 
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('main').hidden) poll(); });
