@@ -778,13 +778,17 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     if kind == "q":
         q = S.preview_quick_quality
     # приоритет: быстрая версия открытого фото > полная > соседние (заголовок X-PF) > сетка
-    prefetch = request.headers.get("x-pf") == "1"
+    # X-PF: 1 — соседи открытого фото, grid — видимые плитки сетки
+    pf = request.headers.get("x-pf")
+    prefetch = pf in ("1", "grid")
     prio = PRIO_GRID if kind in "stm" else PRIO_QUICK if kind == "q" else PRIO_VIEWER
     if prefetch and prio != PRIO_GRID:
         prio = PRIO_PREFETCH
     # к быстрой версии сразу готовим полную 2048 (n=p): тот же файл, второй раз с ПК не читаем
     nk = request.query_params.get("n")
-    ckey = (nk, pid, p.mtime, p.size) if kind == "q" and nk == "p" and not p.video else None
+    # для плиток сетки — только быстрое превью: 2048 «на всякий случай» для каждой плитки
+    # заняло бы процессор и задержало эскизы
+    ckey = (nk, pid, p.mtime, p.size) if kind == "q" and nk == "p" and not p.video and pf != "grid" else None
     key = (kind, pid, p.mtime, p.size)
     if time.time() - failed.get(key, 0) < FAILED_TTL:
         raise HTTPException(415)

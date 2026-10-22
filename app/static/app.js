@@ -385,6 +385,7 @@ function scrollToIndex(i, offset = 0) {
 
 function draw(force) {
   if ($('main').hidden || !st.lib) return;
+  if (force) gridPrefetchSoon();
   const y = window.scrollY, gt = gridTop(), vh = window.innerHeight;
   L.lastY = y;
   // картинки грузим прямо во время прокрутки; пауза только пока тащат ползунок по датам
@@ -505,9 +506,54 @@ function retryBroken() {
 
 let rafPending = false;
 window.addEventListener('scroll', () => {
+  gridPrefetchSoon();
   if (rafPending) return; rafPending = true;
   requestAnimationFrame(() => { rafPending = false; draw(false); updateScrub(); });
 }, { passive: true });
+
+// Прокрутка остановилась на 0,2 с — заранее качаем быстрые превью видимых плиток (~10 КБ),
+// чтобы тап сразу показывал «Превью». Только после того как догрузились эскизы на экране,
+// по два запроса, с низким приоритетом; прокрутка или открытие фото всё обрывает.
+const GP = { t: 0, ctl: null, tries: 0 };
+const prefetched = new Set();         // быстрые превью, которые уже лежат в кэше браузера
+function gridPrefetchSoon() {
+  clearTimeout(GP.t);
+  if (GP.ctl) { GP.ctl.abort(); GP.ctl = null; }
+  GP.tries = 0;
+  GP.t = setTimeout(gridPrefetch, 200);
+}
+async function gridPrefetch() {
+  if ($('main').hidden || !$('viewer').hidden || !st.lib || L.fast) return;
+  const vh = window.innerHeight, want = [];
+  let pending = false;
+  for (const [, node] of L.rendered) {
+    for (const tile of node.querySelectorAll('.tile')) {
+      const r = tile.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= vh) continue;
+      const img = tile.querySelector('img');
+      if (img && !img.dataset.loaded && !img.dataset.err) pending = true;
+      const ph = st.list[+tile.dataset.i];
+      if (!ph || (ph[6] & F_VIDEO)) continue;
+      const u = imgUrl('q', ph) + '&n=p';
+      if (!prefetched.has(u)) want.push(u);
+    }
+  }
+  if (pending && GP.tries++ < 25) { GP.t = setTimeout(gridPrefetch, 200); return; }   // сначала эскизы
+  if (!want.length) return;
+  const ctl = GP.ctl = new AbortController();
+  const worker = async () => {
+    while (want.length && !ctl.signal.aborted) {
+      const u = want.shift();
+      try {
+        const r = await fetch(u, { signal: ctl.signal, priority: 'low', headers: { 'X-PF': 'grid' }, credentials: 'same-origin' });
+        await r.arrayBuffer();
+        if (r.ok) prefetched.add(u);
+      } catch (_) { return; }
+    }
+  };
+  await Promise.all([worker(), worker()]);
+  if (GP.ctl === ctl) GP.ctl = null;
+}
 
 $('grid').addEventListener('click', (e) => { const t = e.target.closest('.tile'); if (t) openViewer(+t.dataset.i); });
 
@@ -644,6 +690,7 @@ const sizeStr = (kb) => (kb >= 1024 ? (kb / 1024).toFixed(1) + ' МБ' : kb + ' 
 function openViewer(i) {
   if (!$('viewer').hidden) { show(i); return; }
   $('viewer').hidden = false; document.body.style.overflow = 'hidden'; Z.pinch = null;
+  clearTimeout(GP.t); if (GP.ctl) { GP.ctl.abort(); GP.ctl = null; }
   // недогруженные эскизы под просмотрщиком не нужны — отменяем, весь канал отдаём фото
   for (const [, node] of L.rendered) cancelImgs(node);
   history.pushState({ viewer: 1 }, ''); V.pushed = true;
@@ -751,7 +798,13 @@ function show(i) {
     const full = previewKind();
     loadStep(ph, tok, 'q', `&n=${full}`).then(() => {
       if (tok !== V.token) return;
-      const rest = () => { if (!VZ.zoomedOnce) loadStep(ph, tok, full, '').then(() => { if (tok === V.token && !VZ.zoomedOnce) prefetchNear(i, tok); }); };
+      // на компьютере (мышь, быстрый канал) сразу за 2048 грузим оригинал — не дожидаясь увеличения
+      const rest = () => {
+        if (VZ.zoomedOnce) return;
+        loadStep(ph, tok, full, '')
+          .then(() => (isDesktop() && !VZ.zoomedOnce && tok === V.token && canOriginal(ph) ? (VZ.want = 'o', loadStep(ph, tok, 'o', '')) : null))
+          .then(() => { if (tok === V.token && !VZ.zoomedOnce) prefetchNear(i, tok); });
+      };
       if (liveVid) playLive(liveVid, tok, rest); else rest();
     });
   }
@@ -792,7 +845,6 @@ function loadStep(ph, tok, kind, extra) {
 }
 
 // соседние фото: по одному и с низким приоритетом — открытое фото важнее
-const prefetched = new Set();         // быстрые превью, которые уже лежат в кэше браузера
 async function prefetchNear(i, tok) {
   const ctl = V.ctl = new AbortController();
   const full = previewKind();
@@ -1051,6 +1103,7 @@ function closeViewer(silent) {
   const r = t && t.getBoundingClientRect();
   if (!r || r.bottom < 0 || r.top > window.innerHeight) { scrollToIndex(V.i, window.innerHeight / 3); draw(true); }
   loadVisible(true);      // догружаем эскизы, отменённые при открытии
+  gridPrefetchSoon();
   if (layoutW() !== lastW) { lastW = layoutW(); initZoom(); relayout(true); }   // повернули телефон в просмотре
 }
 
@@ -1113,13 +1166,19 @@ function stagePoint(cx, cy) { const b = stage.getBoundingClientRect(); return [c
 // Начали увеличивать: недогруженные картинки (версии фото, соседи) обрываем — браузер
 // закрывает соединения, сервер снимает их запросы из очереди — и сразу грузим оригинал (ролик живого фото не трогаем).
 // Если браузер не покажет оригинал (HEIC и т.п.) или он больше 25 МБ — версию 2048.
+// компьютер: мышь/тачпад с наведением (на телефоне и планшете — нет)
+const isDesktop = () => matchMedia('(hover: hover) and (pointer: fine)').matches;
+// оригинал, который браузер покажет сам (не HEIC и т.п.) и не больше 25 МБ
+function canOriginal(ph) {
+  const ext = ph[2].slice(ph[2].lastIndexOf('.')).toLowerCase();
+  return ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext) && ph[5] < 25 * 1024;
+}
 function goOriginal() {
   const ph = st.list[V.i];
   if (!ph || VZ.zoomedOnce || (ph[6] & F_VIDEO)) return;
   VZ.zoomedOnce = true;
-  const ext = ph[2].slice(ph[2].lastIndexOf('.')).toLowerCase();
-  const browserCan = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext);
-  const want = browserCan && ph[5] < 25 * 1024 ? 'o' : 'p';
+  const want = canOriginal(ph) ? 'o' : 'p';
+  if (VZ.want === want) return;                  // уже грузится (на компьютере оригинал идёт сразу)
   cancelLoads(); setLabel();
   if (RANK[want] > VZ.shown) { VZ.want = want; loadStep(ph, V.token, want, ''); }
 }
