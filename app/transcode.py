@@ -18,7 +18,8 @@ log = logging.getLogger("photocloud.transcode")
 SEG = 4.0                          # длина куска, с
 # качество: «экономия» — под медленный канал, «обычное» — без заметной потери
 PROFILES = {
-    "eco": {"h": 720, "crf": "26", "maxrate": "1800k", "bufsize": "3600k", "ab": "96k"},
+    # 720p ~1 Мбит/с: идёт без пауз даже на 2 Мбит/с мобильного интернета
+    "eco": {"h": 720, "crf": "28", "maxrate": "1000k", "bufsize": "2000k", "ab": "64k"},
     "hq": {"h": 1080, "crf": "21", "maxrate": "8M", "bufsize": "16M", "ab": "160k"},
 }
 _FPS_RE = re.compile(rb"Video:.*?(\d+(?:\.\d+)?) fps")
