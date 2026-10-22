@@ -12,6 +12,9 @@ name: Publish Docker image
 on:
   release:
     types: [published]
+  # сборка и по пушу тега (например 1.0.8) — без создания релиза в интерфейсе
+  push:
+    tags: ['*']
 
 jobs:
   push_to_registry:
