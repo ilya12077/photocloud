@@ -159,7 +159,7 @@ def finish(im, box: int, quality: int, fmt: str, tm: dict | None, t_decoded: flo
         return out.getvalue()
 
     data = encode(quality)
-    if box > 1000:
+    if box >= 960:
         # Превью на весь экран: зернистые сканы плёнки, шумные ночные снимки при том же
         # качестве весят в 5–10 раз больше обычных (до 1 МБ на 2048 px) — на медленном
         # канале это секунды. Если вышло больше ~1 бита на пиксель, пережимаем сильнее:
@@ -181,6 +181,12 @@ def finish(im, box: int, quality: int, fmt: str, tm: dict | None, t_decoded: flo
 def render(data: bytes, box: int, quality: int, fmt: str = "webp", tm: dict | None = None) -> bytes:
     """WebP/JPEG с длинной стороной <= box, с учётом EXIF-поворота, без метаданных.
     tm — словарь, куда пишутся длительности этапов (мс) для диагностики."""
+    im = decode(data, box, tm)
+    return finish(im, box, quality, fmt, tm, time.perf_counter())
+
+
+def decode(data: bytes, box: int, tm: dict | None = None):
+    """Декод (с EXIF-поворотом) не меньше чем до box по длинной стороне."""
     t0 = time.perf_counter()
     with Image.open(io.BytesIO(data)) as im:
         if getattr(im, "n_frames", 1) > 1:
@@ -193,7 +199,6 @@ def render(data: bytes, box: int, quality: int, fmt: str = "webp", tm: dict | No
         im.draft("RGB", req)
         im = ImageOps.exif_transpose(im)
         im.load()
-        t1 = time.perf_counter()
         if tm is not None:
-            tm["decode"] = tm.get("decode", 0) + (t1 - t0) * 1000
-        return finish(im, box, quality, fmt, tm, t1)
+            tm["decode"] = tm.get("decode", 0) + (time.perf_counter() - t0) * 1000
+        return im

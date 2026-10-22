@@ -33,11 +33,11 @@ from . import logs
 from .db import DB
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
 from .ha import HomeAssistant, clean
-from .images import HEAD_BYTES, LRUBytes, TooLarge, embedded_heic, embedded_jpeg, finish, read_limited, render
+from .images import HEAD_BYTES, LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_limited, render
 from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
 from .library import Library
-from .sched import PRIO_GRID, PRIO_VIEWER, Gone, Scheduler
+from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
 from .storage import make_storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -679,6 +679,38 @@ def _produce(p, box: int, quality: int, tm: dict | None = None) -> bytes:
     return render(data, box, quality, S.image_format, tm)
 
 
+def _produce_pair(p, box_q: int, qual_q: int, box_full: int, tm: dict):
+    """Быстрая версия для просмотрщика + декодированная картинка для полной версии.
+    Файл читается и декодируется ОДИН раз (это и есть основная работа), а полная
+    версия потом только пережимается — без второго похода на ПК."""
+    limit = S.max_decode_mb * 1024 * 1024
+    t = time.perf_counter()
+    try:
+        with storage.open(p.rel) as f:
+            data = read_limited(f, limit)
+    except TooLarge:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise ConnectionError(type(e).__name__) from e
+    tm["read"] = (time.perf_counter() - t) * 1000
+    im = decode(data, max(box_q, box_full), tm)
+    quick = finish(im.copy(), box_q, qual_q, S.image_format, tm, time.perf_counter())
+    return quick, im
+
+
+async def _finish_companion(ckey, cfut, im, box: int, quality: int) -> None:
+    try:
+        data = await on_pc(finish, im, box, quality, S.image_format, None, time.perf_counter(), timeout=60)
+        preview_cache.put(ckey, data)
+        cfut.set_result(data)
+    except Exception:  # noqa: BLE001 — ждущие сделают сами
+        if not cfut.done():
+            cfut.set_exception(ClientGone())
+    finally:
+        if inflight.get(ckey) is cfut:
+            del inflight[ckey]
+
+
 def _fmt_class(p) -> str:
     if p.video:
         return "видео"
@@ -721,9 +753,19 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     p = library.get(pid)
     if p is None:
         raise HTTPException(404)
-    box = {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size,
+    box = {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size, "q": S.preview_quick_size,
            "e": S.preview_eco_size, "p": S.preview_size}[kind]
     cache, q = (thumb_cache, S.thumb_quality) if kind in "stm" else (preview_cache, S.preview_quality)
+    if kind == "q":
+        q = S.preview_quick_quality
+    # приоритет: быстрая версия открытого фото > полная > соседние (заголовок X-PF) > сетка
+    prefetch = request.headers.get("x-pf") == "1"
+    prio = PRIO_GRID if kind in "stm" else PRIO_QUICK if kind == "q" else PRIO_VIEWER
+    if prefetch and prio != PRIO_GRID:
+        prio = PRIO_PREFETCH
+    # к быстрой версии сразу готовим полную (n=e|p): тот же декод, только пережать
+    nk = request.query_params.get("n")
+    ckey = (nk, pid, p.mtime, p.size) if kind == "q" and nk in ("e", "p") and not p.video else None
     key = (kind, pid, p.mtime, p.size)
     if time.time() - failed.get(key, 0) < FAILED_TTL:
         raise HTTPException(415)
@@ -755,7 +797,7 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                 try:
                     # просмотрщик — вне очереди; в сетке — сначала самые свежие запросы
                     lane = sched_video if p.video else sched
-                    await lane.acquire(PRIO_GRID if kind in "stm" else PRIO_VIEWER, request)
+                    await lane.acquire(prio, request)
                 except Gone:
                     raise ClientGone from None
                 if not await PC.is_up():
@@ -765,7 +807,22 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                 try:
                     tm = {"queue": (time.perf_counter() - tq) * 1000}
                     t0 = time.perf_counter()
-                    data = await on_pc(_produce, p, box, q, tm, timeout=240 if p.video else 60)
+                    pair = ckey is not None and preview_cache.get(ckey) is None and ckey not in inflight
+                    if pair:
+                        cfut = loop.create_future()
+                        cfut.add_done_callback(lambda f: f.cancelled() or f.exception())
+                        inflight[ckey] = cfut
+                        try:
+                            nbox = S.preview_eco_size if nk == "e" else S.preview_size
+                            data, im = await on_pc(_produce_pair, p, box, q, nbox, tm, timeout=60)
+                        except BaseException:
+                            cfut.set_exception(ClientGone())
+                            if inflight.get(ckey) is cfut:
+                                del inflight[ckey]
+                            raise
+                        bg(_finish_companion(ckey, cfut, im, nbox, S.preview_quality))
+                    else:
+                        data = await on_pc(_produce, p, box, q, tm, timeout=240 if p.video else 60)
                     tm["total"] = (time.perf_counter() - t0) * 1000
                 finally:
                     lane.release()
@@ -873,9 +930,9 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), _: Ses
 
 
 @app.get("/img/{kind}/{pid}")
-async def image(request: Request, kind: str = PathParam(pattern=r"^[stmep]$"),
+async def image(request: Request, kind: str = PathParam(pattern=r"^[stmqep]$"),
                 pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
-    """s/t/m — эскизы 240/400/900, e/p — превью 1280/2048 (размеры настраиваются)."""
+    """s/t/m — эскизы 240/400/900, q — быстрое превью 960 (сильно сжатое), e/p — превью 1280/2048."""
     return await rendered(request, kind, pid)
 
 
