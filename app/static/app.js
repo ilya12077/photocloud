@@ -675,6 +675,15 @@ async function playVideo(ph, tok, startAt) {
   if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
   if (orig) { v.src = origUrl(ph, false); return; }
   const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // без сжатия — галочка «Оригинал»
+  // страховка: если сжатый поток за 20 с так и не дал первый кадр — открываем оригинал
+  let ok = false;
+  v.addEventListener('loadeddata', () => { ok = true; }, { once: true });
+  setTimeout(() => {
+    if (ok || tok !== V.token || v.hidden) return;
+    console.warn('photocloud: сжатое видео не запустилось — открываю оригинал');
+    if (V.hls) { V.hls.destroy(); V.hls = null; }
+    v.src = origUrl(ph, false);
+  }, 20000);
   if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = url; return; }
   try {
     const Hls = await loadHls();
@@ -871,14 +880,20 @@ function playLive(vid, tok, after) {
     hi.src = liveUrl(vid, 'hq'); hi.load();
   }
 }
-// касание фото: включает звук (если браузер не дал) и переигрывает ролик
-$('v-stage').addEventListener('pointerup', () => {
-  const c = V.clip; if (!c || $('v-livewrap').hidden || VZ.s > 1) return;
+// касание живого фото (без сдвига и без увеличения) — проиграть ролик заново, со звуком
+let tapAt = null;
+$('v-stage').addEventListener('pointerdown', (e) => { tapAt = [e.clientX, e.clientY]; });
+$('v-stage').addEventListener('pointerup', (e) => {
+  if (!tapAt || Math.hypot(e.clientX - tapAt[0], e.clientY - tapAt[1]) > 10) return;
+  tapAt = null;
+  const ph = st.list[V.i], vid = ph && (ph[6] & F_LIVE) && st.lib.live[ph[0]];
+  if (!vid || $('v-livewrap').hidden || VZ.s > 1.02 || $('viewer').hidden) return;
+  const c = V.clip;
+  if (!c || !c.el.getAttribute('src')) { playLive(vid, V.token); return; }
   const lv = c.el;
-  if (lv.muted && lv.getAttribute('src')) {
-    lv.muted = false; lv.currentTime = 0;
-    lv.play().then(() => { lv.classList.add('on'); setLabel(); }).catch(() => { lv.muted = true; });
-  }
+  lv.muted = false; lv.currentTime = 0;
+  lv.play().catch(() => { lv.muted = true; return lv.play(); })
+    .then(() => { lv.classList.add('on'); setLabel(); }).catch(() => {});
 });
 $('v-livechk').addEventListener('change', (e) => {
   store('pc.live', e.target.checked ? '1' : '0');

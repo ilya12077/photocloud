@@ -152,8 +152,8 @@ class Settings:
     thumb_size: int = 400
     thumb_large_size: int = 900
     thumb_quality: int = 60
-    preview_quick_size: int = 960
-    preview_quick_quality: int = 40
+    preview_quick_size: int = 800
+    preview_quick_quality: int = 35
     preview_eco_size: int = 1280
     preview_size: int = 2048
     preview_quality: int = 75
@@ -271,8 +271,8 @@ def load() -> Settings:
     s.thumb_size = _int("THUMB_SIZE", 400, 64, 1024)
     s.thumb_large_size = _int("THUMB_LARGE_SIZE", 900, 256, 2048)
     s.thumb_quality = _int("THUMB_QUALITY", 60, 30, 95)
-    s.preview_quick_size = _int("PREVIEW_QUICK_SIZE", 960, 320, 2048)
-    s.preview_quick_quality = _int("PREVIEW_QUICK_QUALITY", 40, 20, 90)
+    s.preview_quick_size = _int("PREVIEW_QUICK_SIZE", 800, 320, 2048)
+    s.preview_quick_quality = _int("PREVIEW_QUICK_QUALITY", 35, 20, 90)
     s.preview_eco_size = _int("PREVIEW_ECO_SIZE", 1280, 512, 4096)
     s.preview_size = _int("PREVIEW_SIZE", 2048, 512, 8192)
     s.preview_quality = _int("PREVIEW_QUALITY", 75, 30, 95)

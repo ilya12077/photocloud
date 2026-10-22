@@ -679,10 +679,10 @@ def _produce(p, box: int, quality: int, tm: dict | None = None) -> bytes:
     return render(data, box, quality, S.image_format, tm)
 
 
-def _produce_pair(p, box_q: int, qual_q: int, box_full: int, tm: dict):
-    """Быстрая версия для просмотрщика + декодированная картинка для полной версии.
-    Файл читается и декодируется ОДИН раз (это и есть основная работа), а полная
-    версия потом только пережимается — без второго похода на ПК."""
+def _produce_pair(p, box_q: int, qual_q: int, tm: dict):
+    """Быстрая версия для просмотрщика + байты файла для полной версии.
+    Файл с ПК читается ОДИН раз. Быстрая версия декодируется сразу в малом масштабе
+    (JPEG draft — в разы быстрее), полная потом декодируется из тех же байтов в фоне."""
     limit = S.max_decode_mb * 1024 * 1024
     t = time.perf_counter()
     try:
@@ -693,14 +693,13 @@ def _produce_pair(p, box_q: int, qual_q: int, box_full: int, tm: dict):
     except Exception as e:  # noqa: BLE001
         raise ConnectionError(type(e).__name__) from e
     tm["read"] = (time.perf_counter() - t) * 1000
-    im = decode(data, max(box_q, box_full), tm)
-    quick = finish(im.copy(), box_q, qual_q, S.image_format, tm, time.perf_counter())
-    return quick, im
+    quick = render(data, box_q, qual_q, S.image_format, tm)
+    return quick, data
 
 
-async def _finish_companion(ckey, cfut, im, box: int, quality: int) -> None:
+async def _finish_companion(ckey, cfut, raw, box: int, quality: int) -> None:
     try:
-        data = await on_pc(finish, im, box, quality, S.image_format, None, time.perf_counter(), timeout=60)
+        data = await on_pc(render, raw, box, quality, S.image_format, None, timeout=60)
         preview_cache.put(ckey, data)
         cfut.set_result(data)
     except Exception:  # noqa: BLE001 — ждущие сделают сами
@@ -814,13 +813,13 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
                         inflight[ckey] = cfut
                         try:
                             nbox = S.preview_eco_size if nk == "e" else S.preview_size
-                            data, im = await on_pc(_produce_pair, p, box, q, nbox, tm, timeout=60)
+                            data, raw = await on_pc(_produce_pair, p, box, q, tm, timeout=60)
                         except BaseException:
                             cfut.set_exception(ClientGone())
                             if inflight.get(ckey) is cfut:
                                 del inflight[ckey]
                             raise
-                        bg(_finish_companion(ckey, cfut, im, nbox, S.preview_quality))
+                        bg(_finish_companion(ckey, cfut, raw, nbox, S.preview_quality))
                     else:
                         data = await on_pc(_produce, p, box, q, tm, timeout=240 if p.video else 60)
                     tm["total"] = (time.perf_counter() - t0) * 1000
