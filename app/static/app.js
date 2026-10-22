@@ -772,6 +772,7 @@ function loadStep(ph, tok, kind, extra) {
         const hi = $('v-img');
         hi.src = url; hi.classList.add('ok'); VZ.shown = RANK[kind];
         setLabel();
+        if (kind === 'o') preloadOrigClip(ph, tok);
         $('v-spin').hidden = true;
         setTimeout(() => { if (tok === V.token) $('v-low').style.visibility = 'hidden'; }, 200);
       }
@@ -806,7 +807,7 @@ async function prefetchNear(i, tok) {
 function setLabel() {
   const ph = st.list[V.i]; if (!ph) return;
   let pre = '';
-  if (V.clip && V.clip.el.classList.contains('on')) pre = V.clip.q === 'eco' ? 'Превью • ' : '';
+  if (V.clip && V.clip.el.classList.contains('on')) pre = V.clip.q === 'eco' ? 'Превью • ' : V.clip.q === 'orig' ? 'Без сжатия • ' : '';
   else if (VZ.shown === RANK.q) pre = 'Превью • ';
   else if (VZ.shown === RANK.o) pre = 'Без сжатия • ';
   $('v-name').textContent = pre + ph[2];
@@ -877,21 +878,52 @@ function playLive(vid, tok, after) {
     hi.src = liveUrl(vid, 'hq'); hi.load();
   }
 }
-// касание живого фото (без сдвига и без увеличения) — проиграть ролик заново, со звуком
-let tapAt = null;
+// Оригинал ролика (без пережатия) — грузим сразу, как только показан оригинал фото.
+// Если браузер его не сыграет (HEVC в .mov на части телефонов) — берём хороший пережатый.
+function preloadOrigClip(ph, tok) {
+  const vid = (ph[6] & F_LIVE) && st.lib.live[ph[0]];
+  if (!vid || tok !== V.token) return;
+  stopLive();
+  const el2 = liveEls[1];
+  el2.preload = 'auto';
+  el2.onended = () => { el2.classList.remove('on'); setLabel(); };
+  el2.oncanplaythrough = () => { el2.oncanplaythrough = null; if (tok === V.token) V.clip = { el: el2, q: 'orig' }; };
+  el2.onerror = () => {
+    if (tok !== V.token || el2.dataset.fallback) return;
+    el2.dataset.fallback = '1';
+    el2.src = liveUrl(vid, 'hq'); el2.load();
+    el2.oncanplaythrough = () => { el2.oncanplaythrough = null; if (tok === V.token) V.clip = { el: el2, q: 'hq' }; };
+  };
+  delete el2.dataset.fallback;
+  el2.src = `/img/o/${encodeURIComponent(vid)}`; el2.load();
+}
+
+// Касание живого фото (без сдвига; и в увеличении тоже) — проиграть ролик заново, со звуком.
+// Ждём чуть-чуть: если это первый тап двойного (масштаб), ролик не запускаем.
+let tapAt = null, tapT = 0;
 $('v-stage').addEventListener('pointerdown', (e) => { tapAt = [e.clientX, e.clientY]; });
 $('v-stage').addEventListener('pointerup', (e) => {
   if (!tapAt || Math.hypot(e.clientX - tapAt[0], e.clientY - tapAt[1]) > 10) return;
   tapAt = null;
-  const ph = st.list[V.i], vid = ph && (ph[6] & F_LIVE) && st.lib.live[ph[0]];
-  if (!vid || $('v-livewrap').hidden || VZ.s > 1.02 || $('viewer').hidden) return;
-  const c = V.clip;
-  if (!c || !c.el.getAttribute('src')) { playLive(vid, V.token); return; }
-  const lv = c.el;
-  lv.muted = false; lv.currentTime = 0;
-  lv.play().catch(() => { lv.muted = true; return lv.play(); })
-    .then(() => { lv.classList.add('on'); setLabel(); }).catch(() => {});
+  if (tapT) { clearTimeout(tapT); tapT = 0; return; }          // второй тап — это двойной тап
+  tapT = setTimeout(() => { tapT = 0; replayLive(); }, 300);
 });
+function replayLive() {
+  const ph = st.list[V.i], vid = ph && (ph[6] & F_LIVE) && st.lib.live[ph[0]];
+  if (!vid || $('v-livewrap').hidden || $('viewer').hidden || DR.busy) return;
+  const c = V.clip;
+  if (!c || !c.el.getAttribute('src')) {
+    if (VZ.shown === RANK.o) preloadOrigClip(ph, V.token); else playLive(vid, V.token);
+    if (VZ.shown !== RANK.o) return;
+  }
+  const lv = (V.clip && V.clip.el) || liveEls[1];
+  const go = () => {
+    lv.muted = false; lv.currentTime = 0;
+    lv.play().catch(() => { lv.muted = true; return lv.play(); })
+      .then(() => { lv.classList.add('on'); setLabel(); }).catch(() => {});
+  };
+  if (lv.readyState >= 3) go(); else lv.addEventListener('canplay', go, { once: true });
+}
 $('v-livechk').addEventListener('change', (e) => {
   store('pc.live', e.target.checked ? '1' : '0');
   const ph = st.list[V.i]; const vid = ph && st.lib.live[ph[0]];
