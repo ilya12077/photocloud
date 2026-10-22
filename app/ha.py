@@ -55,7 +55,7 @@ class HomeAssistant:
 
     async def notify_service(self) -> str:
         """Сервис уведомлений. В настройке может быть либо сам сервис (notify.mobile_app_x),
-        либо сущность HA (input_text.notify_ilya), в состоянии которой лежит имя сервиса.
+        либо сущность HA (например input_text.notify_target), в состоянии которой лежит имя сервиса.
         Из сущности принимаем только notify.* — значение из HA не может заставить
         приложение вызвать что-то другое (замок, сигнализацию)."""
         cfg = self.s.ha_notify_service
