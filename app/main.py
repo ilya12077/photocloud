@@ -188,6 +188,7 @@ class Guard:
 async def lifespan(_app):
     global loop
     loop = asyncio.get_running_loop()
+    bg(_indexer())
     if FFMPEG:
         log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
     else:
@@ -555,6 +556,20 @@ loop: asyncio.AbstractEventLoop
 def _index_error(err: str) -> None:
     loop.call_soon_threadsafe(bg, ha.notify("index_error", f"Ошибка индексации фото: {clean(err)}", dedupe_s=3600))
 
+
+
+async def _indexer() -> None:
+    """Список файлов обновляется в фоне — сразу после запуска и потом по INDEX_TTL,
+    а не когда кто-то откроет сайт. Если ПК выключен — ждём, пока появится."""
+    await asyncio.sleep(1)
+    while True:
+        try:
+            if await PC.is_up() and (PC.revived or library.stale(S.index_ttl)):
+                if library.start_build(storage, _index_error):
+                    PC.revived = False
+        except Exception:  # noqa: BLE001
+            log.exception("фоновая индексация")
+        await asyncio.sleep(15)
 
 
 @app.get("/api/status")
