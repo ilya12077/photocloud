@@ -1019,6 +1019,12 @@ async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
     return Response(data, media_type="video/mp2t", headers={"cache-control": "private, max-age=3600"})
 
 
+@app.post("/vid/{pid}/stop", dependencies=[Depends(require_csrf)])
+async def vid_stop(pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
+    """Вышли из видео или живого фото: перекодирование этого файла больше не нужно."""
+    return no_store(JSONResponse({"stopped": transcoder.stop(pid)}))
+
+
 @app.get("/vid/{pid}/live.mp4")
 async def vid_live(request: Request, pid: str = PathParam(pattern=ID_RE), q: str = "hq",
                    _: Session = Depends(require_user)):

@@ -141,6 +141,7 @@ class Transcoder:
         self.inflight: dict[tuple, asyncio.Task] = {}
 
     async def get(self, key: tuple, produce) -> bytes:
+        """key[0] — id файла: по нему stop() останавливает всю работу над этим файлом."""
         data = self.cache.get(key)
         if data is not None:
             return data
@@ -151,13 +152,32 @@ class Transcoder:
                     hit = self.cache.get(key)
                     if hit is not None:
                         return hit
-                    out = await asyncio.to_thread(produce)
+                    from .video import tagged
+                    out = await asyncio.to_thread(tagged, key[0], produce)
                     self.cache.put(key, out)
                     return out
             task = asyncio.create_task(run())
             self.inflight[key] = task
             task.add_done_callback(lambda _t, k=key: self.inflight.pop(k, None))
-        return await asyncio.shield(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            me = asyncio.current_task()
+            if task.cancelled() and not (me and me.cancelling()):
+                from .video import Stopped
+                raise Stopped() from None       # работу остановили через stop(), а не нас
+            raise
+
+    def stop(self, pid: str) -> int:
+        """Вышли из видео / живого фото: снимаем из очереди и убиваем ffmpeg этого файла,
+        чтобы процессор и чтение с ПК сразу достались эскизам."""
+        n = 0
+        for key, task in list(self.inflight.items()):
+            if key[0] == pid:
+                task.cancel()
+                n += 1
+        from .video import stop
+        return n + stop(pid)
 
     def prefetch(self, key: tuple, produce) -> None:
         if self.cache.get(key) is None and key not in self.inflight:
