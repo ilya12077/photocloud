@@ -718,9 +718,9 @@ def _produce_pair(p, box_q: int, qual_q: int, tm: dict):
     return quick, data
 
 
-# Полные 2048 «впрок» делаются по одному и только для последнего открытого фото: если
+# Полные превью (1600) «впрок» делаются по одному и только для последнего открытого фото: если
 # быстро листать (или сразу увеличивать — тогда нужен оригинал), старые заготовки
-# пропускаются, а не копятся очередью на процессоре. Кому 2048 всё же понадобится —
+# пропускаются, а не копятся очередью на процессоре. Кому полное всё же понадобится —
 # запросит, и оно сделается обычным порядком.
 _companion_mu = asyncio.Semaphore(1)
 _companion_seq = 0
@@ -799,9 +799,9 @@ async def rendered(request: Request, kind: str, pid: str) -> Response:
     prio = PRIO_GRID if kind in "stm" else PRIO_QUICK if kind == "q" else PRIO_VIEWER
     if prefetch and prio != PRIO_GRID:
         prio = PRIO_PREFETCH
-    # к быстрой версии сразу готовим полную 2048 (n=p): тот же файл, второй раз с ПК не читаем
+    # к быстрой версии сразу готовим полную 1600 (n=p): тот же файл, второй раз с ПК не читаем
     nk = request.query_params.get("n")
-    # для плиток сетки — только быстрое превью: 2048 «на всякий случай» для каждой плитки
+    # для плиток сетки — только быстрое превью: полное «на всякий случай» для каждой плитки
     # заняло бы процессор и задержало эскизы
     ckey = (nk, pid, p.mtime, p.size) if kind == "q" and nk == "p" and not p.video and pf != "grid" else None
     key = (kind, pid, p.mtime, p.size)
@@ -970,7 +970,7 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), _: Ses
 @app.get("/img/{kind}/{pid}")
 async def image(request: Request, kind: str = PathParam(pattern=r"^[stmqp]$"),
                 pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
-    """s/t/m — эскизы 240/400/900, q — быстрое превью 720 (сильно сжатое), p — превью 2048."""
+    """s/t/m — эскизы 240/400/900, q — быстрое превью 720 (сильно сжатое), p — превью 1600 (размеры настраиваются)."""
     return await rendered(request, kind, pid)
 
 
