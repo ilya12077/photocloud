@@ -18,6 +18,12 @@ RUN grep -v '^imageio-ffmpeg' requirements.txt > /tmp/req.txt \
 
 COPY app ./app
 
+# версия сборки (из файла VERSION, передаётся GitHub Actions) — видна в «Обзоре» админки,
+# в логе при старте и в метке образа org.opencontainers.image.version
+ARG VERSION=dev
+ENV PHOTOCLOUD_VERSION=$VERSION
+LABEL org.opencontainers.image.version=$VERSION
+
 # непривилегированный пользователь; писать можно только в /data
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin photocloud \
  && mkdir -p /data && chown photocloud:photocloud /data

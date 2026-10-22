@@ -91,6 +91,7 @@ async function loadOverview() {
   const o = await act(() => api('/api/admin/overview')); if (!o) return;
   const ix = o.index;
   const cards = [
+    ['Версия', o.version || '—'],
     ['Компьютер', { up: 'включён', down: 'выключен', waking: 'просыпается' }[o.pc] || o.pc],
     ['Файлов', `${ix.files.toLocaleString('ru')} (видео ${ix.videos.toLocaleString('ru')})`],
     ['Дата из метаданных', ix.files ? `${ix.with_date.toLocaleString('ru')} (${Math.round(ix.with_date / ix.files * 100)}%)` : '—'],
