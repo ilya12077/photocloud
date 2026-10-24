@@ -194,10 +194,18 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
   padding: 10px 16px; border-radius: 10px; font-size: 14px; margin: 0; box-shadow: 0 4px 16px #0004; }
 .toast.bad { background: var(--err); color: #fff; }
 @media (max-width: 640px) {
+  /* таблицы — карточками: каждая строка «подпись — значение», подписи берутся из шапки */
   table.list thead { display: none; }
-  table.list tr { display: grid; grid-template-columns: 1fr auto; padding: 6px 0; border-bottom: 1px solid var(--line); }
-  table.list td { border: 0; padding: 4px 12px; }
+  table.list tr { display: block; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  table.list tr:last-child { border-bottom: 0; }
+  table.list td { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; border: 0; padding: 5px 12px; min-height: 0; }
+  table.list td[data-label]::before { content: attr(data-label); flex: 0 0 96px; color: var(--dim); font-size: 12px; }
+  table.list td:first-child { font-weight: 600; font-size: 15px; }
+  table.list td:first-child::before { font-weight: 400; }
+  table.list td:empty { display: none; }
   .ops { justify-content: flex-start; }
+  table.list tr.fold-edit td { display: block; }
+  .fold-list { columns: 1; }
 }
 
 .v-origchk { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 10px; border-radius: 9px;
@@ -220,5 +228,8 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .fold-edit td { background: var(--surface, #0001); }
 .fold-edit label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 .fold-edit .fold-all { font-weight: 600; margin: 6px 0; }
-.fold-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0 12px; margin: 4px 0 10px; }
+.fold-list { columns: 240px; column-gap: 16px; margin: 4px 0 10px; }   /* сверху вниз: подпапки идут под своей папкой */
+.fold-list label { break-inside: avoid; }
 .fold-list label.sub { padding-left: 18px; opacity: .85; }
+.fold-btns { display: flex; gap: 8px; margin-top: 4px; }
+.wake-chk { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }

@@ -40,6 +40,19 @@ function toast(msg, bad) {
 async function act(fn, okMsg) {
   try { const r = await fn(); if (okMsg) toast(okMsg); return r; } catch (e) { toast(e.message, true); return null; }
 }
+// подписи ячеек для телефона: там таблица показывается карточками «подпись — значение»
+function labelize(tbody) {
+  const head = tbody.closest('table').tHead;
+  if (!head) return;
+  const names = [...head.rows[0].cells].map((th) => th.textContent.trim());
+  for (const tr of tbody.rows) {
+    if (tr.classList.contains('fold-edit')) continue;
+    [...tr.cells].forEach((td, i) => { if (names[i]) td.dataset.label = names[i]; });
+  }
+}
+for (const tb of document.querySelectorAll('table.list tbody')) {
+  new MutationObserver(() => labelize(tb)).observe(tb, { childList: true });
+}
 function btn(text, onClick, cls) { const b = el('button', 'btn small ' + (cls || ''), text); b.type = 'button'; b.onclick = onClick; return b; }
 
 // ================================================================== вход / первичная настройка
@@ -164,10 +177,12 @@ async function loadUsers() {
     const wk = el('td');
     if (u.role === 'admin') wk.append(el('span', 'dim2', 'да (админ)'));
     else {
-      const c = el('input'); c.type = 'checkbox'; c.checked = u.wake !== false;
+      const lab = el('label', 'wake-chk'), c = el('input'), txt = el('span');
+      c.type = 'checkbox'; c.checked = u.wake !== false;
+      const show = () => { txt.textContent = c.checked ? 'может' : 'нельзя'; };
       c.onchange = () => act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/wake`, { allow: c.checked }),
-        c.checked ? 'Может включать ПК' : 'Не может включать ПК').then((x) => { if (!x) c.checked = !c.checked; });
-      wk.append(c);
+        c.checked ? 'Может включать ПК' : 'Не может включать ПК').then((x) => { if (!x) c.checked = !c.checked; show(); });
+      show(); lab.append(c, txt); wk.append(lab);
     }
     tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, el('td', null, dt(u.created)), ops);
     return tr;
@@ -207,7 +222,8 @@ async function editFolders(u, tr) {
     if (ok) loadUsers();
   });
   td.append(el('div', 'dim2', 'Пользователь видит только отмеченные папки вместе со всеми их подпапками. Файлы прямо в корне — только при «все папки».'),
-    all, box, save, btn('отмена', () => row.remove()));
+    all, box);
+  const bar = el('div', 'fold-btns'); bar.append(save, btn('отмена', () => row.remove())); td.append(bar);
   tr.after(row);
 }
 
