@@ -31,6 +31,26 @@ class UserError(ValueError):
     pass
 
 
+def norm_folder(f: str) -> str:
+    """Папка из настроек доступа -> «a/b». Только простые части пути: без «..», «.»,
+    обратных слэшей и пустых частей — чтобы правило нельзя было обойти."""
+    if not isinstance(f, str):
+        raise UserError("папка: строка")
+    parts = [x for x in f.strip().replace("\\", "/").split("/") if x != ""]
+    if not parts or len(f) > 500 or any(x in (".", "..") or "\x00" in x or "\\" in x for x in parts):
+        raise UserError(f"неверная папка: {f!r}")
+    return "/".join(parts)
+
+
+def norm_folders(fs) -> list[str] | None:
+    """None — все папки; иначе отсортированный список без повторов."""
+    if fs is None:
+        return None
+    if not isinstance(fs, list) or len(fs) > 200:
+        raise UserError("папки: список")
+    return sorted({norm_folder(f) for f in fs})
+
+
 class UserStore:
     """Пользователи в DATA_DIR/users.json: {"users": {name: {"hash", "role", "created"}}}.
     Пароли — только argon2id-хэши. Запись атомарная (tmp + replace)."""
@@ -45,8 +65,13 @@ class UserStore:
                 if USER_RE.match(name) and isinstance(rec, dict) and str(rec.get("hash", "")).startswith("$argon2") \
                         and rec.get("role") in ROLES:
                     g = rec.get("google")
+                    try:
+                        folders = norm_folders(rec.get("folders"))
+                    except UserError:
+                        folders = []        # испорченная запись — безопаснее ничего, чем всё
                     self._u[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
-                                     "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None}
+                                     "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
+                                     "folders": folders, "wake": rec.get("wake", True) is not False}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,8 +91,36 @@ class UserStore:
         return rec["role"] if rec else None
 
     def list(self) -> list[dict]:
-        return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google")}
+        return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
+                 "folders": r.get("folders"), "wake": r.get("wake", True)}
                 for n, r in sorted(self._u.items())]
+
+    def folders(self, name: str) -> tuple[str, ...] | None:
+        """Папки, которые видит пользователь: None — все; () — никакие (и нет такого пользователя)."""
+        rec = self._u.get(name)
+        if rec is None:
+            return ()
+        f = rec.get("folders")
+        return None if f is None else tuple(f)
+
+    def can_wake(self, name: str) -> bool:
+        rec = self._u.get(name)
+        return bool(rec) and (rec["role"] == "admin" or rec.get("wake", True) is not False)
+
+    def set_wake(self, name: str, allow: bool) -> None:
+        with self._mu:
+            if name not in self._u:
+                raise UserError("нет такого пользователя")
+            self._u[name]["wake"] = bool(allow)
+            self._save()
+
+    def set_folders(self, name: str, folders) -> None:
+        folders = norm_folders(folders)
+        with self._mu:
+            if name not in self._u:
+                raise UserError("нет такого пользователя")
+            self._u[name]["folders"] = folders
+            self._save()
 
     def by_google(self, email: str) -> tuple[str, str] | None:
         email = email.lower()
@@ -120,7 +173,7 @@ class UserStore:
         with self._mu:
             if name in self._u:
                 raise UserError("такой пользователь уже есть")
-            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None}
+            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "wake": True}
             self._save()
 
     def set_password(self, name: str, password: str) -> None:

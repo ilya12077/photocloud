@@ -13,7 +13,7 @@ const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
-  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', session_revoke: 'сессия закрыта',
+  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', session_revoke: 'сессия закрыта',
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
 };
 
@@ -153,9 +153,51 @@ async function loadUsers() {
       loadUsers();
     }, 'danger'));
     const tdRole = el('td'); tdRole.append(role);
-    tr.append(el('td', 'mono', u.user), tdRole, g, el('td', null, dt(u.created)), ops);
+    // папки: админ видит всё; пользователю — все или только выбранные (с подпапками)
+    const fd = el('td');
+    if (u.role === 'admin') fd.append(el('span', 'dim2', 'все (админ)'));
+    else {
+      fd.append(el('span', null, u.folders == null ? 'все' : (u.folders.length ? u.folders.join(', ') : 'никакие')), ' ',
+        btn('изменить', () => editFolders(u, tr)));
+    }
+    // может ли включать компьютер кнопкой «Запустить компьютер» (админ — всегда)
+    const wk = el('td');
+    if (u.role === 'admin') wk.append(el('span', 'dim2', 'да (админ)'));
+    else {
+      const c = el('input'); c.type = 'checkbox'; c.checked = u.wake !== false;
+      c.onchange = () => act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/wake`, { allow: c.checked }),
+        c.checked ? 'Может включать ПК' : 'Не может включать ПК').then((x) => { if (!x) c.checked = !c.checked; });
+      wk.append(c);
+    }
+    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, el('td', null, dt(u.created)), ops);
     return tr;
   }));
+}
+
+let folderList = null;
+async function editFolders(u, tr) {
+  if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
+  if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
+  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 7; row.append(td);
+  const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
+  allChk.checked = u.folders == null; all.append(allChk, ' все папки (и новые тоже)');
+  const box = el('div', 'fold-list');
+  const sel = new Set(u.folders || []);
+  const chks = folderList.map((f) => {
+    const l = el('label', f.includes('/') ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f; c.checked = sel.has(f);
+    l.append(c, ' ' + f); box.append(l); return c;
+  });
+  const sync = () => { box.hidden = allChk.checked; };
+  allChk.onchange = sync; sync();
+  const save = btn('сохранить', async () => {
+    const folders = allChk.checked ? null : chks.filter((c) => c.checked).map((c) => c.value);
+    if (folders && !folders.length && !confirm(`${u.user} не увидит ни одного фото. Сохранить?`)) return;
+    const ok = await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/folders`, { folders }), 'Доступ изменён');
+    if (ok) loadUsers();
+  });
+  td.append(el('div', 'dim2', 'Пользователь видит только отмеченные папки вместе со всеми их подпапками. Файлы прямо в корне — только при «все папки».'),
+    all, box, save, btn('отмена', () => row.remove()));
+  tr.after(row);
 }
 
 $('add-user').addEventListener('submit', async (e) => {

@@ -35,6 +35,42 @@ LIVE_VID = {".mp4", ".mov"}
 LIVE_MAX = 40 * 1024 * 1024     # ролик живого фото — пара секунд, обычно 2–10 МБ
 
 
+def folder_ok(rel: str, folders) -> bool:
+    """Путь файла (или папки) rel внутри разрешённых папок? folders=None — разрешено всё.
+    Сравнение по целым частям пути: «фотки» не открывает «фотки2»."""
+    if folders is None:
+        return True
+    return any(rel == f or rel.startswith(f + "/") for f in folders)
+
+
+class View:
+    """Список файлов для конкретного набора папок (админ — все)."""
+    __slots__ = ("payload", "gz", "version", "count")
+
+    def __init__(self, payload: bytes, gz: bytes, version: str, count: int):
+        self.payload, self.gz, self.version, self.count = payload, gz, version, count
+
+
+def _encode(photos: list, folder_list: list[str], fmap: dict[int, int] | None = None) -> View:
+    # колоночный формат: так gzip жмёт заметно лучше, чем массив строк
+    dates = [int(p.date) for p in photos]
+    cols = {
+        "id": "".join(p.id for p in photos),
+        "f": [p.folder if fmap is None else fmap[p.folder] for p in photos],
+        "n": [p.name for p in photos],
+        # даты по убыванию -> храним разницу с предыдущей (маленькие числа)
+        "d": [dates[0]] + [dates[i - 1] - dates[i] for i in range(1, len(dates))] if dates else [],
+        "m": [int(p.mtime) - d for p, d in zip(photos, dates)],     # чаще всего 0
+        "s": [(p.size + 1023) // 1024 for p in photos],              # КБ
+        "x": [p.flags() for p in photos],
+        "live": {p.id: p.live for p in photos if p.live},
+    }
+    body = json.dumps({"folders": folder_list, **cols}, ensure_ascii=False, separators=(",", ":"))
+    version = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
+    payload = ('{"v":"%s",' % version + body[1:]).encode("utf-8", "replace")
+    return View(payload, gzip.compress(payload, compresslevel=9), version, len(photos))
+
+
 def photo_id(rel: str, salt: int = 0) -> str:
     """8 символов [A-Za-z0-9_-] (48 бит) — короче список для медленных клиентов.
     Стабилен между пересборками, поэтому кэш эскизов в браузере не теряется."""
@@ -146,6 +182,9 @@ class Library:
         self.by_id: dict[str, Photo] = {}
         self.payload = b"{}"
         self.payload_gz = gzip.compress(b"{}")
+        self._feed: list = []
+        self._folders: list[str] = [""]
+        self._views: dict = {None: View(b"{}", gzip.compress(b"{}"), "", 0)}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -201,26 +240,34 @@ class Library:
         # ролики живых фото в ленту не попадают, но остаются доступны по id
         photos = [p for p in photos if not (p.video and p.live)]
         photos = sorted(photos, key=lambda p: (int(p.date), p.name), reverse=True)
-        # колоночный формат: так gzip жмёт заметно лучше, чем массив строк
-        dates = [int(p.date) for p in photos]
-        cols = {
-            "id": "".join(p.id for p in photos),
-            "f": [p.folder for p in photos],
-            "n": [p.name for p in photos],
-            # даты по убыванию -> храним разницу с предыдущей (маленькие числа)
-            "d": [dates[0]] + [dates[i - 1] - dates[i] for i in range(1, len(dates))] if dates else [],
-            "m": [int(p.mtime) - d for p, d in zip(photos, dates)],     # чаще всего 0
-            "s": [(p.size + 1023) // 1024 for p in photos],              # КБ
-            "x": [p.flags() for p in photos],
-            "live": {p.id: p.live for p in photos if p.live},
-        }
-        body = json.dumps({"folders": folder_list, **cols}, ensure_ascii=False, separators=(",", ":"))
-        version = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
-        payload = ('{"v":"%s",' % version + body[1:]).encode("utf-8", "replace")
-        gz = gzip.compress(payload, compresslevel=9)
+        full = _encode(photos, folder_list)
         # атомарная подмена: читатели видят либо старую, либо новую версию целиком
         self.by_id = {p.id: p for p in everything}
-        self.payload, self.payload_gz, self.version = payload, gz, version
+        self._feed, self._folders = photos, folder_list
+        self._views = {None: full}
+        self.payload, self.payload_gz, self.version = full.payload, full.gz, full.version
+
+    def view(self, folders) -> View:
+        """Список только из разрешённых папок (folders=None — всё). Папки-предки разрешённых
+        попадают в дерево только именами — чтобы до них можно было дойти; соседние — нет."""
+        views, feed, flist = self._views, self._feed, self._folders     # один снимок версии
+        if not self.version:
+            return views[None]                  # список ещё не собран — пусто для всех
+        key = None if folders is None else tuple(sorted(folders))
+        v = views.get(key)
+        if v is not None:
+            return v
+        need = {""}
+        for f in key:
+            parts = f.split("/")
+            need.update("/".join(parts[:i]) for i in range(1, len(parts)))
+        keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, key)]
+        fmap = {old: new for new, old in enumerate(keep)}
+        v = _encode([p for p in feed if folder_ok(p.rel, key)], [flist[i] for i in keep], fmap)
+        if len(views) > 64:
+            views.clear()
+        views[key] = v
+        return v
 
     # ------------------------------------------------------------ сборка
 
