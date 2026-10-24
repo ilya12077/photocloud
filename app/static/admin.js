@@ -187,10 +187,21 @@ async function editFolders(u, tr) {
     const l = el('label', f.includes('/') ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f; c.checked = sel.has(f);
     l.append(c, ' ' + f); box.append(l); return c;
   });
+  // отмеченная папка открывает и все вложенные — их галочки ставятся сами и блокируются
+  const inside = (c, p) => c.value.startsWith(p.value + '/');
+  const cascade = () => {
+    for (const c of chks) {
+      const parent = chks.some((p) => p !== c && p.checked && !p.disabled && inside(c, p));
+      if (parent) { c.checked = true; c.disabled = true; } else if (c.disabled) { c.disabled = false; c.checked = false; }
+    }
+  };
+  for (const c of chks) c.addEventListener('change', cascade);
+  cascade();
   const sync = () => { box.hidden = allChk.checked; };
   allChk.onchange = sync; sync();
   const save = btn('сохранить', async () => {
-    const folders = allChk.checked ? null : chks.filter((c) => c.checked).map((c) => c.value);
+    // сохраняем только верхние отмеченные папки: вложенные и так входят в них
+    const folders = allChk.checked ? null : chks.filter((c) => c.checked && !c.disabled).map((c) => c.value);
     if (folders && !folders.length && !confirm(`${u.user} не увидит ни одного фото. Сохранить?`)) return;
     const ok = await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/folders`, { folders }), 'Доступ изменён');
     if (ok) loadUsers();
