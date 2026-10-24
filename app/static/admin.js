@@ -145,7 +145,7 @@ async function loadUsers() {
     }));
     const ops = el('td', 'ops');
     ops.append(btn('пароль', async () => {
-      const p = prompt(`Новый пароль для ${u.user} (от 12 символов). Все его сессии будут закрыты.`);
+      const p = prompt(`Новый пароль для ${u.user} (от 8 символов). Все его сессии будут закрыты.`);
       if (p) act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/password`, { p }), 'Пароль изменён');
     }), btn('удалить', async () => {
       if (!confirm(`Удалить пользователя ${u.user}? Его сессии будут закрыты.`)) return;

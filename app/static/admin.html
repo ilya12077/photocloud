@@ -17,8 +17,8 @@
     <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name">Первый запуск</span></div>
     <p class="dim2">Создай администратора. Ссылка из консоли сервера одноразовая.</p>
     <label>Логин<input id="su" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="32" required></label>
-    <label>Пароль (от 12 символов)<input id="sp" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label>
-    <label>Ещё раз<input id="sp2" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label>
+    <label>Пароль (от 8 символов)<input id="sp" type="password" autocomplete="new-password" minlength="8" maxlength="256" required></label>
+    <label>Ещё раз<input id="sp2" type="password" autocomplete="new-password" minlength="8" maxlength="256" required></label>
     <button type="submit">Создать</button>
     <p id="serr" class="err" role="alert"></p>
   </form>
@@ -66,7 +66,7 @@
       <h3>Новый пользователь</h3>
       <form id="add-user" class="inline">
         <input id="nu" placeholder="логин" autocapitalize="off" spellcheck="false" maxlength="32" required>
-        <input id="np" type="password" placeholder="пароль, от 12 символов" autocomplete="new-password" minlength="12" maxlength="256" required>
+        <input id="np" type="password" placeholder="пароль, от 8 символов" autocomplete="new-password" minlength="8" maxlength="256" required>
         <select id="nr"><option value="user">пользователь</option><option value="admin">администратор</option></select>
         <button class="btn primary">Добавить</button>
       </form>

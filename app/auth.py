@@ -24,7 +24,7 @@ _DUMMY_HASH = _ph.hash(secrets.token_urlsafe(16))
 USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 ROLES = ("admin", "user")
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$")
-MIN_PASSWORD = 12
+MIN_PASSWORD = 8
 
 
 class UserError(ValueError):
