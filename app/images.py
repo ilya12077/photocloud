@@ -164,7 +164,7 @@ def finish(im, box: int, quality: int, fmt: str, tm: dict | None, t_decoded: flo
         # качестве весят в 5–10 раз больше обычных (до 1 МБ на 2048 px) — на медленном
         # канале это секунды. Если вышло больше ~0.5 бита на пиксель, пережимаем сильнее:
         # на шуме разница на глаз не видна, а размер падает в разы.
-        budget = im.width * im.height // 16            # ≈ 0.5 бита на пиксель: 1600×1200 -> ~120 КБ
+        budget = im.width * im.height // 16            # ≈ 0.5 бита на пиксель: 2048×1536 -> ~200 КБ
         if len(data) > budget:
             data = encode(max(30, quality - 20))
         if len(data) > budget:

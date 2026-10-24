@@ -255,7 +255,7 @@ function thumbKind() {
   if (px <= Z.sizes.t * 1.15) return 't';
   return 'm';
 }
-// на весь экран: сначала быстрое превью 720, затем 1600; при увеличении — оригинал
+// на весь экран: быстрое превью 720 -> 2048 -> сразу следом оригинал
 const previewKind = () => 'p';
 
 // ================================================================== отрисовка: шапка, папки
@@ -792,18 +792,18 @@ function show(i) {
     // загрузки только мешают друг другу):
     //   1) быстрая сильно сжатая версия (~20–40 КБ) — фото видно почти сразу;
     //   2) у живого фото — ролик (он и так закрывает фото, пока играет);
-    //   3) полная версия 1600 — сервер готовит её заранее вместе с быстрой, из того же декода;
+    //   3) полная версия 2048 — сервер готовит её заранее вместе с быстрой, из того же декода;
     //   4) соседние фото (быстрые версии).
     // Начали увеличивать — всё недогруженное обрывается и сразу грузится оригинал (goOriginal).
     $('v-spin').hidden = false;
     const full = previewKind();
     loadStep(ph, tok, 'q', `&n=${full}`).then(() => {
       if (tok !== V.token) return;
-      // на компьютере (мышь, быстрый канал) сразу за 1600 грузим оригинал — не дожидаясь увеличения
+      // сразу за 2048 грузим оригинал (и на телефоне, и на компьютере) — не дожидаясь увеличения
       const rest = () => {
         if (VZ.zoomedOnce) return;
         loadStep(ph, tok, full, '')
-          .then(() => (isDesktop() && !VZ.zoomedOnce && tok === V.token && canOriginal(ph) ? (VZ.want = 'o', loadStep(ph, tok, 'o', '')) : null))
+          .then(() => (!VZ.zoomedOnce && tok === V.token && canOriginal(ph) ? (VZ.want = 'o', loadStep(ph, tok, 'o', '')) : null))
           .then(() => { if (tok === V.token && !VZ.zoomedOnce) prefetchNear(i, tok); });
       };
       if (liveVid) playLive(liveVid, tok, rest); else rest();
@@ -958,7 +958,7 @@ function playClip(el) {
   startEl(el).then(() => { el.classList.add('on'); setLabel(); }).catch(() => {});
 }
 
-// при открытии: превью-ролик (сразу играет) -> хороший ролик -> after (фото 1600)
+// при открытии: превью-ролик (сразу играет) -> хороший ролик -> after (фото 2048)
 function playLive(vid, tok, after) {
   let done = false;
   const next = () => { if (done) return; done = true; if (after && tok === V.token) after(); };
@@ -1179,9 +1179,7 @@ function stagePoint(cx, cy) { const b = stage.getBoundingClientRect(); return [c
 
 // Начали увеличивать: недогруженные картинки (версии фото, соседи) обрываем — браузер
 // закрывает соединения, сервер снимает их запросы из очереди — и сразу грузим оригинал (ролик живого фото не трогаем).
-// Если браузер не покажет оригинал (HEIC и т.п.) или он больше 25 МБ — версию 1600.
-// компьютер: мышь/тачпад с наведением (на телефоне и планшете — нет)
-const isDesktop = () => matchMedia('(hover: hover) and (pointer: fine)').matches;
+// Если браузер не покажет оригинал (HEIC и т.п.) или он больше 25 МБ — версию 2048.
 // оригинал, который браузер покажет сам (не HEIC и т.п.) и не больше 25 МБ
 function canOriginal(ph) {
   const ext = ph[2].slice(ph[2].lastIndexOf('.')).toLowerCase();
