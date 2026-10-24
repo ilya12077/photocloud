@@ -67,11 +67,13 @@ class UserStore:
                     g = rec.get("google")
                     try:
                         folders = norm_folders(rec.get("folders"))
+                        exclude = norm_folders(rec.get("exclude")) or []
                     except UserError:
-                        folders = []        # испорченная запись — безопаснее ничего, чем всё
+                        folders, exclude = [], []   # испорченная запись — безопаснее ничего, чем всё
                     self._u[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
                                      "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
-                                     "folders": folders, "wake": rec.get("wake", True) is not False}
+                                     "folders": folders, "exclude": exclude,
+                                     "wake": rec.get("wake", True) is not False}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,16 +94,19 @@ class UserStore:
 
     def list(self) -> list[dict]:
         return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
-                 "folders": r.get("folders"), "wake": r.get("wake", True)}
+                 "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True)}
                 for n, r in sorted(self._u.items())]
 
-    def folders(self, name: str) -> tuple[str, ...] | None:
-        """Папки, которые видит пользователь: None — все; () — никакие (и нет такого пользователя)."""
+    def folders(self, name: str):
+        """Доступ пользователя к папкам: None — всё; иначе (разрешённые или None=все, исключённые).
+        Нет такого пользователя — ничего."""
         rec = self._u.get(name)
         if rec is None:
-            return ()
-        f = rec.get("folders")
-        return None if f is None else tuple(f)
+            return ((), ())
+        allow, deny = rec.get("folders"), tuple(rec.get("exclude") or ())
+        if allow is None and not deny:
+            return None
+        return (None if allow is None else tuple(allow), deny)
 
     def can_wake(self, name: str) -> bool:
         rec = self._u.get(name)
@@ -114,12 +119,16 @@ class UserStore:
             self._u[name]["wake"] = bool(allow)
             self._save()
 
-    def set_folders(self, name: str, folders) -> None:
+    def set_folders(self, name: str, folders, exclude=None) -> None:
+        """folders: None — все папки, список — только эти (с подпапками);
+        exclude: подпапки, которые при этом скрыты (тоже с их подпапками)."""
         folders = norm_folders(folders)
+        exclude = norm_folders(exclude or []) or []
         with self._mu:
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             self._u[name]["folders"] = folders
+            self._u[name]["exclude"] = exclude
             self._save()
 
     def by_google(self, email: str) -> tuple[str, str] | None:
@@ -173,7 +182,7 @@ class UserStore:
         with self._mu:
             if name in self._u:
                 raise UserError("такой пользователь уже есть")
-            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "wake": True}
+            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "exclude": [], "wake": True}
             self._save()
 
     def set_password(self, name: str, password: str) -> None:

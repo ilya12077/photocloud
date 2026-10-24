@@ -35,12 +35,20 @@ LIVE_VID = {".mp4", ".mov"}
 LIVE_MAX = 40 * 1024 * 1024     # ролик живого фото — пара секунд, обычно 2–10 МБ
 
 
-def folder_ok(rel: str, folders) -> bool:
-    """Путь файла (или папки) rel внутри разрешённых папок? folders=None — разрешено всё.
-    Сравнение по целым частям пути: «фотки» не открывает «фотки2»."""
-    if folders is None:
-        return True
+def _under(rel: str, folders) -> bool:
+    # сравнение по целым частям пути: «фотки» не захватывает «фотки2»
     return any(rel == f or rel.startswith(f + "/") for f in folders)
+
+
+def folder_ok(rel: str, access) -> bool:
+    """Путь файла (или папки) rel доступен? access=None — всё; иначе (allow, deny):
+    allow — разрешённые папки (None — все), deny — скрытые папки внутри них."""
+    if access is None:
+        return True
+    allow, deny = access
+    if allow is not None and not _under(rel, allow):
+        return False
+    return not _under(rel, deny)
 
 
 class View:
@@ -253,12 +261,13 @@ class Library:
         views, feed, flist = self._views, self._feed, self._folders     # один снимок версии
         if not self.version:
             return views[None]                  # список ещё не собран — пусто для всех
-        key = None if folders is None else tuple(sorted(folders))
+        key = None if folders is None else (None if folders[0] is None else tuple(sorted(folders[0])),
+                                            tuple(sorted(folders[1])))
         v = views.get(key)
         if v is not None:
             return v
         need = {""}
-        for f in key:
+        for f in (key[0] or ()):
             parts = f.split("/")
             need.update("/".join(parts[:i]) for i in range(1, len(parts)))
         keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, key)]
