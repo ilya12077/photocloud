@@ -233,4 +233,5 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .fold-list label.sub { padding-left: 18px; opacity: .85; }
 .fold-btns { display: flex; gap: 8px; margin-top: 4px; }
 .fold-sum { font-weight: 600; margin: 4px 0 8px; }
+.fold-list.off { opacity: .45; }
 .wake-chk { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }

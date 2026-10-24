@@ -205,7 +205,8 @@ async function editFolders(u, tr) {
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
   const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 7; row.append(td);
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
-  allChk.checked = u.folders == null; all.append(allChk, ' все папки (и новые тоже)');
+  // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
+  allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');
   const box = el('div', 'fold-list');
   const chks = folderList.map((f) => {
     const l = el('label', f.includes('/') ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f;
@@ -216,10 +217,7 @@ async function editFolders(u, tr) {
   const parentOf = (c) => { const i = c.value.lastIndexOf('/'); return i < 0 ? null : byName.get(c.value.slice(0, i)) || null; };
   // из галочек -> «разрешённые + скрытые внутри»
   const compute = () => {
-    if (allChk.checked) {
-      return { folders: null,      // все, кроме снятых (верхних из снятых)
-        exclude: chks.filter((c) => !c.checked && (!parentOf(c) || parentOf(c).checked)).map((c) => c.value) };
-    }
+    if (allChk.checked) return { folders: null, exclude: [] };
     return { folders: chks.filter((c) => c.checked && (!parentOf(c) || !parentOf(c).checked)).map((c) => c.value),
       exclude: chks.filter((c) => !c.checked && parentOf(c) && parentOf(c).checked).map((c) => c.value) };
   };
@@ -230,15 +228,17 @@ async function editFolders(u, tr) {
     for (const d of chks) if (d.value.startsWith(c.value + '/')) d.checked = c.checked;   // вложенные — так же
     refresh();
   });
-  allChk.addEventListener('change', () => { for (const c of chks) c.checked = allChk.checked; refresh(); });
-  refresh();
+  // «все папки» отмечена — список неактивен (всё и так открыто); снята — выбираешь сам
+  const syncAll = () => { for (const c of chks) { c.disabled = allChk.checked; if (allChk.checked) c.checked = true; } box.classList.toggle('off', allChk.checked); };
+  allChk.addEventListener('change', () => { if (!allChk.checked) for (const c of chks) c.checked = false; syncAll(); refresh(); });
+  syncAll(); refresh();
   const save = btn('сохранить', async () => {
     const { folders, exclude } = compute();
     if (folders && !folders.length && !confirm(`${u.user} не увидит ни одного фото. Сохранить?`)) return;
     const ok = await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/folders`, { folders, exclude }), 'Доступ изменён');
     if (ok) loadUsers();
   });
-  td.append(el('div', 'dim2', 'Отмеченная папка открыта вместе со всеми подпапками, кроме снятых. «Все папки» — и новые, которые появятся позже; снятые ниже тогда скрыты. Файлы прямо в корне — только при «все папки».'),
+  td.append(el('div', 'dim2', 'Отмеченная папка открыта вместе со всеми подпапками, кроме снятых. «Все папки» — всё, и новые папки тоже. Файлы прямо в корне — только при «все папки».'),
     all, box, summary);
   const bar = el('div', 'fold-btns'); bar.append(save, btn('отмена', () => row.remove())); td.append(bar);
   tr.after(row);
