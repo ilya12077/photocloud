@@ -36,7 +36,7 @@ from .ha import HomeAssistant, clean
 from .images import HEAD_BYTES, LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_limited, render
 from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
-from .library import Library
+from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
 from .storage import make_storage
 
@@ -231,6 +231,19 @@ async def require_user(request: Request) -> Session:
     s.role = role  # type: ignore[attr-defined]
     s.sid = sessions.sid(token)  # type: ignore[attr-defined]
     return s
+
+
+def user_folders(s: Session):
+    """Папки, доступные пользователю: None — все (админ всегда видит всё)."""
+    if getattr(s, "role", None) == "admin":
+        return None
+    return users.folders(s.user)
+
+
+def visible(s: Session, p) -> bool:
+    """Файл p в папках, доступных пользователю. Все запросы по id проходят через это:
+    чужой id отвечает 404 — так же, как несуществующий."""
+    return p is not None and folder_ok(p.rel, user_folders(s))
 
 
 async def require_admin(s: Session = Depends(require_user)) -> Session:
@@ -438,7 +451,8 @@ async def logout(request: Request):
 async def me(s: Session = Depends(require_user)):
     return no_store(JSONResponse({"user": s.user, "role": s.role, "name": S.public_name,  # type: ignore[attr-defined]
                                   "sizes": {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size},
-                                  "video": bool(FFMPEG), "transcode": TRANSCODE}))
+                                  "video": bool(FFMPEG), "transcode": TRANSCODE,
+                                  "can_wake": users.can_wake(s.user)}))
 
 
 # ---------------------------------------------------------------- ПК и индекс
@@ -590,22 +604,25 @@ async def _pc_watch() -> None:
 
 
 @app.get("/api/status")
-async def status(_: Session = Depends(require_user)):
+async def status(s: Session = Depends(require_user)):
     pc = pc_state(await PC.is_up())
+    view = await run_in_threadpool(library.view, user_folders(s))
     if pc == "up":
         PC.wake_at = 0
     return no_store(JSONResponse({
         "pc": pc,
         "wake_left": max(0, int(S.wake_timeout - (time.time() - PC.wake_at))) if pc == "waking" else 0,
         "wake_failed": pc == "down" and bool(PC.wake_at),
-        "index": {"state": library.state, "count": len(library.by_id), "progress": library.progress,
-                  "built_at": int(library.built_at), "v": library.version,
+        "index": {"state": library.state, "count": view.count, "progress": library.progress,
+                  "built_at": int(library.built_at), "v": view.version,
                   "meta": [library.meta_done, library.meta_total]},
     }))
 
 
 @app.post("/api/wake", dependencies=[Depends(require_csrf)])
 async def wake(s: Session = Depends(require_user)):
+    if not users.can_wake(s.user):
+        raise HTTPException(403, "wake not allowed")
     if await PC.is_up():
         return no_store(JSONResponse({"pc": "up"}))
     if PC.wake_at and time.time() - PC.wake_at < 30:
@@ -630,15 +647,16 @@ async def reindex(_: Session = Depends(require_admin)):
 
 
 @app.get("/api/library")
-async def get_library(request: Request, _: Session = Depends(require_user)):
-    etag = f'"{library.version}"'
+async def get_library(request: Request, s: Session = Depends(require_user)):
+    v = await run_in_threadpool(library.view, user_folders(s))     # только свои папки
+    etag = f'"{v.version}"'
     headers = {"etag": etag, "cache-control": "private, no-cache", "vary": "cookie, accept-encoding"}
-    if library.version and request.headers.get("if-none-match") == etag:
+    if v.version and request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
     if "gzip" in request.headers.get("accept-encoding", ""):
         headers["content-encoding"] = "gzip"
-        return Response(library.payload_gz, media_type="application/json", headers=headers)
-    return Response(library.payload, media_type="application/json", headers=headers)
+        return Response(v.gz, media_type="application/json", headers=headers)
+    return Response(v.payload, media_type="application/json", headers=headers)
 
 
 # ---------------------------------------------------------------- картинки
@@ -783,9 +801,9 @@ class Perf:
                 "requests": total, "workers": S.workers, "inflight": len(inflight), "waiting": sched.waiting + sched_video.waiting}
 
 
-async def rendered(request: Request, kind: str, pid: str) -> Response:
+async def rendered(request: Request, kind: str, pid: str, s: Session) -> Response:
     p = library.get(pid)
-    if p is None:
+    if not visible(s, p):
         raise HTTPException(404)
     box = {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size, "q": S.preview_quick_size,
            "p": S.preview_size}[kind]
@@ -954,9 +972,9 @@ async def serve_file(request: Request, p, extra: dict) -> Response:
 
 
 @app.get("/img/o/{pid}")
-async def original(request: Request, pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
+async def original(request: Request, pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
     p = library.get(pid)
-    if p is None:
+    if not visible(s, p):
         raise HTTPException(404)
     ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", p.name)[:100] or "file"
     disp = "attachment" if request.query_params.get("dl") == "1" else "inline"
@@ -969,16 +987,16 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), _: Ses
 
 @app.get("/img/{kind}/{pid}")
 async def image(request: Request, kind: str = PathParam(pattern=r"^[stmqp]$"),
-                pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
+                pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
     """s/t/m — эскизы 240/400/900, q — быстрое превью 720 (сильно сжатое), p — превью 2048 (размеры настраиваются)."""
-    return await rendered(request, kind, pid)
+    return await rendered(request, kind, pid, s)
 
 
 # ---------------------------------------------------------------- видео: HLS на лету
 
-def _vid(pid: str):
+def _vid(pid: str, s: Session):
     p = library.get(pid)
-    if p is None or not p.video:
+    if not visible(s, p) or not p.video:
         raise HTTPException(404)
     if not TRANSCODE:
         raise HTTPException(404, "transcode off")
@@ -1004,8 +1022,8 @@ async def _duration(p) -> float:
 
 @app.get("/vid/{pid}/{profile}/index.m3u8")
 async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathParam(pattern=r"^eco$"),
-                       _: Session = Depends(require_user)):
-    p = _vid(pid)
+                       s: Session = Depends(require_user)):
+    p = _vid(pid, s)
     if not await PC.is_up():
         raise HTTPException(503, "pc")
     d = await _duration(p)
@@ -1016,8 +1034,8 @@ async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathP
 @app.get("/vid/{pid}/{profile}/{n}.ts")
 async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
                       profile: str = PathParam(pattern=r"^eco$"), n: int = PathParam(ge=0, le=100000),
-                      _: Session = Depends(require_user)):
-    p = _vid(pid)
+                      s: Session = Depends(require_user)):
+    p = _vid(pid, s)
     d = await _duration(p)
     if n * transcode.SEG >= d:
         raise HTTPException(404)
@@ -1039,18 +1057,20 @@ async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
 
 
 @app.post("/vid/{pid}/stop", dependencies=[Depends(require_csrf)])
-async def vid_stop(pid: str = PathParam(pattern=ID_RE), _: Session = Depends(require_user)):
+async def vid_stop(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
     """Вышли из видео или живого фото: перекодирование этого файла больше не нужно."""
+    if not visible(s, library.get(pid)):
+        raise HTTPException(404)
     return no_store(JSONResponse({"stopped": transcoder.stop(pid)}))
 
 
 @app.get("/vid/{pid}/live.mp4")
 async def vid_live(request: Request, pid: str = PathParam(pattern=ID_RE), q: str = "hq",
-                   _: Session = Depends(require_user)):
+                   s: Session = Depends(require_user)):
     """Ролик живого фото: целиком, H.264 + звук — играет в любом браузере.
     Пара секунд видео перекодируется за доли секунды и живёт в RAM-кэше."""
     p = library.get(pid)
-    if p is None or not p.video or not p.live:
+    if not visible(s, p) or not p.video or not p.live:
         raise HTTPException(404)
     if not TRANSCODE:
         return await serve_file(request, p, {"cache-control": "private, max-age=3600"})
@@ -1222,6 +1242,43 @@ async def admin_user_google(request: Request, name: str, s: Session = Depends(re
     except UserError as e:
         return _bad(str(e))
     audit("user_google", s.user, ip_of(request), f"{name} -> {email or 'отвязан'}")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/users/{name}/wake", dependencies=[Depends(require_csrf)])
+async def admin_user_wake(request: Request, name: str, s: Session = Depends(require_admin)):
+    """Может ли пользователь включать компьютер (админ — всегда)."""
+    name = _user_arg(name)
+    d = await read_json(request)
+    allow = d.get("allow")
+    if not isinstance(allow, bool):
+        return _bad("allow: true/false")
+    try:
+        users.set_wake(name, allow)
+    except UserError as e:
+        return _bad(str(e))
+    audit("user_wake", s.user, ip_of(request), f"{name} -> {'может' if allow else 'не может'} включать ПК")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.get("/api/admin/folders")
+async def admin_folders(_: Session = Depends(require_admin)):
+    """Папки для настройки доступа: верхний уровень и следующий (длинное дерево не нужно)."""
+    fl = [f for f in library._folders if f and f.count("/") <= 1]
+    return no_store(JSONResponse({"folders": fl}))
+
+
+@app.post("/api/admin/users/{name}/folders", dependencies=[Depends(require_csrf)])
+async def admin_user_folders(request: Request, name: str, s: Session = Depends(require_admin)):
+    """Какие папки видит пользователь: null — все, список — только эти (с подпапками)."""
+    name = _user_arg(name)
+    d = await read_json(request)
+    folders = d.get("folders")
+    try:
+        users.set_folders(name, folders)
+    except UserError as e:
+        return _bad(str(e))
+    audit("user_folders", s.user, ip_of(request), f"{name} -> {'все' if folders is None else ', '.join(folders) or 'никакие'}")
     return no_store(JSONResponse({"ok": True}))
 
 
