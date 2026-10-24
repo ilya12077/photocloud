@@ -18,10 +18,8 @@ class ConfigError(RuntimeError):
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def app_version() -> str:
-    """Версия сборки: из образа (PHOTOCLOUD_VERSION) или из файла VERSION рядом с проектом."""
-    v = os.environ.get("PHOTOCLOUD_VERSION", "").strip()
-    if v:
-        return v
+    """Версия сборки — из файла VERSION (в образе он лежит в /app). Переменную окружения
+    не используем: Portainer переносит старые переменные в новый контейнер."""
     try:
         return (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip() or "dev"
     except OSError:

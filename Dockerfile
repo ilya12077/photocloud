@@ -18,10 +18,11 @@ RUN grep -v '^imageio-ffmpeg' requirements.txt > /tmp/req.txt \
 
 COPY app ./app
 
-# версия сборки (из файла VERSION, передаётся GitHub Actions) — видна в «Обзоре» админки,
-# в логе при старте и в метке образа org.opencontainers.image.version
+# Версия сборки — файлом внутри образа (видна в «Обзоре» админки и в логе при старте).
+# Не переменной окружения: Portainer при «Pull and redeploy» сохраняет старые переменные
+# контейнера, и версия застревала на той, с которой контейнер создали.
+COPY VERSION ./VERSION
 ARG VERSION=dev
-ENV PHOTOCLOUD_VERSION=$VERSION
 LABEL org.opencontainers.image.version=$VERSION
 
 # непривилегированный пользователь; писать можно только в /data
