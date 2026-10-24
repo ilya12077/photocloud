@@ -102,5 +102,5 @@ class HomeAssistant:
         await self.call(svc, {
             "title": self.s.public_name,
             "message": message,
-            "data": {"tag": f"photocloud-{event}", "group": "photocloud"},
+            "data": {"tag": f"photocloud-{event}", "group": "photocloud", "channel": "photocloud"},
         })
