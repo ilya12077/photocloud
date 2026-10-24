@@ -170,7 +170,7 @@ async function loadUsers() {
     const fd = el('td');
     if (u.role === 'admin') fd.append(el('span', 'dim2', 'все (админ)'));
     else {
-      fd.append(el('span', null, u.folders == null ? 'все' : (u.folders.length ? u.folders.join(', ') : 'никакие')), ' ',
+      fd.append(el('span', null, foldersText(u)), ' ',
         btn('изменить', () => editFolders(u, tr)));
     }
     // может ли включать компьютер кнопкой «Запустить компьютер» (админ — всегда)
@@ -190,6 +190,16 @@ async function loadUsers() {
 }
 
 let folderList = null;
+const under = (rel, fs) => fs.some((f) => rel === f || rel.startsWith(f + '/'));
+const canSee = (rel, allow, deny) => (allow == null || under(rel, allow)) && !under(rel, deny || []);
+function foldersText(u) {
+  const ex = u.exclude && u.exclude.length ? ', кроме ' + u.exclude.join(', ') : '';
+  if (u.folders == null) return 'все' + ex;
+  return (u.folders.length ? u.folders.join(', ') : 'никакие') + ex;
+}
+
+// Галочки — просто удобство: отметил папку — отметились и вложенные (их можно снять),
+// снял — снялись. При сохранении из галочек получается «разрешённые + скрытые внутри».
 async function editFolders(u, tr) {
   if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
@@ -197,31 +207,31 @@ async function editFolders(u, tr) {
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   allChk.checked = u.folders == null; all.append(allChk, ' все папки (и новые тоже)');
   const box = el('div', 'fold-list');
-  const sel = new Set(u.folders || []);
   const chks = folderList.map((f) => {
-    const l = el('label', f.includes('/') ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f; c.checked = sel.has(f);
+    const l = el('label', f.includes('/') ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f;
+    c.checked = canSee(f, u.folders, u.exclude);
     l.append(c, ' ' + f); box.append(l); return c;
   });
-  // отмеченная папка открывает и все вложенные — их галочки ставятся сами и блокируются
-  const inside = (c, p) => c.value.startsWith(p.value + '/');
-  const cascade = () => {
-    for (const c of chks) {
-      const parent = chks.some((p) => p !== c && p.checked && !p.disabled && inside(c, p));
-      if (parent) { c.checked = true; c.disabled = true; } else if (c.disabled) { c.disabled = false; c.checked = false; }
-    }
-  };
-  for (const c of chks) c.addEventListener('change', cascade);
-  cascade();
-  const sync = () => { box.hidden = allChk.checked; };
-  allChk.onchange = sync; sync();
+  const byName = new Map(chks.map((c) => [c.value, c]));
+  const parentOf = (c) => { const i = c.value.lastIndexOf('/'); return i < 0 ? null : byName.get(c.value.slice(0, i)) || null; };
+  for (const c of chks) c.addEventListener('change', () => {
+    for (const d of chks) if (d.value.startsWith(c.value + '/')) d.checked = c.checked;   // вложенные — так же
+  });
+  allChk.addEventListener('change', () => { for (const c of chks) c.checked = allChk.checked; });
   const save = btn('сохранить', async () => {
-    // сохраняем только верхние отмеченные папки: вложенные и так входят в них
-    const folders = allChk.checked ? null : chks.filter((c) => c.checked && !c.disabled).map((c) => c.value);
+    let folders, exclude;
+    if (allChk.checked) {
+      folders = null;      // все, кроме снятых (верхних из снятых)
+      exclude = chks.filter((c) => !c.checked && (!parentOf(c) || parentOf(c).checked)).map((c) => c.value);
+    } else {
+      folders = chks.filter((c) => c.checked && (!parentOf(c) || !parentOf(c).checked)).map((c) => c.value);
+      exclude = chks.filter((c) => !c.checked && parentOf(c) && parentOf(c).checked).map((c) => c.value);
+    }
     if (folders && !folders.length && !confirm(`${u.user} не увидит ни одного фото. Сохранить?`)) return;
-    const ok = await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/folders`, { folders }), 'Доступ изменён');
+    const ok = await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/folders`, { folders, exclude }), 'Доступ изменён');
     if (ok) loadUsers();
   });
-  td.append(el('div', 'dim2', 'Пользователь видит только отмеченные папки вместе со всеми их подпапками. Файлы прямо в корне — только при «все папки».'),
+  td.append(el('div', 'dim2', 'Отмеченная папка открыта вместе со всеми подпапками, кроме снятых. «Все папки» — и новые, которые появятся позже. Файлы прямо в корне — только при «все папки».'),
     all, box);
   const bar = el('div', 'fold-btns'); bar.append(save, btn('отмена', () => row.remove())); td.append(bar);
   tr.after(row);

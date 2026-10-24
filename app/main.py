@@ -1270,15 +1270,17 @@ async def admin_folders(_: Session = Depends(require_admin)):
 
 @app.post("/api/admin/users/{name}/folders", dependencies=[Depends(require_csrf)])
 async def admin_user_folders(request: Request, name: str, s: Session = Depends(require_admin)):
-    """Какие папки видит пользователь: null — все, список — только эти (с подпапками)."""
+    """Какие папки видит пользователь: folders — null (все) или список (с подпапками);
+    exclude — подпапки, скрытые внутри разрешённых."""
     name = _user_arg(name)
     d = await read_json(request)
-    folders = d.get("folders")
+    folders, exclude = d.get("folders"), d.get("exclude") or []
     try:
-        users.set_folders(name, folders)
+        users.set_folders(name, folders, exclude)
     except UserError as e:
         return _bad(str(e))
-    audit("user_folders", s.user, ip_of(request), f"{name} -> {'все' if folders is None else ', '.join(folders) or 'никакие'}")
+    what = "все" if folders is None else ", ".join(folders) or "никакие"
+    audit("user_folders", s.user, ip_of(request), f"{name} -> {what}" + (f", кроме {', '.join(exclude)}" if exclude else ""))
     return no_store(JSONResponse({"ok": True}))
 
 
