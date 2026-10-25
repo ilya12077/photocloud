@@ -18,7 +18,7 @@ const st = {
   pc: 'unknown', pollTimer: 0, newVersion: null,
 };
 const Z = { cols: 3, pinch: null, wheel: 0, sizes: { s: 240, t: 400, m: 900 } };
-const L = { rows: [], height: 0, tileH: 0, gap: 3, rendered: new Map(), lastY: 0, idleT: 0, fast: false };
+const L = { rows: [], height: 0, tileH: 0, gap: 3, rendered: new Map(), lastY: 0, idleT: 0, fast: false, calmUntil: 0 };
 
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (_) { return null; } }
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -166,7 +166,7 @@ async function poll(delay) {
   if (ix.v && !st.lib && !st.libPromise) await loadLibrary();
   else if (ix.v && st.lib && ix.v !== st.lib.v && ix.state !== 'building') {
     // молча обновляем, только если пользователь ещё не начал листать
-    if (window.scrollY < 50 && $('viewer').hidden) await loadLibrary();
+    if (window.scrollY < 50 && $('viewer').hidden && Date.now() > L.calmUntil) await loadLibrary();
     else if (!st.newVersion) { st.newVersion = ix.v; next = 100; }
   }
   if (prevPc !== 'up' && s.pc === 'up') retryBroken();
@@ -673,8 +673,11 @@ document.addEventListener('keydown', (e) => {
 // На телефоне при прокрутке браузер прячет/показывает адресную строку — высота окна
 // меняется, но сетка от высоты не зависит. Перестраиваем её только при смене ширины
 // (поворот, окно на компе), иначе плитки пересоздавались бы и мигали.
-// ширина макета, а не видимой области: щипок-увеличение в браузере её не меняет
-const layoutW = () => document.documentElement.clientWidth;
+
+// Ширина окна целиком (со скроллбаром): на компе скроллбар исчезает/появляется, когда
+// открываешь фото или подгружается список, — сетку из-за этого перестраивать не надо.
+// Перестраиваем только при настоящей смене ширины окна или повороте телефона.
+const layoutW = () => window.innerWidth;
 let resizeT = 0, lastW = layoutW();
 window.addEventListener('resize', () => {
   clearTimeout(resizeT);
@@ -1278,6 +1281,7 @@ function closeViewer(silent) {
   loadVisible(true);      // догружаем эскизы, отменённые при открытии
   gridPrefetchSoon();
   if (layoutW() !== lastW) { lastW = layoutW(); initZoom(); relayout(true); }   // повернули телефон в просмотре
+  L.calmUntil = Date.now() + 2000;          // после выхода сетка пару секунд не перестраивается сама
 }
 
 window.addEventListener('popstate', () => { if (!$('viewer').hidden) { V.pushed = false; closeViewer(true); } });
