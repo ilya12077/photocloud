@@ -768,9 +768,7 @@ function show(i) {
   const fromMeta = ph[6] & F_TAKEN, fromName = ph[6] & F_NAME;
   let meta = (ph[6] & F_FOLDER)
     ? `${new Date(ph[3] * 1000).getFullYear()} год (по названию папки) · ${sizeStr(ph[5])}`
-    : (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Изменён ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
-  if (ph[6] & F_FOLDER) meta += ' · файл изменён ' + fmt.format(new Date(ph[4] * 1000));
-  if ((fromMeta || fromName) && Math.abs(ph[4] - ph[3]) > 86400) meta += ' · файл изменён ' + fmt.format(new Date(ph[4] * 1000));
+    : (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Дата файла ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
   $('v-date').textContent = meta;
   $('v-orig').href = origUrl(ph, false);
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
@@ -1165,13 +1163,13 @@ async function fillInfo() {
   const seq = ++INFO.seq;
   if (INFO.map) { INFO.map.remove(); INFO.map = null; }
   const body = $('v-info-body');
-  const src = (ph[6] & F_TAKEN) ? 'из метаданных' : (ph[6] & F_NAME) ? 'по имени файла' : (ph[6] & F_FOLDER) ? 'по названию папки' : 'дата изменения файла';
+  const src = (ph[6] & F_TAKEN) ? 'из метаданных' : (ph[6] & F_NAME) ? 'по имени файла' : (ph[6] & F_FOLDER) ? 'по названию папки' : 'дата файла, дата съёмки неизвестна';
   const when = (ph[6] & F_FOLDER) ? `${new Date(ph[3] * 1000).getFullYear()} год` : fmt.format(new Date(ph[3] * 1000));
   const folder = st.lib.folders[ph[1]] || 'корень';
   const extra = el('div'); extra.append(el('div', 'dim', 'Загружаю подробности…'));
   body.replaceChildren(el('h3', null, 'Подробнее'),
     infoRows([['Дата', `${when} (${src})`], ['Файл', ph[2]], ['Папка', folder], ['Размер', sizeStr(ph[5])],
-      ['Изменён', fmt.format(new Date(ph[4] * 1000))]]), extra);
+    ]), extra);
   let info = {};
   try {
     const r = await api(`/api/info/${encodeURIComponent(ph[0])}`);
