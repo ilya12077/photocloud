@@ -1010,8 +1010,7 @@ async def admin_info_stop(request: Request, s: Session = Depends(require_admin))
     return no_store(JSONResponse({"ok": True}))
 
 
-@app.get("/api/info/{pid}")
-async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
+async def _photo_info(pid: str, s: Session) -> dict:
     p = library.get(pid)
     if not visible(s, p):
         raise HTTPException(404)
@@ -1034,10 +1033,29 @@ async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(r
         if len(_info_cache) > 5000:
             _info_cache.clear()
         _info_cache[key] = info
-    out = dict(info)
+    return info
+
+
+@app.get("/api/info/{pid}")
+async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
+    """Подробности сразу: адрес — только если уже известен (без похода в интернет),
+    чтобы карта показалась мгновенно; неизвестный адрес — отдельным запросом ниже."""
+    out = dict(await _photo_info(pid, s))
     if "lat" in out:
-        out["address"] = await geocoder.address(out["lat"], out["lon"])
+        addr = await geocoder.cached(out["lat"], out["lon"])
+        if addr is not None:
+            out["address"] = addr or None
+            out["address_known"] = True
     return no_store(JSONResponse(out))
+
+
+@app.get("/api/info/{pid}/address")
+async def photo_address(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
+    """Адрес по координатам снимка: OpenStreetMap (до 1–2 с при первом запросе места)."""
+    info = await _photo_info(pid, s)
+    if "lat" not in info:
+        return no_store(JSONResponse({"address": None}))
+    return no_store(JSONResponse({"address": await geocoder.address(info["lat"], info["lon"])}))
 
 
 @app.get("/img/o/{pid}")

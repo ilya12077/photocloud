@@ -73,6 +73,10 @@ class Geocoder:
     async def close(self) -> None:
         await self._http.aclose()
 
+    async def cached(self, lat: float, lon: float) -> str | None:
+        """Адрес, если уже известен (без запроса в интернет); '' — места нет; None — не спрашивали."""
+        return await asyncio.to_thread(self.db.geo_get, f"{lat:.4f},{lon:.4f}")
+
     async def address(self, lat: float, lon: float) -> str | None:
         key = f"{lat:.4f},{lon:.4f}"                 # ~10 м — соседние снимки делят запрос
         hit = await asyncio.to_thread(self.db.geo_get, key)
