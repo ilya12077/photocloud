@@ -23,6 +23,10 @@ SCHEMA = [
          key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime
          ts REAL NOT NULL)              -- дата съёмки, 0 = в файле её нет
        WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS info (
+         key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime (как у дат)
+         data TEXT NOT NULL)            -- JSON: размеры, камера, координаты
+       WITHOUT ROWID""",
     """CREATE TABLE IF NOT EXISTS geo (
          key TEXT PRIMARY KEY,          -- «широта,долгота» с точностью ~10 м
          addr TEXT NOT NULL,            -- адрес по-русски; '' — не нашёлся
@@ -86,3 +90,25 @@ class DB:
     def geo_put(self, key: str, addr: str) -> None:
         import time
         self.run("INSERT OR REPLACE INTO geo(key, addr, ts) VALUES(?, ?, ?)", (key, addr, time.time()))
+
+    # ------------------------------------------------------------ подробности снимка (EXIF)
+
+    def info_get(self, key: str) -> str | None:
+        r = self.run("SELECT data FROM info WHERE key = ?", (key,))
+        return r[0][0] if r else None
+
+    def info_put(self, key: str, data: str) -> None:
+        self.run("INSERT OR REPLACE INTO info(key, data) VALUES(?, ?)", (key, data))
+
+    def info_keys(self) -> set[str]:
+        return {k for (k,) in self.run("SELECT key FROM info")}
+
+    def info_put_many(self, items: list[tuple[str, str]]) -> None:
+        if items:
+            self.many("INSERT OR REPLACE INTO info(key, data) VALUES(?, ?)", items)
+
+    def info_prune(self, keep: set[str]) -> int:
+        gone = [(k,) for k in self.info_keys() if k not in keep]
+        if gone:
+            self.many("DELETE FROM info WHERE key = ?", gone)
+        return len(gone)

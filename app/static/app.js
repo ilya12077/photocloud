@@ -154,6 +154,11 @@ async function poll(delay) {
     banner('Не удалось прочитать папку на компьютере' + (admin ? ' (проверь доступ)' : ''), admin ? 'Повторить' : null, reindex, true); next = 15000;
   } else if (metaBusy) {
     banner(`Читаю даты съёмки: ${ix.meta[0].toLocaleString('ru')} из ${ix.meta[1].toLocaleString('ru')}`); next = 3000;
+  } else if (ix.info && ix.info[2] === 'running') {
+    // фоновый сбор подробностей (камера, размеры, место) — админ может остановить
+    const admin = st.me && st.me.role === 'admin';
+    banner(`Сбор метаданных из файлов (${ix.info[0].toLocaleString('ru')} из ${ix.info[1].toLocaleString('ru')})`,
+      admin ? 'Остановить' : null, stopInfo); next = 3000;
   } else if (st.newVersion && st.lib) {
     banner('Список файлов обновился', 'Показать', () => { st.newVersion = null; loadLibrary(); });
   } else banner(null);
@@ -167,6 +172,11 @@ async function poll(delay) {
   if (prevPc !== 'up' && s.pc === 'up') retryBroken();
   if (!st.lib && ix.state !== 'error' && s.pc === 'up') next = Math.min(next, 1500);
   st.pollTimer = setTimeout(() => poll(), next);
+}
+
+async function stopInfo() {
+  try { await api('/api/admin/info/stop', { method: 'POST' }); } catch (_) {}
+  poll(300);
 }
 
 async function reindex() {
@@ -801,6 +811,7 @@ function show(i) {
       const rest = () => {
         if (VZ.zoomedOnce) return;
         loadStep(ph, tok, full, '')
+          .then(() => { if (tok === V.token) prefetchInfo(ph, tok); })
           .then(() => (!VZ.zoomedOnce && tok === V.token && canOriginal(ph) ? (VZ.want = 'o', loadStep(ph, tok, 'o', '')) : null))
           .then(() => { if (tok === V.token && !VZ.zoomedOnce) prefetchNear(i, tok); });
       };
@@ -1152,6 +1163,25 @@ function loadLeaflet() {
   return leaflet;
 }
 
+// подробности снимка: один запрос на фото за сеанс (сервер и сам хранит их в базе)
+const infoCache = new Map();
+function getInfo(ph) {
+  let pr = infoCache.get(ph[0]);
+  if (!pr) {
+    pr = fetch(`/api/info/${encodeURIComponent(ph[0])}`, { credentials: 'same-origin', priority: 'low' })
+      .then((r) => (r.ok ? r.json() : {})).catch(() => ({}))
+      .then((j) => { if (!Object.keys(j).length) infoCache.delete(ph[0]); return j; });
+    infoCache.set(ph[0], pr);
+    if (infoCache.size > 500) infoCache.delete(infoCache.keys().next().value);
+  }
+  return pr;
+}
+// заранее (после фото 2048): к смахиванию вверх всё уже готово, при GPS — и карта
+function prefetchInfo(ph, tok) {
+  if (ph[6] & F_VIDEO) return;
+  getInfo(ph).then((j) => { if (tok === V.token && j && j.lat != null) loadLeaflet().catch(() => {}); });
+}
+
 function infoRows(rows) {
   const dl = el('dl', 'kv');
   for (const [k, v] of rows) if (v) dl.append(el('dt', null, k), el('dd', null, v));
@@ -1170,11 +1200,7 @@ async function fillInfo() {
   body.replaceChildren(el('h3', null, 'Подробнее'),
     infoRows([['Дата', `${when} (${src})`], ['Файл', ph[2]], ['Папка', folder], ['Размер', sizeStr(ph[5])],
     ]), extra);
-  let info = {};
-  try {
-    const r = await api(`/api/info/${encodeURIComponent(ph[0])}`);
-    if (r.ok) info = await r.json();
-  } catch (_) { /* без подробностей */ }
+  const info = await getInfo(ph);
   if (seq !== INFO.seq || !INFO.open) return;
   extra.replaceChildren();
   const mp = info.width && info.height ? `${info.width} × ${info.height} (${(info.width * info.height / 1e6).toFixed(1)} Мп)` : '';
