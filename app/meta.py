@@ -214,6 +214,22 @@ _NAME_DT = re.compile(
 _NAME_UNIX = re.compile(r"^(\d{10}|\d{13})(?:[-_ ]\(?\d{1,3}\)?|\(\d{1,3}\))?$")
 
 
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def _in_hash(stem: str, start: int, end: int) -> bool:
+    """Цифры даты — часть длинного шестнадцатеричного хэша (имена из мессенджеров и
+    облаков: «image-…4d3e20240511a949…»)? Тогда это не дата. Настоящие даты-время в
+    именах — максимум 17 цифр подряд и без букв a–f."""
+    l, r = start, end
+    while l > 0 and stem[l - 1] in _HEX:
+        l -= 1
+    while r < len(stem) and stem[r] in _HEX:
+        r += 1
+    run = stem[l:r]
+    return len(run) >= 20 and any(c.isalpha() for c in run)
+
+
 def name_date(name: str, tz: ZoneInfo) -> float | None:
     """Дата из имени файла (местное время) или None. Без даты времени — полдень."""
     stem = name.rsplit(".", 1)[0]
@@ -222,6 +238,8 @@ def name_date(name: str, tz: ZoneInfo) -> float | None:
         v = int(m.group(1))
         return _plausible(v / 1000 if len(m.group(1)) == 13 else v)
     for m in _NAME_DT.finditer(stem):
+        if _in_hash(stem, *m.span()):
+            continue
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         h, mi, s = (int(m.group(i)) if m.group(i) else None for i in (4, 5, 6))
         if h is None:
