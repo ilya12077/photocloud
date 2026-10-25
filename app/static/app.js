@@ -811,6 +811,7 @@ function show(i) {
   }
   $('v-prev').disabled = i === 0; $('v-next').disabled = i === st.list.length - 1;
   setSides();
+  if (INFO.open) fillInfo();
 }
 
 const RANK = { q: 1, e: 2, p: 3, o: 4 };
@@ -1051,6 +1052,10 @@ function dragMove(dx, dy) {
   if (DR.axis === 'x') {
     const edge = (dx > 0 && V.i === 0) || (dx < 0 && V.i === st.list.length - 1);
     paneTo(edge ? dx * 0.3 : dx, 0, 1, false);                 // у края — «резинка»
+  } else if (dy < 0 || INFO.open) {
+    // вверх — потянуть фото к панели «Подробнее»; при открытой панели вниз — к её закрытию
+    sides(false);
+    paneTo(0, dy * 0.25, 1, false);
   } else {
     sides(false);                                               // при выходе — только текущее фото
     const p = Math.min(1, Math.abs(dy) / H);
@@ -1072,7 +1077,12 @@ function dragEnd(dx, dy, dt) {
     } else paneTo(0, 0, 1, true);
   } else {
     const fast = Math.abs(dy) / Math.max(dt, 1) > 0.6 && Math.abs(dy) > 40;
-    if (Math.abs(dy) > 90 || fast) dismiss(dx, dy);
+    if (dy < 0 || INFO.open) {
+      // вверх — открыть «Подробнее» (фото не закрывается); вниз при открытой панели — закрыть её
+      if (dy < -50 || (fast && dy < 0)) openInfo();
+      else if (INFO.open && (dy > 50 || fast)) closeInfo();
+      paneTo(0, 0, 1, true); setTimeout(() => sides(true), 270);
+    } else if (Math.abs(dy) > 90 || fast) dismiss(dx, dy);
     else { paneTo(0, 0, 1, true); backdrop(1, true); setTimeout(() => { if (!DR.axis) sides(true); }, 270); }
   }
   DR.axis = null;
@@ -1104,8 +1114,121 @@ function dismiss() {
   setTimeout(() => { closeViewer(); resetPane(); pane.style.opacity = ''; }, 270);
 }
 
+// ================================================================== «Подробнее»: дата, файл, камера, место
+// Смахнуть фото вверх (или кнопка ⓘ) — снизу выезжает панель; вниз или ✕ на панели — скрыть.
+const INFO = { open: false, map: null, seq: 0 };
+function openInfo() {
+  if ($('viewer').hidden || INFO.open) return;
+  INFO.open = true;
+  const el = $('v-info'); el.hidden = false; el.scrollTop = 0;
+  requestAnimationFrame(() => { el.classList.add('open'); liftPhoto(); });
+  fillInfo();
+}
+// фото уезжает вверх — в свободную над панелью часть экрана (на телефоне; на компе панель сбоку)
+function liftPhoto() {
+  const st2 = $('v-stage'), el = $('v-info');
+  const narrow = window.innerWidth < 700;
+  const h = INFO.open && narrow ? Math.min(el.offsetHeight, window.innerHeight * 0.58) : 0;
+  st2.style.transition = 'transform .25s cubic-bezier(.2,.8,.2,1)';
+  st2.style.transform = h ? `translateY(${-h / 2}px)` : '';
+}
+function closeInfo(now) {
+  if (!INFO.open && $('v-info').hidden) return;
+  INFO.open = false; INFO.seq++;
+  const el = $('v-info'); el.classList.remove('open'); liftPhoto();
+  if (INFO.map) { INFO.map.remove(); INFO.map = null; }
+  if (now) el.hidden = true; else setTimeout(() => { if (!INFO.open) el.hidden = true; }, 260);
+}
+$('v-infobtn').addEventListener('click', () => (INFO.open ? closeInfo() : openInfo()));
+
+let leaflet = null;
+function loadLeaflet() {
+  if (leaflet) return leaflet;
+  leaflet = new Promise((ok, fail) => {
+    const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = '/static/vendor/leaflet.css';
+    document.head.append(css);
+    const sc = document.createElement('script'); sc.src = '/static/vendor/leaflet.js';
+    sc.onload = () => ok(window.L); sc.onerror = () => { leaflet = null; fail(new Error('leaflet')); };
+    document.head.append(sc);
+  });
+  return leaflet;
+}
+
+function infoRows(rows) {
+  const dl = el('dl', 'kv');
+  for (const [k, v] of rows) if (v) dl.append(el('dt', null, k), el('dd', null, v));
+  return dl;
+}
+
+async function fillInfo() {
+  const ph = st.list[V.i]; if (!ph) return;
+  const seq = ++INFO.seq;
+  if (INFO.map) { INFO.map.remove(); INFO.map = null; }
+  const body = $('v-info-body');
+  const src = (ph[6] & F_TAKEN) ? 'из метаданных' : (ph[6] & F_NAME) ? 'по имени файла' : (ph[6] & F_FOLDER) ? 'по названию папки' : 'дата изменения файла';
+  const when = (ph[6] & F_FOLDER) ? `${new Date(ph[3] * 1000).getFullYear()} год` : fmt.format(new Date(ph[3] * 1000));
+  const folder = st.lib.folders[ph[1]] || 'корень';
+  const extra = el('div'); extra.append(el('div', 'dim', 'Загружаю подробности…'));
+  body.replaceChildren(el('h3', null, 'Подробнее'),
+    infoRows([['Дата', `${when} (${src})`], ['Файл', ph[2]], ['Папка', folder], ['Размер', sizeStr(ph[5])],
+      ['Изменён', fmt.format(new Date(ph[4] * 1000))]]), extra);
+  let info = {};
+  try {
+    const r = await api(`/api/info/${encodeURIComponent(ph[0])}`);
+    if (r.ok) info = await r.json();
+  } catch (_) { /* без подробностей */ }
+  if (seq !== INFO.seq || !INFO.open) return;
+  extra.replaceChildren();
+  const mp = info.width && info.height ? `${info.width} × ${info.height} (${(info.width * info.height / 1e6).toFixed(1)} Мп)` : '';
+  if (mp || info.camera) extra.append(infoRows([['Разрешение', mp], ['Камера', info.camera]]));
+  if (info.lat == null) {
+    extra.append(el('h3', null, 'Местоположение'), el('div', 'dim', 'В файле нет координат.'));
+    return;
+  }
+  const lat = info.lat, lon = info.lon;
+  const map = el('div', 'map'), addr = el('div', 'addr', info.address || `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+  const links = el('div', 'links');
+  const ya = el('a', null, 'Яндекс Карты'); ya.href = `https://yandex.ru/maps/?pt=${lon},${lat}&z=16&l=map`;
+  const gm = el('a', null, 'Google Карты'); gm.href = `https://www.google.com/maps?q=${lat},${lon}`;
+  for (const a of [ya, gm]) { a.target = '_blank'; a.rel = 'noopener noreferrer'; links.append(a); }
+  extra.append(el('h3', null, 'Местоположение'), map, addr, links);
+  try {
+    const L = await loadLeaflet();
+    if (seq !== INFO.seq || !INFO.open) return;
+    const m = L.map(map, { zoomControl: true, attributionControl: true }).setView([lat, lon], 15);
+    m.attributionControl.setPrefix(false);
+    // OpenStreetMap просит Referer — отдаём только адрес сайта, без пути
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      { maxZoom: 19, attribution: '© OpenStreetMap', referrerPolicy: 'origin' }).addTo(m);
+    const pin = document.createElement('div'); pin.className = 'map-pin';
+    const im = document.createElement('img'); im.alt = ''; im.src = imgUrl('s', ph); pin.append(im);
+    L.marker([lat, lon], { icon: L.divIcon({ html: pin, className: '', iconSize: [52, 52], iconAnchor: [26, 52] }) }).addTo(m);
+    INFO.map = m;
+    setTimeout(() => m.invalidateSize(), 280);      // панель доехала — пересчитать размер карты
+  } catch (_) {
+    map.replaceWith(el('div', 'dim', 'Карта не загрузилась.'));
+  }
+}
+
+// панель: потянуть вниз от верха — закрыть
+(() => {
+  const p = $('v-info'); let y0 = null;
+  p.addEventListener('touchstart', (e) => { y0 = p.scrollTop <= 0 && e.touches.length === 1 && !e.target.closest('.map') ? e.touches[0].clientY : null; }, { passive: true });
+  p.addEventListener('touchmove', (e) => {
+    if (y0 == null) return;
+    const dy = e.touches[0].clientY - y0;
+    if (dy > 0) p.style.transform = `translateY(${dy}px)`;
+  }, { passive: true });
+  p.addEventListener('touchend', (e) => {
+    if (y0 == null) return;
+    const dy = e.changedTouches[0].clientY - y0; y0 = null; p.style.transform = '';
+    if (dy > 80) closeInfo();
+  }, { passive: true });
+})();
+
 function closeViewer(silent) {
   if ($('viewer').hidden) return;
+  closeInfo(true);
   stopVideo(); stopLive(); resetZoom(false); cancelLoads();
   $('viewer').hidden = true; document.body.style.overflow = ''; resetPane(); pane.style.opacity = '';
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;

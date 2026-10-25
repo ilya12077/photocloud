@@ -23,6 +23,11 @@ SCHEMA = [
          key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime
          ts REAL NOT NULL)              -- дата съёмки, 0 = в файле её нет
        WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS geo (
+         key TEXT PRIMARY KEY,          -- «широта,долгота» с точностью ~10 м
+         addr TEXT NOT NULL,            -- адрес по-русски; '' — не нашёлся
+         ts REAL NOT NULL)
+       WITHOUT ROWID""",
 ]
 
 
@@ -71,3 +76,13 @@ class DB:
         if gone:
             self.many("DELETE FROM dates WHERE key = ?", gone)
         return len(gone)
+
+    # ------------------------------------------------------------ кэш адресов (обратное геокодирование)
+
+    def geo_get(self, key: str) -> str | None:
+        r = self.run("SELECT addr FROM geo WHERE key = ?", (key,))
+        return r[0][0] if r else None
+
+    def geo_put(self, key: str, addr: str) -> None:
+        import time
+        self.run("INSERT OR REPLACE INTO geo(key, addr, ts) VALUES(?, ?, ?)", (key, addr, time.time()))

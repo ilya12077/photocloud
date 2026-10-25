@@ -68,6 +68,7 @@
     <label class="v-origchk" id="v-livewrap" hidden title="Живое фото: проигрывать ролик при открытии"><input type="checkbox" id="v-livechk"> <span class="live-ico" aria-hidden="true"></span>Live</label>
     <label class="v-origchk" id="v-origwrap" hidden title="Смотреть исходный файл без перекодирования (тяжелее для канала)"><input type="checkbox" id="v-origchk"> Оригинал</label>
     <div class="v-meta"><div id="v-name"></div><div id="v-date" class="dim"></div></div>
+    <button id="v-infobtn" class="icon" type="button" aria-label="Подробнее" title="Подробнее (или смахни фото вверх)">ⓘ</button>
     <button id="v-close" class="icon" type="button" aria-label="Закрыть">✕</button>
   </div>
   <div class="v-stage" id="v-stage">
@@ -82,6 +83,10 @@
   </div>
   <button id="v-prev" class="v-nav prev" type="button" aria-label="Предыдущее">‹</button>
   <button id="v-next" class="v-nav next" type="button" aria-label="Следующее">›</button>
+  <section id="v-info" class="v-info" hidden aria-label="Подробнее">
+    <div class="v-info-grip"></div>
+    <div id="v-info-body"></div>
+  </section>
 </div>
 
 </body>
