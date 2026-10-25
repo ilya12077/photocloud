@@ -618,6 +618,7 @@ async def status(s: Session = Depends(require_user)):
         "wake_failed": pc == "down" and bool(PC.wake_at),
         "index": {"state": library.state, "count": view.count, "progress": library.progress,
                   "built_at": int(library.built_at), "v": view.version,
+                  "info": [library.info_done, library.info_total, library.info_state],
                   "meta": [library.meta_done, library.meta_total]},
     }))
 
@@ -645,6 +646,7 @@ async def wake(s: Session = Depends(require_user)):
 async def reindex(_: Session = Depends(require_admin)):
     if not await PC.is_up():
         raise HTTPException(409, "pc down")
+    library.allow_info()           # ручное пересканирование снова разрешает сбор подробностей
     library.start_build(storage, _index_error)
     return no_store(JSONResponse({"ok": True}))
 
@@ -980,11 +982,33 @@ geocoder = geo.Geocoder(db)
 _info_cache: dict = {}
 
 
-def _read_for_info(p) -> bytes:
+HEIC_EXT = (".heic", ".heif")
+
+
+def _info_from_file(p) -> dict:
+    """Подробности без чтения файла целиком: EXIF и размеры почти всегда в начале
+    (JPEG — первые 256 КБ, HEIC — 512 КБ). Только если у HEIC в начале не нашлось ни
+    камеры, ни координат, дочитываем файл — у части программ EXIF лежит в конце."""
     with storage.open(p.rel) as f:
-        if p.ext in (".jpg", ".jpeg"):
-            return f.read(HEAD_BYTES)           # EXIF и размеры — в начале файла
-        return read_limited(f, S.max_decode_mb * 1024 * 1024)
+        head = f.read(512 * 1024 if p.ext in HEIC_EXT else HEAD_BYTES)
+        info = geo.exif_info(head)
+        if p.ext in HEIC_EXT and "camera" not in info and "lat" not in info and p.size > len(head):
+            try:
+                info = geo.exif_info(head + read_limited(f, S.max_decode_mb * 1024 * 1024 - len(head)))
+            except TooLarge:
+                pass
+    return info
+
+
+library.info_reader = _info_from_file      # фоновый сбор подробностей после сканирования
+
+
+@app.post("/api/admin/info/stop", dependencies=[Depends(require_csrf)])
+async def admin_info_stop(request: Request, s: Session = Depends(require_admin)):
+    """Остановить фоновый сбор подробностей; снова — только после ручного пересканирования."""
+    library.stop_info()
+    audit("info_stop", s.user, ip_of(request), "остановлен сбор метаданных")
+    return no_store(JSONResponse({"ok": True}))
 
 
 @app.get("/api/info/{pid}")
@@ -992,21 +1016,22 @@ async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(r
     p = library.get(pid)
     if not visible(s, p):
         raise HTTPException(404)
-    key = (pid, p.mtime, p.size)
+    key = p.cache_key()                     # путь+размер+mtime: файл изменился — прочитаем заново
     info = _info_cache.get(key)
     if info is None:
-        if p.video:
+        saved = await run_in_threadpool(db.info_get, key)       # прочитанное раньше — из базы
+        if saved is not None:
+            info = json.loads(saved)
+        elif p.video:
             info = {}
         else:
             if not await PC.is_up():
                 raise HTTPException(503, "pc")
             try:
-                data = await on_pc(_read_for_info, p, timeout=30)
-            except TooLarge:
-                data = b""
+                info = await on_pc(_info_from_file, p, timeout=30)
             except Exception:  # noqa: BLE001
                 raise HTTPException(503, "pc") from None
-            info = await run_in_threadpool(geo.exif_info, data)
+            await run_in_threadpool(db.info_put, key, json.dumps(info))
         if len(_info_cache) > 5000:
             _info_cache.clear()
         _info_cache[key] = info

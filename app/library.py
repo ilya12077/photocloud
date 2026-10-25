@@ -186,6 +186,12 @@ class Library:
         self.progress = 0
         self.meta_total = 0           # сколько файлов надо дочитать
         self.meta_done = 0
+        # фаза 3: подробности (камера, размеры, GPS) для панели «Подробнее» -> в базу
+        self.info_reader = None       # p -> dict; задаёт main (читает файл с ПК)
+        self.info_total = self.info_done = 0
+        self.info_state = ""          # "" | running | stopped | done
+        self.info_blocked = False     # админ остановил — до ручного пересканирования
+        self._info_stop = threading.Event()
         self.version = ""
         self.by_id: dict[str, Photo] = {}
         self.payload = b"{}"
@@ -330,6 +336,7 @@ class Library:
         todo = [p for p in photos if p.cache_key() not in self.cache.d and meta.needs_scan(p.ext)]
         if not todo:
             self.cache.save(keep={p.cache_key() for p in photos})
+            self._collect_info(storage, photos)
             return
         self.meta_total, self.meta_done = len(todo), 0
         t1 = time.time()
@@ -363,3 +370,71 @@ class Library:
         self._publish(photos, folder_list)
         log.info("даты съёмки: %d файлов за %.1fс, найдено у %d", len(todo), time.time() - t1,
                  sum(1 for p in todo if p.taken))
+        self._collect_info(storage, photos)
+
+    # ------------------------------------------------------------ фаза 3: подробности в базу
+
+    def stop_info(self) -> None:
+        """Админ остановил сбор: до ручного пересканирования папок не продолжаем."""
+        self.info_blocked = True
+        self._info_stop.set()
+
+    def allow_info(self) -> None:
+        self.info_blocked = False
+
+    def _collect_info(self, storage, photos: list[Photo]) -> None:
+        """Камера, размеры и координаты всех фото, которых ещё нет в базе — чтобы панель
+        «Подробнее» открывалась сразу. Фоновые потоки («meta…») уступают эскизам и просмотру."""
+        db, reader = self.cache.db, self.info_reader
+        if reader is None or db is None or self.info_blocked:
+            return
+        keep = {p.cache_key() for p in photos}
+        try:
+            gone = db.info_prune(keep)
+            if gone:
+                log.info("подробности: убрано %d записей об отсутствующих файлах", gone)
+            have = db.info_keys()
+        except Exception as e:  # noqa: BLE001
+            log.warning("подробности: база недоступна (%s)", e)
+            return
+        todo = [p for p in photos if not p.video and p.cache_key() not in have]
+        if not todo:
+            self.info_state = "done"
+            return
+        self._info_stop.clear()
+        self.info_total, self.info_done, self.info_state = len(todo), 0, "running"
+        t0, failures, batch = time.time(), 0, []
+
+        def one(p: Photo):
+            if self._info_stop.is_set():
+                return None
+            return p.cache_key(), json.dumps(reader(p), separators=(",", ":"))
+
+        with ThreadPoolExecutor(self.meta_threads, thread_name_prefix="meta-info") as ex:
+            futs = [ex.submit(one, p) for p in todo]
+            for i, fut in enumerate(as_completed(futs), 1):
+                if self._info_stop.is_set():
+                    for f2 in futs:
+                        f2.cancel()
+                    break
+                try:
+                    r = fut.result()
+                except Exception as e:  # noqa: BLE001 — не прочитали: попробуем в следующий раз
+                    failures += 1
+                    if failures > 50 and failures > i // 2:
+                        log.warning("подробности: слишком много ошибок (%s), прерываю", type(e).__name__)
+                        for f2 in futs:
+                            f2.cancel()
+                        break
+                    continue
+                if r:
+                    batch.append(r)
+                self.info_done = i
+                if len(batch) >= 200:
+                    db.info_put_many(batch)
+                    batch = []
+        db.info_put_many(batch)
+        stopped = self._info_stop.is_set()
+        self.info_state = "stopped" if stopped else "done"
+        log.info("подробности: %d из %d файлов за %.1fс%s", self.info_done, self.info_total,
+                 time.time() - t0, " — остановлено" if stopped else "")

@@ -13,7 +13,7 @@ const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
-  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', session_revoke: 'сессия закрыта',
+  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
 };
 
