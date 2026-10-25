@@ -1210,7 +1210,19 @@ async function fillInfo() {
     return;
   }
   const lat = info.lat, lon = info.lon;
-  const map = el('div', 'map'), addr = el('div', 'addr', info.address || `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+  const coords = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  const map = el('div', 'map'), addr = el('div', 'addr', info.address || coords);
+  if (!info.address_known) {
+    // адрес ещё не известен — карта показывается сразу, адрес подставится, как придёт
+    addr.textContent = coords + ' · ищу адрес…';
+    fetch(`/api/info/${encodeURIComponent(ph[0])}/address`, { credentials: 'same-origin' })
+      .then((r) => (r.ok ? r.json() : {})).catch(() => ({}))
+      .then((j) => {
+        if (seq !== INFO.seq) return;
+        addr.textContent = j.address || coords;
+        if (j.address) { info.address = j.address; info.address_known = true; }   // в кэше сеанса
+      });
+  }
   const links = el('div', 'links');
   const ya = el('a', null, 'Яндекс Карты'); ya.href = `https://yandex.ru/maps/?pt=${lon},${lat}&z=16&l=map`;
   const gm = el('a', null, 'Google Карты'); gm.href = `https://www.google.com/maps?q=${lat},${lon}`;
