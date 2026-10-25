@@ -29,6 +29,7 @@ from starlette.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 
 from . import config
+from . import geo
 from . import logs
 from .db import DB
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
@@ -142,7 +143,8 @@ SEC_HEADERS = [
     (b"cross-origin-resource-policy", b"same-origin"),
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), interest-cohort=()"),
     (b"content-security-policy",
-     b"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
+     b"default-src 'none'; script-src 'self'; style-src 'self'; "
+     b"img-src 'self' blob: data: https://tile.openstreetmap.org; "
      b"media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
 ]
 if S.cookie_secure:
@@ -206,6 +208,7 @@ async def lifespan(_app):
         log.warning("COOKIE_SECURE=false — допустимо только для теста по http://localhost")
     yield
     await ha.close()
+    await geocoder.close()
     if google:
         await google.close()
 
@@ -969,6 +972,48 @@ async def serve_file(request: Request, p, extra: dict) -> Response:
 
     return StreamingResponse(gen(), status_code=status,
                              media_type=CONTENT_TYPES.get(p.ext, "application/octet-stream"), headers=headers)
+
+
+# ---------------------------------------------------------------- «Подробнее»: камера, размеры, место
+
+geocoder = geo.Geocoder(db)
+_info_cache: dict = {}
+
+
+def _read_for_info(p) -> bytes:
+    with storage.open(p.rel) as f:
+        if p.ext in (".jpg", ".jpeg"):
+            return f.read(HEAD_BYTES)           # EXIF и размеры — в начале файла
+        return read_limited(f, S.max_decode_mb * 1024 * 1024)
+
+
+@app.get("/api/info/{pid}")
+async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
+    p = library.get(pid)
+    if not visible(s, p):
+        raise HTTPException(404)
+    key = (pid, p.mtime, p.size)
+    info = _info_cache.get(key)
+    if info is None:
+        if p.video:
+            info = {}
+        else:
+            if not await PC.is_up():
+                raise HTTPException(503, "pc")
+            try:
+                data = await on_pc(_read_for_info, p, timeout=30)
+            except TooLarge:
+                data = b""
+            except Exception:  # noqa: BLE001
+                raise HTTPException(503, "pc") from None
+            info = await run_in_threadpool(geo.exif_info, data)
+        if len(_info_cache) > 5000:
+            _info_cache.clear()
+        _info_cache[key] = info
+    out = dict(info)
+    if "lat" in out:
+        out["address"] = await geocoder.address(out["lat"], out["lon"])
+    return no_store(JSONResponse(out))
 
 
 @app.get("/img/o/{pid}")
