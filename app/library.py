@@ -190,7 +190,6 @@ class Library:
         self.info_reader = None       # p -> dict; задаёт main (читает файл с ПК)
         self.info_total = self.info_done = 0
         self.info_state = ""          # "" | running | stopped | done
-        self.info_blocked = False     # админ остановил — до ручного пересканирования
         self._info_stop = threading.Event()
         self.version = ""
         self.by_id: dict[str, Photo] = {}
@@ -375,18 +374,15 @@ class Library:
     # ------------------------------------------------------------ фаза 3: подробности в базу
 
     def stop_info(self) -> None:
-        """Админ остановил сбор: до ручного пересканирования папок не продолжаем."""
-        self.info_blocked = True
+        """Админ остановил текущий сбор. Следующее сканирование папок (по интервалу
+        или вручную) продолжит с того места — собранное уже лежит в базе."""
         self._info_stop.set()
-
-    def allow_info(self) -> None:
-        self.info_blocked = False
 
     def _collect_info(self, storage, photos: list[Photo]) -> None:
         """Камера, размеры и координаты всех фото, которых ещё нет в базе — чтобы панель
         «Подробнее» открывалась сразу. Фоновые потоки («meta…») уступают эскизам и просмотру."""
         db, reader = self.cache.db, self.info_reader
-        if reader is None or db is None or self.info_blocked:
+        if reader is None or db is None:
             return
         keep = {p.cache_key() for p in photos}
         try:

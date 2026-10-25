@@ -646,7 +646,6 @@ async def wake(s: Session = Depends(require_user)):
 async def reindex(_: Session = Depends(require_admin)):
     if not await PC.is_up():
         raise HTTPException(409, "pc down")
-    library.allow_info()           # ручное пересканирование снова разрешает сбор подробностей
     library.start_build(storage, _index_error)
     return no_store(JSONResponse({"ok": True}))
 
@@ -1005,7 +1004,7 @@ library.info_reader = _info_from_file      # фоновый сбор подро�
 
 @app.post("/api/admin/info/stop", dependencies=[Depends(require_csrf)])
 async def admin_info_stop(request: Request, s: Session = Depends(require_admin)):
-    """Остановить фоновый сбор подробностей; снова — только после ручного пересканирования."""
+    """Остановить текущий фоновый сбор подробностей; следующее сканирование продолжит."""
     library.stop_info()
     audit("info_stop", s.user, ip_of(request), "остановлен сбор метаданных")
     return no_store(JSONResponse({"ok": True}))
