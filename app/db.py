@@ -45,10 +45,21 @@ class DB:
         self.con.execute("PRAGMA synchronous=NORMAL")
         for q in SCHEMA:
             self.con.execute(q)
+        self._migrate()
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
+    def _migrate(self) -> None:
+        ver = self.con.execute("PRAGMA user_version").fetchone()[0]
+        if ver < 1:
+            # до 1.5.5 у JPEG с большими служебными блоками в начале (HONOR/Huawei)
+            # подробности не читались — забываем пустые записи, их соберут заново
+            n = self.con.execute("DELETE FROM info WHERE data NOT LIKE '%\"width\"%'").rowcount
+            if n:
+                log.info("подробности: %d пустых записей будут собраны заново", n)
+            self.con.execute("PRAGMA user_version = 1")
 
     def run(self, sql: str, args=()):
         with self.mu:

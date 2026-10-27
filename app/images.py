@@ -81,6 +81,46 @@ _TRANSPOSE = {2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180,
               5: Image.Transpose.TRANSPOSE, 6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE,
               8: Image.Transpose.ROTATE_90}
 HEAD_BYTES = 256 * 1024          # EXIF и заголовок JPEG почти всегда в первых десятках КБ
+HEAD_MAX = 4 * 1024 * 1024       # но не больше этого: дальше это уже не заголовок
+
+
+def read_head(f, first: int = HEAD_BYTES) -> bytes:
+    """Начало файла, из которого Pillow сможет прочитать размеры и EXIF.
+    Обычно хватает first байт, но у JPEG до начала картинки бывают сотни КБ служебных
+    блоков (HONOR/Huawei кладут ~260 КБ APP6–APP9) — тогда дочитываем по маркерам
+    ровно до начала данных изображения (SOS)."""
+    data = f.read(first)
+    if data[:2] != b"\xff\xd8":
+        return data
+    i = 2
+    while len(data) < HEAD_MAX:
+        if i + 4 > len(data):
+            more = f.read(max(i + 4 - len(data), 64 * 1024))
+            if not more:
+                return data
+            data += more
+            continue
+        if data[i] != 0xFF:
+            return data                       # не похоже на маркер — дальше не разбираем
+        m = data[i + 1]
+        if m == 0xFF:                         # заполнитель
+            i += 1
+            continue
+        if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+            i += 2
+            continue
+        end = i + 2 + int.from_bytes(data[i + 2:i + 4], "big")
+        if m == 0xDA:                          # начало скана — заголовок кончился
+            if end > len(data):
+                data += f.read(end - len(data))
+            return data
+        if end + 4 > len(data):
+            more = f.read(max(end + 4 - len(data), 64 * 1024))
+            if not more:
+                return data
+            data += more
+        i = end
+    return data
 
 
 def _aspect_ok(a: tuple, b: tuple) -> bool:
