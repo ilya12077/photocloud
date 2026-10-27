@@ -34,7 +34,7 @@ from . import logs
 from .db import DB
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
 from .ha import HomeAssistant, clean
-from .images import HEAD_BYTES, LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_limited, render
+from .images import LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_head, read_limited, render
 from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
 from .library import Library, folder_ok
@@ -693,7 +693,7 @@ def _produce(p, box: int, quality: int, tm: dict | None = None) -> bytes:
         with storage.open(p.rel) as f:
             if small and p.ext in (".jpg", ".jpeg"):
                 # сначала только начало файла: по сети это в разы быстрее, чем тянуть все 4–10 МБ
-                head = f.read(HEAD_BYTES)
+                head = read_head(f)
                 tm["read"] = (time.perf_counter() - t) * 1000
                 t1 = time.perf_counter()
                 emb = embedded_jpeg(head, box)
@@ -986,10 +986,10 @@ HEIC_EXT = (".heic", ".heif")
 
 def _info_from_file(p) -> dict:
     """Подробности без чтения файла целиком: EXIF и размеры почти всегда в начале
-    (JPEG — первые 256 КБ, HEIC — 512 КБ). Только если у HEIC в начале не нашлось ни
+    (JPEG — до начала данных картинки, обычно до 256 КБ; HEIC — 512 КБ). Только если у HEIC в начале не нашлось ни
     камеры, ни координат, дочитываем файл — у части программ EXIF лежит в конце."""
     with storage.open(p.rel) as f:
-        head = f.read(512 * 1024 if p.ext in HEIC_EXT else HEAD_BYTES)
+        head = f.read(512 * 1024) if p.ext in HEIC_EXT else read_head(f)
         info = geo.exif_info(head)
         if p.ext in HEIC_EXT and "camera" not in info and "lat" not in info and p.size > len(head):
             try:
