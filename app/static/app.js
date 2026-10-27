@@ -1427,10 +1427,35 @@ stage.addEventListener('wheel', (e) => {
   const mouseWheel = e.deltaMode === 1 || (Math.abs(e.deltaY) >= 40 && e.deltaX === 0);
   if (e.ctrlKey) {                                          // щипок трекпада / Ctrl+колесо
     zoomAt(VZ.s * Math.exp(-e.deltaY * 0.01), fx, fy, false);
-  } else if (mouseWheel) {                                  // колесо мыши: щелчок — ×1.25 к курсору
-    zoomAt(VZ.s * (e.deltaY < 0 ? 1.25 : 0.8), fx, fy, true);
+  } else if (mouseWheel) {
+    // колесо мыши: вверх — увеличить (к курсору); вниз — уменьшить, а без увеличения —
+    // открыть «Подробнее»; вверх при открытой панели — закрыть её
+    if (e.deltaY < 0) { if (INFO.open) closeInfo(); else zoomAt(VZ.s * 1.25, fx, fy, true); }
+    else if (VZ.s > 1.02) zoomAt(VZ.s * 0.8, fx, fy, true);
+    else openInfo();
   } else if (VZ.s > 1) {                                    // прокрутка тачпадом двигает увеличенную картинку
     VZ.tx -= e.deltaX; VZ.ty -= e.deltaY; clampPan(); applyZoom(false);
+  } else {
+    // тачпад без увеличения: прокрутка вниз — открыть «Подробнее», вверх — закрыть
+    wheelInfo(e.deltaY);
+  }
+}, { passive: false });
+
+// накапливаем мелкие шаги тачпада: один жест — одно действие
+let wheelAcc = 0, wheelT = 0, wheelLock = 0;
+function wheelInfo(dy) {
+  if (Date.now() < wheelLock) return;
+  clearTimeout(wheelT); wheelT = setTimeout(() => { wheelAcc = 0; }, 250);
+  wheelAcc += dy;
+  if (wheelAcc > 60 && !INFO.open) { openInfo(); wheelAcc = 0; wheelLock = Date.now() + 500; }
+  else if (wheelAcc < -60 && INFO.open) { closeInfo(); wheelAcc = 0; wheelLock = Date.now() + 500; }
+}
+// на самой панели: прокрутка вверх, когда она уже в самом верху, — закрыть
+$('v-info').addEventListener('wheel', (e) => {
+  if (e.deltaY < 0 && $('v-info').scrollTop <= 0 && !e.target.closest('.map')) {
+    e.preventDefault();
+    if (e.deltaMode === 1 || Math.abs(e.deltaY) >= 40) { if (Date.now() >= wheelLock) { closeInfo(); wheelLock = Date.now() + 500; } }
+    else wheelInfo(e.deltaY);
   }
 }, { passive: false });
 stage.addEventListener('pointerdown', (e) => {
