@@ -29,7 +29,14 @@ from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.2.0"
+def _version() -> str:
+    try:
+        return (Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "dev"
+
+
+VERSION = _version()          # файл backup/VERSION — по нему же клиент ищет обновления на GitHub
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"

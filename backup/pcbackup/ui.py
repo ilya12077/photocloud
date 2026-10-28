@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 import httpx
 from PIL import Image, ImageDraw
 
-from . import winutil
+from . import updater, winutil
 from .engine import VERSION, Api, AuthError, PcOff, human
 
 COLORS = {"copying": "#2f80ed", "done": "#27ae60", "paused": "#9aa0a6", "pc_off": "#f2994a", "waiting": "#2f80ed",
@@ -88,6 +88,8 @@ class App:
         if start_hidden and configured and cfg.hide_on_autostart and not getattr(self, "_no_pystray", False):
             self.root.withdraw()
         self.root.after(300, self.tick)
+        self._offered: set[str] = set()
+        self.root.after(30_000, self._auto_update)          # через полминуты после запуска, потом раз в 6 ч
 
     def _tk_error(self, exc, val, tb) -> None:
         import logging
@@ -177,6 +179,9 @@ class App:
         self.v_auto = tk.BooleanVar(value=self.cfg.autostart)
         self.v_hide = tk.BooleanVar(value=self.cfg.hide_on_autostart)
         self.v_wake = tk.BooleanVar(value=self.cfg.wake_on_start)
+        self.v_upd = tk.BooleanVar(value=self.cfg.check_updates)
+        self.v_branch = tk.StringVar(value=self.cfg.update_branch)
+        self.v_updmsg = tk.StringVar()
         self.v_free = tk.StringVar(value=self._fmt_limit(self.cfg.min_free_gb))
         self.v_test = tk.StringVar()
         r = 0
@@ -210,6 +215,19 @@ class App:
         r += 1
         ttk.Checkbutton(s, text="Будить домашний компьютер при запуске", variable=self.v_wake).grid(
             row=r, column=1, columnspan=2, sticky="w", padx=12, pady=2)
+        r += 1
+        ttk.Checkbutton(s, text="Проверять обновления на GitHub и предлагать обновиться", variable=self.v_upd).grid(
+            row=r, column=1, columnspan=2, sticky="w", padx=12, pady=2)
+        r += 1
+        ttk.Label(s, text="Ветка обновлений:").grid(row=r, column=0, sticky="w", padx=12, pady=4)
+        ub = ttk.Frame(s)
+        ub.grid(row=r, column=1, columnspan=2, sticky="w", padx=12, pady=4)
+        ttk.Entry(ub, textvariable=self.v_branch, width=18).pack(side="left")
+        ttk.Label(ub, text=f"пусто — {updater.default_branch()}", foreground="#666").pack(side="left", padx=6)
+        ttk.Button(ub, text="Проверить обновления", command=lambda: self.check_update(manual=True)).pack(side="left")
+        r += 1
+        ttk.Label(s, textvariable=self.v_updmsg, foreground="#666", wraplength=560).grid(
+            row=r, column=1, columnspan=2, sticky="w", padx=12)
         r += 1
         b = ttk.Frame(s)
         b.grid(row=r, column=1, columnspan=2, sticky="w", padx=12, pady=12)
@@ -305,6 +323,8 @@ class App:
             self.cfg.token = tok
         self.cfg.autostart, self.cfg.wake_on_start = self.v_auto.get(), self.v_wake.get()
         self.cfg.hide_on_autostart = self.v_hide.get()
+        self.cfg.check_updates = self.v_upd.get()
+        self.cfg.update_branch = self.v_branch.get().strip()
         self.cfg.min_free_gb = free_gb
         try:
             self.cfg.save()
@@ -322,6 +342,82 @@ class App:
         self.engine.reconfigure()
         self.v_test.set("Сохранено.")
         self.test_conn()
+
+    # ------------------------------------------------------------ обновления
+
+    def _branch(self) -> str:
+        return (self.cfg.update_branch or "").strip() or updater.default_branch()
+
+    def _auto_update(self) -> None:
+        if self.cfg.check_updates:
+            self.check_update(manual=False)
+        self.root.after(6 * 3600 * 1000, self._auto_update)
+
+    def check_update(self, manual: bool) -> None:
+        branch = self._branch()
+        if manual:
+            self.v_updmsg.set(f"Проверяю ветку {branch}…")
+
+        def run():
+            try:
+                remote = updater.remote_version(branch)
+                err = ""
+            except httpx.HTTPError as e:
+                remote, err = None, type(e).__name__
+            self.q.put(lambda: self._update_found(branch, remote, err, manual))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_found(self, branch: str, remote: str | None, err: str, manual: bool) -> None:
+        cur = updater.local_version()
+        if err:
+            self.v_updmsg.set(f"Не удалось проверить обновления: {err}")
+            return
+        if remote is None:
+            self.v_updmsg.set(f"В ветке {branch} нет клиента бэкапа (или GitHub недоступен).")
+            return
+        if not updater.newer(remote):
+            self.v_updmsg.set(f"Установлена последняя версия {cur} (ветка {branch}).")
+            return
+        self.v_updmsg.set(f"Доступна версия {remote} (сейчас {cur}).")
+        if remote in self._offered and not manual:
+            return                                       # уже предлагали — не надоедаем до следующего запуска
+        self._offered.add(remote)
+        self.show()
+        if messagebox.askyesno("Photocloud — бэкап", f"Доступно обновление клиента: {remote} (сейчас {cur}).\n\n"
+                               "Обновить сейчас? Программа перезапустится, копирование продолжится с того же места.",
+                               parent=self.root):
+            self.update_now(branch)
+
+    def update_now(self, branch: str) -> None:
+        self.v_updmsg.set("Скачиваю обновление…")
+        hidden = self.root.state() == "withdrawn"
+
+        def run():
+            try:
+                new = updater.apply(branch)
+                self.q.put(lambda: self._restart(new, hidden))
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger("pcbackup").exception("обновление не удалось")
+                msg = f"{type(e).__name__}: {e}"
+                self.q.put(lambda: (self.v_updmsg.set(f"Обновление не удалось: {msg}"),
+                                    messagebox.showerror("Бэкап", f"Обновление не удалось:\n{msg}", parent=self.root)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _restart(self, new: str, hidden: bool) -> None:
+        import logging
+        logging.getLogger("pcbackup").info("перезапуск после обновления до %s", new)
+        self.engine.shutdown()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.engine.join(10)
+        updater.restart(hidden)
+        self.root.destroy()
 
     def test_conn(self) -> None:
         srv = self._server()
