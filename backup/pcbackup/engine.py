@@ -28,7 +28,7 @@ from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"
@@ -36,6 +36,7 @@ CHUNK = 256 * 1024
 PASS_MAX = 15 * 60          # с: проход не дольше — потом свежий список (досчитались новые хеши)
 IDLE_EVERY = 10 * 60        # с: всё скопировано — проверять новое так часто
 PC_OFF_EVERY = 60           # с: ПК выключен — проверять так часто
+DISK_EVERY = 10             # с: мало места — так часто смотреть, не освободилось ли
 REPORT_EVERY = 5 * 60       # с: отчёт серверу во время копирования
 DELETE_SUSPICIOUS = (100, 0.05)   # больше стольких И больше такой доли — ждём подтверждения
 IS_WIN = sys.platform == "win32"
@@ -47,6 +48,12 @@ class Stop(Exception):
 
 class PcOff(Exception):
     pass
+
+
+class DiskFull(Exception):
+    def __init__(self, free: int, keep: int, need: int):
+        super().__init__(f"свободно {human(free)}, порог {human(keep)}")
+        self.free, self.keep, self.need = free, keep, need
 
 
 class AuthError(Exception):
@@ -298,6 +305,8 @@ class Engine(threading.Thread):
                 self._loop_once()
             except Stop:
                 pass
+            except DiskFull as e:
+                self._disk_full(e)
             except AuthError as e:
                 self._set(state="error", text=str(e), detail="Проверьте токен в настройках")
                 self._note(str(e), "error")
@@ -311,6 +320,26 @@ class Engine(threading.Thread):
                 self._note(f"ошибка: {type(e).__name__}: {e}", "error")
                 self._sleep(120)
         self._close()
+
+    def _disk_full(self, e: "DiskFull") -> None:
+        """Места мало: раз в 10 с смотрим диск (без запросов к серверу). Как только места хватает
+        на файл, который не влез, или поменяли порог в настройках — продолжаем."""
+        self._note(f"мало места на диске ({e}) — новые файлы не скачиваю", "error")
+        self._report("disk_full", f"мало места: {e}")
+        self._want_sync = False                   # «Проверить сейчас» — заново проверить и место тоже
+        while not (self.quit or self._reload or self.cfg.paused or self._want_sync):
+            keep = int(max(0.0, float(self.cfg.min_free_gb or 0)) * 2**30)
+            try:
+                free = shutil.disk_usage(str(self.root)).free
+            except OSError:
+                free = 0
+            if free - e.need >= keep:
+                self._note(f"место освободилось ({human(free)}) — продолжаю")
+                return
+            self._set(state="disk_full", text="Мало места на диске", current="", speed=0.0,
+                      detail=f"Свободно {human(free)}, а оставлять нужно {human(keep)}. Новые файлы не "
+                             f"скачиваются — освободите место или уменьшите порог в настройках.")
+            self._sleep(DISK_EVERY)
 
     def _close(self) -> None:
         if self.api:
@@ -423,7 +452,7 @@ class Engine(threading.Thread):
                 self._set(state="pc_off", text="Компьютер выключен", current="", speed=0.0)
                 self._report("pc_off")
                 return False
-            except (Stop, AuthError):
+            except (Stop, AuthError, DiskFull):
                 raise
             except httpx.HTTPError as e:
                 self._error(p, f"сеть: {type(e).__name__}")
@@ -541,8 +570,16 @@ class Engine(threading.Thread):
         self._note("перенесён", "move", f"{src} → {rel}")
         self._prune_dirs(a.parent)
 
+    def _space(self, need: int) -> None:
+        """Перед записью нового файла: после него на диске должно остаться не меньше порога."""
+        keep = int(max(0.0, float(self.cfg.min_free_gb or 0)) * 2**30)
+        free = shutil.disk_usage(str(self.root)).free
+        if free - need < keep:
+            raise DiskFull(free, keep, need)
+
     def _copy_local(self, src: str, f) -> None:
         rel = f[0]
+        self._space(f[1])
         b = self._arch(rel)
         os.makedirs(lp(b.parent), exist_ok=True)
         if os.path.exists(lp(b)):
@@ -605,6 +642,7 @@ class Engine(threading.Thread):
         if have > size:
             os.remove(lp(tmp))
             have = 0
+        self._space(size - have)
         self._set(current=rel, cur_done=have, cur_size=size)
         if have < size:
             self._fetch(rel, tmp, have, size)
@@ -703,7 +741,7 @@ class Engine(threading.Thread):
 
     # ------------------------------------------------------------ отчёт серверу
 
-    def _report(self, state: str) -> None:
+    def _report(self, state: str, error: str = "") -> None:
         if not self.api:
             return
         self._last_report = time.monotonic()
@@ -711,4 +749,4 @@ class Engine(threading.Thread):
         self.api.report({"state": state, "client": f"photocloud-backup {VERSION}", "files": s["files"],
                          "bytes": s["bytes"], "left_files": s["left_files"], "left_bytes": s["left_bytes"],
                          "copied": s["copied"], "copied_bytes": s["copied_bytes"], "errors": s["errors"],
-                         "pending_delete": s["pending_delete"]})
+                         "pending_delete": s["pending_delete"], **({"error": error} if error else {})})

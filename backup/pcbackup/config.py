@@ -64,7 +64,7 @@ else:                                      # для проверки на Linux:
 
 
 class Config:
-    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart")
+    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart", "min_free_gb")
 
     def __init__(self, path: Path | None = None):
         self.path = path or app_dir() / "config.json"
@@ -72,6 +72,7 @@ class Config:
         self.token = ""
         self.root = ""
         self.limit_mbps = 0.0
+        self.min_free_gb = 10.0           # меньше стольких ГБ свободно на диске — новые файлы не скачиваем
         self.paused = False
         self.wake_on_start = True
         self.autostart = True
