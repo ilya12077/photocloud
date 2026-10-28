@@ -321,21 +321,26 @@ function verifyText(v) {
   if (v.since) return `продолжится, когда ПК включится${bad}`;
   return v.last ? `последняя ${dday(v.last)}, следующая ${dday(v.next)}${bad}` : 'ещё не было';
 }
+function plural(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+}
 function ago(ts) {
   if (!ts) return 'ещё не было';
-  const s = Math.max(0, Date.now() / 1000 - ts);
-  if (s < 120) return 'только что';
-  if (s < 7200) return Math.round(s / 60) + ' мин назад';
-  if (s < 172800) return Math.round(s / 3600) + ' ч назад';
-  return Math.round(s / 86400) + ' дн назад';
+  const s = Math.max(1, Math.round(Date.now() / 1000 - ts));
+  if (s < 60) return `${s} ${plural(s, 'секунду', 'секунды', 'секунд')} назад`;
+  if (s < 3600) { const m = Math.floor(s / 60); return `${m} ${plural(m, 'минуту', 'минуты', 'минут')} назад`; }
+  if (s < 172800) { const h = Math.floor(s / 3600); return `${h} ${plural(h, 'час', 'часа', 'часов')} назад`; }
+  const d = Math.floor(s / 86400); return `${d} ${plural(d, 'день', 'дня', 'дней')} назад`;
 }
+// «N секунд назад» идёт каждую секунду — без перезапроса и перерисовки таблицы
+setInterval(() => { for (const e of document.querySelectorAll('[data-ago]')) e.textContent = ago(+e.dataset.ago); }, 1000);
 const BK_STATE = { copying: 'копирует', disk_full: 'мало места на диске', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
 
 const mbs = (b) => (b >= 1048576 ? (b / 1048576).toFixed(1).replace('.', ',') + ' МБ/с' : Math.round(b / 1024) + ' КБ/с');
 async function loadBackup() {
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
-  // «на связи N мин назад» тоже должно идти, поэтому сравниваем с точностью до минуты
-  if (unchanged('backup', { ...r, now: Math.floor(Date.now() / 60000) })) return;
+    if (unchanged('backup', r)) return;
   const v = r.verify;
   const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Проверка хешей', verifyText(v)], ['Клиентов', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
@@ -381,6 +386,7 @@ async function loadBackup() {
     if (rp.errors) st.append(el('div', 'dim2', `ошибок: ${rp.errors}`));
     if (rp.error) st.append(el('div', 'err', rp.error));
     const seen = el('td', null, ago(t.last_seen)); if (t.last_ip) seen.title = t.last_ip;
+    if (t.last_seen) seen.dataset.ago = t.last_seen;
     tr.append(el('td', null, t.name), el('td', 'mono', t.user), seen, el('td', null, copied), el('td', null, left), st, el('td', null, dt(t.created)), ops);
     return tr;
   }));
