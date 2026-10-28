@@ -264,7 +264,3 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .bk-new { margin-top: 12px; padding: 12px; border: 1px solid var(--line, #444); border-radius: 10px; }
 .bk-new input { flex: 1; min-width: 0; }
 .bk-cur { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bk-sec { margin: 18px 0 6px; }
-.bk-sec h4 { margin: 0 0 4px; font-size: 15px; }
-.bk-sec p { margin: 4px 0; }
-.bk-sec .actions { margin-top: 8px; }
