@@ -301,7 +301,7 @@ async function loadBackup() {
   const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Клиентов', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
   $('bk-hash-stop').hidden = r.hashes.state !== 'running';
-  $('bk-hash-start').hidden = r.hashes.state === 'running' || !r.tokens.length;
+  $('bk-hash-start').hidden = !r.tokens.length || !['stopped', 'error', ''].includes(r.hashes.state);
   const sel = $('bk-user'); const cur = sel.value;
   sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
   if (cur && r.users.includes(cur)) sel.value = cur;
