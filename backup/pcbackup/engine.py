@@ -28,14 +28,15 @@ from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"
 CHUNK = 256 * 1024
 PASS_MAX = 15 * 60          # с: проход не дольше — потом свежий список (досчитались новые хеши)
-IDLE_EVERY = 10 * 60        # с: всё скопировано — проверять новое так часто
-PC_OFF_EVERY = 60           # с: ПК выключен — проверять так часто
+IDLE_EVERY = 10             # с: всё скопировано — спрашивать сервер о новом так часто
+PC_OFF_EVERY = 10           # с: ПК выключен — проверять так часто
+LOCAL_EVERY = 10 * 60       # с: сверять папку бэкапа с базой (на месте ли файлы) не чаще
 DISK_EVERY = 10             # с: мало места — так часто смотреть, не освободилось ли
 REPORT_EVERY = 5 * 60       # с: отчёт серверу во время копирования
 DELETE_SUSPICIOUS = (100, 0.05)   # больше стольких И больше такой доли — ждём подтверждения
@@ -238,6 +239,9 @@ class Engine(threading.Thread):
         self._woke = False
         self._speed_t, self._speed_b = time.monotonic(), 0
         self._last_report = 0.0
+        self._reported = ""                    # состояние из последнего отчёта
+        self._checked_local = 0.0              # когда последний раз проверяли папку бэкапа
+        self._idle = False                     # прошлый проход всё сделал — ждём новое
         self._manifest = None
         self._etag = None
 
@@ -388,6 +392,7 @@ class Engine(threading.Thread):
             waking = st["pc"] == "waking"
             self._set(state="pc_off", text="Компьютер просыпается…" if waking else "Компьютер выключен",
                       detail="Копирование продолжится, когда он включится", current="", speed=0.0)
+            self._report("pc_off")
             self._sleep(15 if waking else PC_OFF_EVERY)
             return
         self._woke = True              # ПК уже включён — будить при запуске не нужно
@@ -413,11 +418,19 @@ class Engine(threading.Thread):
     # ------------------------------------------------------------ проход
 
     def _pass(self) -> bool:
-        """True — всё, что можно, сделано (дальше ждём новое); False — проход прерван по времени."""
+        """True — всё, что можно, сделано (дальше ждём новое); False — сразу следующий проход
+        (прервали по времени, выключился ПК, обрыв связи)."""
         m, etag = self.api.manifest(self._etag)
+        if m is None and self._idle and time.monotonic() - self._checked_local < LOCAL_EVERY:
+            # на сервере ничего не поменялось, у нас всё скопировано — проверять нечего
+            self._set(detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
+            self._report(self.st["state"])
+            return True
         if m is not None:
             self._manifest, self._etag = m, etag
         m = self._manifest
+        self._idle = False
+        self._checked_local = time.monotonic()
         files = {f[0]: f for f in m["files"]}            # путь -> [путь, размер, mtime, дата, sha]
         local = self._verify_local(self.db.files())
         plan = self._plan(files, local)
@@ -461,8 +474,7 @@ class Engine(threading.Thread):
                 self._error(p, f"{type(e).__name__}: {e}")
             self._set(have_files=self.st["have_files"] + 1, have_bytes=self.st["have_bytes"] + f[1],
                       left_files=left_files, left_bytes=left_b)
-            if time.monotonic() - self._last_report > REPORT_EVERY:
-                self._report("copying")
+            self._report("copying")
             if time.monotonic() - t0 > PASS_MAX:
                 return False                       # свежий список: могли досчитаться новые хеши
         self._set(current="", speed=0.0, last_ok=time.time())
@@ -473,9 +485,10 @@ class Engine(threading.Thread):
             pass                                   # ждём «Подтвердить» — состояние уже выставлено
         else:
             self._set(state="done", text="Всё скопировано",
-                      detail=f"Проверено в {time.strftime('%H:%M')}. Новое проверяется каждые {IDLE_EVERY // 60} мин.")
+                      detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
         self._report(self.st["state"])
-        return not waiting
+        self._idle = not waiting and not self.st.get("pending_delete")
+        return True                              # подождать IDLE_EVERY (и когда ждём хеши — тоже)
 
     def _plan(self, files: dict, local: dict):
         missing = {p: v for p, v in local.items() if p not in files}
@@ -742,8 +755,12 @@ class Engine(threading.Thread):
     # ------------------------------------------------------------ отчёт серверу
 
     def _report(self, state: str, error: str = "") -> None:
+        """Отчёт серверу — при смене состояния или раз в 5 минут, а не на каждый опрос."""
         if not self.api:
             return
+        if state == self._reported and not error and time.monotonic() - self._last_report < REPORT_EVERY:
+            return
+        self._reported = state
         self._last_report = time.monotonic()
         s = self.snapshot()
         self.api.report({"state": state, "client": f"photocloud-backup {VERSION}", "files": s["files"],
