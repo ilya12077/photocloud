@@ -9,3 +9,4 @@ __pycache__/
 
 # журнал клиента бэкапа
 backup/backup.log*
+backup/*.new
