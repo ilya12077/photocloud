@@ -608,6 +608,8 @@ async def _pc_watch() -> None:
             log.exception("фоновая проверка компьютера")
         try:
             _backup_stale_check()
+            if PC.up:
+                await run_in_threadpool(_verify_tick)
         except Exception:  # noqa: BLE001
             log.exception("проверка клиентов бэкапа")
         await asyncio.sleep(5 if PC.wake_at else 15)     # пока ждём включения — чаще
@@ -1119,6 +1121,56 @@ def _hash_file(p, stop) -> str | None:
 
 library.hash_reader = _hash_file
 
+VERIFY_EVERY = 30 * 86400        # полная сверка хешей с файлами — раз в 30 дней
+_verify_checked = 0.0
+
+
+def _hash_mismatch(p, old: str, new: str) -> None:
+    db.kv_set("hash_gen", int(db.kv_get("hash_gen") or 0) + 1)   # список для клиентов поменялся
+    audit("hash_mismatch", "", "", f"{p.rel}: {old[:12]}… → {new[:12]}…")
+    loop.call_soon_threadsafe(bg, ha.notify(
+        "hash_mismatch", f"Проверка хешей: «{clean(p.rel, 120)}» изменился без смены размера и даты "
+                         f"(порча диска на компьютере или программа, сохраняющая дату). Счётчик — в админке.",
+        dedupe_s=3600, key="hash_mismatch"))
+
+
+library.on_mismatch = _hash_mismatch
+
+
+def _verify_info() -> dict:
+    last, since = db.kv_get("verify_last"), db.kv_get("verify_since")
+    return {"state": library.verify_state, "done": library.verify_done, "total": library.verify_total,
+            "bytes_done": library.verify_bytes_done, "bytes_total": library.verify_bytes_total,
+            "bad": library.verify_bad if library.verify_state else int(db.kv_get("verify_last_bad") or 0),
+            "last": int(float(last)) if last else 0,
+            "since": int(float(since)) if since else 0, "paused": db.kv_get("verify_paused") == "1",
+            "next": int(float(last)) + VERIFY_EVERY if last else 0}
+
+
+def _verify_tick() -> None:
+    """Раз в минуту, пока ПК включён: начать проверку, если прошёл месяц, продолжить прерванную,
+    отметить завершённую. Отметки — в базе (kv): verify_last, verify_since, verify_paused."""
+    global _verify_checked
+    now = time.time()
+    if now - _verify_checked < 60 or not tokens.any() or library.state != "ready" or library.hash_busy():
+        return
+    _verify_checked = now
+    last, since = db.kv_get("verify_last"), db.kv_get("verify_since")
+    if last is None:
+        db.kv_set("verify_last", now)       # хеши только что посчитаны — первая сверка через месяц
+        return
+    if since and library.verify_state == "done":
+        db.kv_set("verify_last", now)
+        db.kv_set("verify_since", None)
+        db.kv_set("verify_last_bad", library.verify_bad)
+        audit("hash_verify_done", "", "", f"проверено {library.verify_done}, не совпало {library.verify_bad}")
+        return
+    if since is None and now - float(last) >= VERIFY_EVERY:
+        since = str(now)
+        db.kv_set("verify_since", since)
+    if since and db.kv_get("verify_paused") != "1":
+        library.start_verify(storage, float(since))
+
 
 def _hash_progress() -> dict:
     return {"state": library.hash_state, "done": library.hash_done, "total": library.hash_total,
@@ -1208,8 +1260,9 @@ async def backup_manifest(request: Request, t=Depends(require_backup)):
     access = _token_access(t)
     # клиенты спрашивают раз в 10 с: «ничего не поменялось» отвечаем без чтения всех хешей
     n_hashes = await run_in_threadpool(db.hashes_count)
+    gen = await run_in_threadpool(db.kv_get, "hash_gen")       # растёт, когда проверка нашла изменённый файл
     ver = library.version
-    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{access!r}|{library.skipped}".encode(), digest_size=10).hexdigest()
+    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{gen}|{access!r}|{library.skipped}".encode(), digest_size=10).hexdigest()
     etag = f'"{tag}"'
     if ver and request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"etag": etag, "cache-control": "no-store"})
@@ -1311,7 +1364,7 @@ async def backup_file(request: Request, path: str = "", z: int = 0, start: int =
 
 _REPORT_NUM = ("files", "bytes", "copied", "copied_bytes", "left_files", "left_bytes", "moved",
                "versions", "deleted", "errors", "pending_delete", "speed", "cur_done", "cur_size",
-               "wire_bytes", "raw_bytes", "limit_mbps")
+               "wire_bytes", "raw_bytes", "limit_mbps", "verify_last", "verify_done", "verify_total", "verify_bad")
 
 
 @app.post("/api/backup/report")
@@ -1332,6 +1385,7 @@ async def backup_report(request: Request, t=Depends(require_backup)):
 @app.get("/api/admin/backup")
 async def admin_backup(_: Session = Depends(require_admin)):
     return no_store(JSONResponse({"tokens": tokens.list(), "hashes": _hash_progress(),
+                                  "verify": await run_in_threadpool(_verify_info),
                                   "hashed": await run_in_threadpool(db.hashes_count),
                                   "users": [u["user"] for u in users.list()]}))
 
@@ -1369,6 +1423,31 @@ async def admin_backup_token_revoke(request: Request, tid: str, s: Session = Dep
 async def admin_backup_hashes_stop(request: Request, s: Session = Depends(require_admin)):
     library.stop_hashes()
     audit("hash_stop", s.user, ip_of(request), "остановлен подсчёт хешей")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/backup/verify/start", dependencies=[Depends(require_csrf)])
+async def admin_backup_verify_start(request: Request, s: Session = Depends(require_admin)):
+    """Проверить хеши всех файлов: продолжить начатую проверку или начать новую."""
+    if not await PC.is_up():
+        raise HTTPException(409, "pc down")
+    if library.hash_busy():
+        return _bad("сейчас уже считаются хеши — подожди окончания или останови")
+    since = await run_in_threadpool(db.kv_get, "verify_since")
+    if not since:
+        since = str(time.time())
+        await run_in_threadpool(db.kv_set, "verify_since", since)
+    await run_in_threadpool(db.kv_set, "verify_paused", None)
+    ok = library.start_verify(storage, float(since))
+    audit("hash_verify", s.user, ip_of(request), "запущена проверка хешей")
+    return no_store(JSONResponse({"ok": ok}))
+
+
+@app.post("/api/admin/backup/verify/stop", dependencies=[Depends(require_csrf)])
+async def admin_backup_verify_stop(request: Request, s: Session = Depends(require_admin)):
+    await run_in_threadpool(db.kv_set, "verify_paused", "1")    # сама не продолжится, только по кнопке
+    library.stop_hashes()
+    audit("hash_stop", s.user, ip_of(request), "остановлена проверка хешей")
     return no_store(JSONResponse({"ok": True}))
 
 

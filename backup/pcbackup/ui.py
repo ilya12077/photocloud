@@ -85,7 +85,7 @@ class App:
         if getattr(cfg, "load_error", ""):
             self.root.after(500, lambda: messagebox.showwarning(
                 "Бэкап", f"Настройки не прочитались: {cfg.load_error}\nФайл: {cfg.path}", parent=self.root))
-        if start_hidden and configured and cfg.hide_on_autostart:
+        if start_hidden and configured and cfg.hide_on_autostart and not getattr(self, "_no_pystray", False):
             self.root.withdraw()
         self.root.after(300, self.tick)
 
@@ -117,6 +117,7 @@ class App:
         self.v_counts = tk.StringVar()
         self.v_current = tk.StringVar()
         self.v_speed = tk.StringVar()
+        self.v_verify = tk.StringVar()
         ttk.Label(t, textvariable=self.v_state, font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=12, pady=(12, 0))
         ttk.Label(t, textvariable=self.v_detail, foreground="#666", wraplength=640).pack(anchor="w", **pad)
         self.bar = ttk.Progressbar(t, maximum=1000)
@@ -124,6 +125,7 @@ class App:
         ttk.Label(t, textvariable=self.v_counts).pack(anchor="w", **pad)
         ttk.Label(t, textvariable=self.v_current, foreground="#666", wraplength=640).pack(anchor="w", **pad)
         ttk.Label(t, textvariable=self.v_speed).pack(anchor="w", **pad)
+        ttk.Label(t, textvariable=self.v_verify, foreground="#666", wraplength=600).pack(anchor="w", **pad)
 
         self.confirm = ttk.Frame(t)
         ttk.Label(self.confirm, text="Файлы уберутся в папку «Удалённые» внутри бэкапа — ничего не стирается.",
@@ -137,6 +139,7 @@ class App:
         ttk.Button(row, text="Проверить сейчас", command=self.engine.sync_now).pack(side="left", padx=6)
         ttk.Button(row, text="Разбудить ПК", command=self.engine.wake_now).pack(side="left")
         ttk.Button(row, text="Открыть папку", command=self.open_root).pack(side="right")
+        ttk.Button(row, text="Проверить копии", command=self.engine.verify_now).pack(side="right", padx=6)
 
         lim = ttk.Frame(t)
         lim.pack(fill="x", padx=12, pady=4, side="bottom")
@@ -363,7 +366,13 @@ class App:
 
     def hide(self) -> None:
         """Крестик — окно прячется совсем (и из панели задач); программа остаётся значком в трее.
-        Если значок вдруг не поднялся, окно снова открывается повторным запуском программы."""
+        Значка нет (pystray не установлен) — прятать некуда: спрашиваем и закрываем программу."""
+        if getattr(self, "_no_pystray", False):
+            if messagebox.askyesno("Бэкап", "Значка в трее нет (не установлена библиотека pystray), поэтому "
+                                   "свернуть в трей нельзя. Закрыть программу? Копирование остановится.",
+                                   parent=self.root):
+                self.quit()
+            return
         self.root.withdraw()
 
     def quit(self) -> None:
@@ -388,8 +397,12 @@ class App:
             import pystray
         except ImportError:
             import logging
-            logging.getLogger("pcbackup").error("нет библиотеки pystray — значка в трее не будет")
+            logging.getLogger("pcbackup").error("нет библиотеки pystray (python: %s) — значка в трее не будет",
+                                                sys.executable)
+            self._no_pystray = True
+            self.root.after(800, self._offer_pystray)
             return
+        self._no_pystray = False
         call = lambda fn: (lambda *_a: self.q.put(fn))        # noqa: E731 — из потока трея в поток окна
         self._tray_status = "Photocloud — бэкап"
         self._tray_menu = pystray.Menu(
@@ -400,6 +413,7 @@ class App:
                              call(self.toggle_pause)),
             pystray.MenuItem("Проверить сейчас", call(self.engine.sync_now)),
             pystray.MenuItem("Разбудить домашний ПК", call(self.engine.wake_now)),
+            pystray.MenuItem("Проверить копии", call(self.engine.verify_now)),
             pystray.MenuItem("Открыть папку бэкапа", call(self.open_root)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", call(self.quit)),
@@ -423,6 +437,43 @@ class App:
             self._tray_cls = base
         self._tray_attempt = 0
         self._launch_tray()
+
+    def _offer_pystray(self) -> None:
+        """pystray не установлен в тот Python, которым запущена программа (часто — другой venv):
+        предлагаем поставить прямо отсюда, тем же интерпретатором."""
+        import subprocess
+        self.show()
+        cmd = [sys.executable, "-m", "pip", "install", "pystray"]
+        if not messagebox.askyesno(
+                "Бэкап", "Для значка в трее нужна библиотека pystray, а в этом Python её нет:\n"
+                         f"{sys.executable}\n\nУстановить сейчас?", parent=self.root):
+            return
+
+        def run():
+            import logging
+            lg = logging.getLogger("pcbackup")
+            flags = 0x08000000 if sys.platform == "win32" else 0        # CREATE_NO_WINDOW
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=flags)
+                ok = r.returncode == 0
+                lg.info("pip install pystray: %s\n%s", r.returncode, (r.stdout + r.stderr)[-2000:])
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                lg.error("pip install pystray: %s", e)
+
+            def done():
+                if ok:
+                    import importlib
+                    importlib.invalidate_caches()
+                    self._start_tray()
+                    if not self._no_pystray:
+                        messagebox.showinfo("Бэкап", "Готово — значок появился в трее.", parent=self.root)
+                        return
+                messagebox.showerror("Бэкап", "Не получилось установить pystray. Выполните в командной строке:\n"
+                                     + " ".join(f'"{c}"' if " " in c else c for c in cmd), parent=self.root)
+            self.q.put(done)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _launch_tray(self) -> None:
         """Не поднялся (бывает при автозапуске, пока панель задач ещё не готова) — снова через 15 с."""
@@ -507,6 +558,14 @@ class App:
         else:
             self.confirm.pack_forget()
         self.b_pause.configure(text="Продолжить" if s["paused"] else "Пауза")
+        day = lambda ts: time.strftime("%d.%m.%Y", time.localtime(ts)) if ts else "—"     # noqa: E731
+        bad = f" · повреждено и скачивается заново: {s['verify_bad']}" if s["verify_bad"] else ""
+        if s["verifying"]:
+            self.v_verify.set(f"Проверка копий: {num(s['verify_done'])} из {num(s['verify_total'])}{bad}")
+        elif s["verify_last"]:
+            self.v_verify.set(f"Проверка копий: последняя {day(s['verify_last'])}, следующая {day(s['verify_next'])}{bad}")
+        else:
+            self.v_verify.set("")
         top = s["log"][0] if s["log"] else None
         if top != self._log_top:
             self._log_top = top

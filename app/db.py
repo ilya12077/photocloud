@@ -29,7 +29,11 @@ SCHEMA = [
        WITHOUT ROWID""",
     """CREATE TABLE IF NOT EXISTS hashes (
          key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime (как у дат)
-         sha TEXT NOT NULL)             -- SHA-256 содержимого, hex
+         sha TEXT NOT NULL,             -- SHA-256 содержимого, hex
+         checked REAL NOT NULL DEFAULT 0)   -- когда хеш последний раз сверяли с файлом
+       WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS kv (
+         key TEXT PRIMARY KEY, value TEXT NOT NULL)   -- служебные отметки (даты проверок и т.п.)
        WITHOUT ROWID""",
     """CREATE TABLE IF NOT EXISTS backup_tokens (
          key TEXT PRIMARY KEY,          -- SHA-256 токена (сам токен не хранится)
@@ -70,6 +74,12 @@ class DB:
             if n:
                 log.info("подробности: %d пустых записей будут собраны заново", n)
             self.con.execute("PRAGMA user_version = 1")
+        if ver < 2:
+            cols = {r[1] for r in self.con.execute("PRAGMA table_info(hashes)")}
+            if "checked" not in cols:               # таблица из 1.6.0-beta: дата проверки хеша
+                self.con.execute("ALTER TABLE hashes ADD COLUMN checked REAL NOT NULL DEFAULT 0")
+                self.con.execute("UPDATE hashes SET checked = ?", (__import__("time").time(),))
+            self.con.execute("PRAGMA user_version = 2")
 
     def run(self, sql: str, args=()):
         with self.mu:
@@ -143,8 +153,33 @@ class DB:
         return self.run("SELECT count(*) FROM hashes")[0][0]
 
     def hashes_put_many(self, items: list[tuple[str, str]]) -> None:
+        """Только что посчитанные хеши — они же и проверенные."""
         if items:
-            self.many("INSERT OR REPLACE INTO hashes(key, sha) VALUES(?, ?)", items)
+            import time
+            now = time.time()
+            self.many("INSERT OR REPLACE INTO hashes(key, sha, checked) VALUES(?, ?, ?)",
+                      [(k, h, now) for k, h in items])
+
+    def hashes_unchecked(self, since: float) -> dict[str, str]:
+        """Хеши, которые не сверяли с файлом с момента since (начало текущей проверки)."""
+        return dict(self.run("SELECT key, sha FROM hashes WHERE checked < ?", (since,)))
+
+    def hashes_checked_many(self, rows: list[tuple[str, float, str]]) -> None:
+        """rows: (sha, checked, key) — после сверки (sha мог поменяться)."""
+        if rows:
+            self.many("UPDATE hashes SET sha = ?, checked = ? WHERE key = ?", rows)
+
+    # ------------------------------------------------------------ служебные отметки
+
+    def kv_get(self, key: str) -> str | None:
+        r = self.run("SELECT value FROM kv WHERE key = ?", (key,))
+        return r[0][0] if r else None
+
+    def kv_set(self, key: str, value) -> None:
+        if value is None:
+            self.run("DELETE FROM kv WHERE key = ?", (key,))
+        else:
+            self.run("INSERT OR REPLACE INTO kv(key, value) VALUES(?, ?)", (key, str(value)))
 
     def hashes_prune(self, keep: set[str]) -> int:
         gone = [(k,) for (k,) in self.run("SELECT key FROM hashes") if k not in keep]
