@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"
