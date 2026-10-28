@@ -315,11 +315,11 @@ function hashText(h) {
 }
 const dday = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString('ru') : '—');
 function verifyText(v) {
-  const bad = v.bad ? ` · не совпало: ${v.bad}` : '';
-  if (v.state === 'running') return `идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} (${gb(v.bytes_done)} из ${gb(v.bytes_total)})${bad}`;
-  if (v.since && v.paused) return `остановлена, ${v.done ? 'проверено ' + v.done.toLocaleString('ru') : 'продолжится по кнопке'}${bad}`;
-  if (v.since) return `продолжится, когда ПК включится${bad}`;
-  return v.last ? `последняя ${dday(v.last)}, следующая ${dday(v.next)}${bad}` : 'ещё не было';
+  const bad = v.bad ? ` Найдено изменённых файлов: ${v.bad}.` : '';
+  if (v.state === 'running') return `Идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} файлов (${gb(v.bytes_done)} из ${gb(v.bytes_total)}).${bad}`;
+  if (v.since && v.paused) return `Остановлена${v.done ? ` на ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}` : ''} — продолжится только по кнопке.${bad}`;
+  if (v.since) return `Начата и прервалась — продолжится, когда ПК включится, или по кнопке.${bad}`;
+  return v.last ? `Последняя: ${dday(v.last)}, следующая: ${dday(v.next)}.${bad}` : 'Ещё не было.';
 }
 function plural(n, one, few, many) {
   const m10 = n % 10, m100 = n % 100;
@@ -342,14 +342,20 @@ async function loadBackup() {
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
     if (unchanged('backup', r)) return;
   const v = r.verify;
-  const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Проверка хешей', verifyText(v)], ['Клиентов', String(r.tokens.length)]];
+  const cards = [['Файлов с хешем', `${(r.files - r.unhashed).toLocaleString('ru')} из ${r.files.toLocaleString('ru')}`], ['Клиентов', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
-  $('bk-hash-stop').hidden = r.hashes.state !== 'running';
-  $('bk-hash-start').hidden = !r.tokens.length || !['stopped', 'error', ''].includes(r.hashes.state);
-  const vRun = v.state === 'running', hRun = r.hashes.state === 'running';
+  const hRun = r.hashes.state === 'running', vRun = v.state === 'running';
+  // хеши новых: кнопка — только если правда есть что считать и подсчёт сейчас не идёт
+  $('bk-hash-text').textContent = !r.tokens.length ? 'Не считаются: пока нет ни одного клиента.'
+    : hRun ? hashText(r.hashes)
+    : r.unhashed ? `Без хеша: ${r.unhashed.toLocaleString('ru')} файлов` + (r.hashes.state === 'stopped' ? ' — подсчёт остановлен.' : r.hashes.state === 'error' ? ' — подсчёт прервался (ошибки чтения).' : ' — посчитаются после сканирования.')
+    : 'Посчитаны для всех файлов.';
+  $('bk-hash-start').hidden = hRun || vRun || !r.unhashed || !r.tokens.length;
+  $('bk-hash-stop').hidden = !hRun;
+  $('bk-verify-text').textContent = !r.tokens.length ? 'Не нужна: пока нет ни одного клиента.' : verifyText(v);
   $('bk-verify-stop').hidden = !vRun;
   $('bk-verify-start').hidden = vRun || hRun || !r.tokens.length;
-  $('bk-verify-start').textContent = v.since ? 'Продолжить проверку хешей' : 'Проверить хеши всех файлов';
+  $('bk-verify-start').textContent = v.since ? 'Продолжить проверку' : 'Проверить сейчас';
   const sel = $('bk-user'), cur = sel.value;
   if ([...sel.options].map((o) => o.value).join('\n') !== r.users.join('\n')) {     // открытый список не закрываем зря
     sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
@@ -404,7 +410,7 @@ $('bk-copy').onclick = async () => {
 $('bk-hash-stop').onclick = () => act(() => api('/api/admin/backup/hashes/stop', {}), 'Подсчёт остановлен').then(loadBackup);
 $('bk-verify-start').onclick = () => act(() => api('/api/admin/backup/verify/start', {}), 'Проверка хешей запущена').then(loadBackup);
 $('bk-verify-stop').onclick = () => act(() => api('/api/admin/backup/verify/stop', {}), 'Проверка остановлена').then(loadBackup);
-$('bk-hash-start').onclick = () => act(() => api('/api/admin/backup/hashes/start', {}), 'Подсчёт запущен').then(loadBackup);
+$('bk-hash-start').onclick = () => act(() => api('/api/admin/backup/hashes/start', {}), 'Подсчёт хешей запущен').then(loadBackup);
 
 // ================================================================== настройки
 
