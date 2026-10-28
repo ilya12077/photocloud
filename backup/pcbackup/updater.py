@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -46,13 +47,36 @@ def _client() -> httpx.Client:
                         headers={"user-agent": f"photocloud-backup/{local_version()}"})
 
 
-def remote_version(branch: str) -> str | None:
-    """Версия в ветке на GitHub; None — в этой ветке клиента нет (или GitHub недоступен)."""
+def head_sha(branch: str) -> str | None:
+    """Последний коммит ветки. Через API GitHub — без пятиминутного кэша raw.githubusercontent.com,
+    из-за которого клиент после пуша ещё какое-то время видел старую версию."""
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch):
         return None
+    try:
+        with _client() as c:
+            r = c.get(f"https://api.github.com/repos/{REPO}/commits/{branch}",
+                      headers={"accept": "application/vnd.github.sha"})
+    except httpx.HTTPError:
+        return None
+    sha = r.text.strip() if r.status_code == 200 else ""
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def _ref(branch: str) -> str:
+    """Коммит, если API ответил (файлы коммита неизменны — кэш не мешает); иначе имя ветки."""
+    return head_sha(branch) or branch
+
+
+def remote_version(branch: str, ref: str | None = None) -> str | None:
+    """Версия клиента в ветке на GitHub; None — в этой ветке клиента нет (или GitHub недоступен)."""
+    if not re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", branch):
+        return None
+    ref = ref or _ref(branch)
+    url = f"https://raw.githubusercontent.com/{REPO}/{ref}/backup/VERSION"
+    if ref == branch:
+        url += f"?t={int(time.time())}"                   # без API: хотя бы мимо кэша
     with _client() as c:
-        r = c.get(f"https://raw.githubusercontent.com/{REPO}/{branch}/backup/VERSION",
-                  headers={"cache-control": "no-cache"})
+        r = c.get(url, headers={"cache-control": "no-cache"})
     if r.status_code != 200:
         return None
     v = r.text.strip()
@@ -64,9 +88,13 @@ def newer(remote: str | None) -> bool:
 
 
 def apply(branch: str) -> str:
-    """Скачать ветку и разложить backup/ поверх этой папки. Возвращает новую версию."""
+    """Скачать последний коммит ветки и разложить backup/ поверх этой папки. Возвращает новую версию."""
+    ref = _ref(branch)
+    expect = remote_version(branch, ref)
+    url = (f"https://codeload.github.com/{REPO}/zip/{ref}" if ref != branch
+           else f"https://codeload.github.com/{REPO}/zip/refs/heads/{branch}")
     with _client() as c:
-        r = c.get(f"https://codeload.github.com/{REPO}/zip/refs/heads/{branch}")
+        r = c.get(url)
         r.raise_for_status()
         data = r.content
     zf = zipfile.ZipFile(io.BytesIO(data))
@@ -91,6 +119,10 @@ def apply(branch: str) -> str:
     if "photocloud_backup.pyw" not in files or "VERSION" not in files:
         shutil.rmtree(tmp, ignore_errors=True)
         raise ValueError("в архиве нет клиента бэкапа")
+    got = (tmp / "VERSION").read_text(encoding="utf-8").strip()
+    if expect and got != expect:                       # архив из кэша старее, чем версия — не ставим
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise ValueError(f"GitHub отдал версию {got} вместо {expect} — попробуйте через пару минут")
     old_req = (HERE / "requirements.txt").read_bytes() if (HERE / "requirements.txt").exists() else b""
     for rel in files:
         dst = HERE.joinpath(*rel.split("/"))
