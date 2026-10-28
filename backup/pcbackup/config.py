@@ -66,7 +66,8 @@ else:                                      # для проверки на Linux:
 
 
 class Config:
-    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart", "min_free_gb", "hide_on_autostart")
+    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart", "min_free_gb", "hide_on_autostart",
+              "check_updates", "update_branch")
 
     def __init__(self, path: Path | None = None):
         self.path = path or app_dir() / "config.json"
@@ -79,6 +80,8 @@ class Config:
         self.wake_on_start = True
         self.autostart = True
         self.hide_on_autostart = True     # при автозапуске — только значок в трее, без окна
+        self.check_updates = True         # искать новую версию клиента на GitHub
+        self.update_branch = ""           # пусто — ветка git-клона (.git/HEAD) или master
         self._mu = threading.Lock()
         self.load()
 

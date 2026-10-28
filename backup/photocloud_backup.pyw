@@ -35,6 +35,11 @@ def main() -> None:
     if "WindowsApps" in sys.executable or "PythonSoftwareFoundation" in sys.prefix:
         log.warning("Python из Microsoft Store: файлы в %%APPDATA%% он хранит в своей песочнице")
 
+    if "--wait-pid" in sys.argv:             # перезапуск после обновления: ждём, пока старая копия выйдет
+        try:
+            winutil.wait_pid(int(sys.argv[sys.argv.index("--wait-pid") + 1]), 30)
+        except (ValueError, IndexError):
+            pass
     app = None
     inst = winutil.SingleInstance(d, lambda: app and app.q.put(app.show))
     if not inst.acquire():
