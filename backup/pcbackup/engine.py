@@ -23,12 +23,13 @@ import sqlite3
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"
@@ -38,7 +39,8 @@ IDLE_EVERY = 10             # с: всё скопировано — спраши
 PC_OFF_EVERY = 10           # с: ПК выключен — проверять так часто
 LOCAL_EVERY = 10 * 60       # с: сверять папку бэкапа с базой (на месте ли файлы) не чаще
 DISK_EVERY = 10             # с: мало места — так часто смотреть, не освободилось ли
-REPORT_EVERY = 5 * 60       # с: отчёт серверу во время копирования
+REPORT_EVERY = 5 * 60       # с: отчёт серверу, если состояние не меняется
+REPORT_COPYING = 5          # с: а во время копирования — так часто (админка видит ход в реальном времени)
 DELETE_SUSPICIOUS = (100, 0.05)   # больше стольких И больше такой доли — ждём подтверждения
 IS_WIN = sys.platform == "win32"
 
@@ -189,7 +191,8 @@ class Api:
         h = {"accept-encoding": "identity"}
         if start:
             h["range"] = f"bytes={start}-"
-        return self.c.stream("GET", f"{self.base}/api/backup/file?path={quote(rel, safe='')}", headers=h,
+        # z=1 — сжатие блоками (сервер 1.6+); старый сервер параметр не знает и отдаёт файл как есть по Range
+        return self.c.stream("GET", f"{self.base}/api/backup/file?path={quote(rel, safe='')}&z=1&start={start}", headers=h,
                              timeout=httpx.Timeout(90, connect=15))
 
     def close(self) -> None:
@@ -232,7 +235,8 @@ class Engine(threading.Thread):
         self.st = dict(state="setup", text="Укажите сервер, токен и папку в настройках", detail="",
                        files=0, bytes=0, have_files=0, have_bytes=0, left_files=0, left_bytes=0,
                        waiting_hash=0, current="", cur_done=0, cur_size=0, speed=0.0, errors=0,
-                       pending_delete=0, copied=0, copied_bytes=0, last_ok=0.0, server="")
+                       pending_delete=0, copied=0, copied_bytes=0, last_ok=0.0, server="",
+                       wire_bytes=0, raw_bytes=0)
         self.api: Api | None = None
         self.db: State | None = None
         self.root: Path | None = None
@@ -689,23 +693,68 @@ class Engine(threading.Thread):
             if r.status_code in (401, 429):
                 self.api._check(r)
             r.raise_for_status()
-            if r.status_code == 200:
-                have = 0                              # сервер отдал целиком — пишем с начала
-            mode = "ab" if have else "wb"
-            done = have
-            with open(lp(tmp), mode) as out:
-                try:
-                    for chunk in r.iter_bytes(CHUNK if not self.cfg.limit_mbps else 64 * 1024):
-                        if self.halt.is_set() or self.cfg.paused or self.quit:
-                            raise Stop()
-                        out.write(chunk)
-                        done += len(chunk)
-                        self._progress(len(chunk), done)
-                        thr.wait(len(chunk), self.halt)
-                except httpx.RemoteProtocolError:
-                    raise PcOff() from None             # ПК пропал посреди файла
+            if r.headers.get("x-pc-frames") == "1":
+                if int(r.headers.get("x-start", "-1")) != have:
+                    raise ValueError("сервер начал не с того места")
+                done = self._frames(r, tmp, have, thr)
+            else:
+                done = self._plain(r, tmp, have, thr)
         if done < size:
             raise PcOff()
+
+    def _halted(self) -> bool:
+        return self.halt.is_set() or self.cfg.paused or self.quit
+
+    def _plain(self, r, tmp: Path, have: int, thr) -> int:
+        if r.status_code == 200:
+            have = 0                              # сервер отдал целиком — пишем с начала
+        done = have
+        with open(lp(tmp), "ab" if have else "wb") as out:
+            try:
+                for chunk in r.iter_bytes(CHUNK if not self.cfg.limit_mbps else 64 * 1024):
+                    if self._halted():
+                        raise Stop()
+                    out.write(chunk)
+                    done += len(chunk)
+                    self._wire(len(chunk), len(chunk))
+                    self._progress(len(chunk), done)
+                    thr.wait(len(chunk), self.halt)
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                raise PcOff() from None             # ПК пропал посреди файла
+        return done
+
+    def _frames(self, r, tmp: Path, have: int, thr) -> int:
+        """Кадры [тип][длина][данные]: тип 0 — как есть, 1 — zlib. В файл пишутся только целые
+        кадры, поэтому после обрыва файл ровно на границе блока и докачка идёт с этого места."""
+        done, buf = have, bytearray()
+        with open(lp(tmp), "ab" if have else "wb") as out:
+            try:
+                for chunk in r.iter_raw(64 * 1024):
+                    if self._halted():
+                        raise Stop()
+                    buf += chunk
+                    thr.wait(len(chunk), self.halt)
+                    while len(buf) >= 5:
+                        kind, n = buf[0], int.from_bytes(buf[1:5], "big")
+                        if kind not in (0, 1) or n > 4 * 1024 * 1024:
+                            raise ValueError("повреждённый ответ сервера")
+                        if len(buf) < 5 + n:
+                            break
+                        payload = bytes(buf[5:5 + n])
+                        del buf[:5 + n]
+                        data = zlib.decompress(payload) if kind == 1 else payload
+                        out.write(data)
+                        done += len(data)
+                        self._wire(5 + n, len(data))
+                        self._progress(len(data), done)
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                raise PcOff() from None
+        return done
+
+    def _wire(self, wire: int, raw: int) -> None:
+        with self.mu:
+            self.st["wire_bytes"] += wire
+            self.st["raw_bytes"] += raw
 
     def _progress(self, n: int, done: int) -> None:
         now = time.monotonic()
@@ -718,6 +767,8 @@ class Engine(threading.Thread):
             self._speed_t, self._speed_b = now, 0
         with self.mu:
             self.st["cur_done"] = done
+        if time.monotonic() - self._last_report > REPORT_COPYING:
+            self._report("copying")              # большой файл — ход виден в админке и посреди него
 
     @staticmethod
     def _sha(p: Path) -> str:
@@ -758,7 +809,8 @@ class Engine(threading.Thread):
         """Отчёт серверу — при смене состояния или раз в 5 минут, а не на каждый опрос."""
         if not self.api:
             return
-        if state == self._reported and not error and time.monotonic() - self._last_report < REPORT_EVERY:
+        every = REPORT_COPYING if state == "copying" else REPORT_EVERY
+        if state == self._reported and not error and time.monotonic() - self._last_report < every:
             return
         self._reported = state
         self._last_report = time.monotonic()
@@ -766,4 +818,9 @@ class Engine(threading.Thread):
         self.api.report({"state": state, "client": f"photocloud-backup {VERSION}", "files": s["files"],
                          "bytes": s["bytes"], "left_files": s["left_files"], "left_bytes": s["left_bytes"],
                          "copied": s["copied"], "copied_bytes": s["copied_bytes"], "errors": s["errors"],
-                         "pending_delete": s["pending_delete"], **({"error": error} if error else {})})
+                         "pending_delete": s["pending_delete"], "speed": int(s["speed"]),
+                         "current": s["current"] if state == "copying" else "",
+                         "cur_done": s["cur_done"], "cur_size": s["cur_size"],
+                         "wire_bytes": s["wire_bytes"], "raw_bytes": s["raw_bytes"],
+                         "limit_mbps": int(float(self.cfg.limit_mbps or 0)),
+                         **({"error": error} if error else {})})

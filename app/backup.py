@@ -95,8 +95,12 @@ class TokenStore:
             self.flush()
 
     def set_report(self, t: Token, report: dict) -> None:
+        """Во время копирования клиент шлёт отчёт раз в 10 с: в памяти — сразу (админка видит),
+        в базу — при смене состояния или вместе с «на связи» раз в минуту."""
+        changed = report.get("state") != t.report.get("state")
         t.report, t.dirty = report, True
-        self.flush()
+        if changed or time.monotonic() - self._flushed > FLUSH_EVERY:
+            self.flush()
 
     def flush(self) -> None:
         self._flushed = time.monotonic()

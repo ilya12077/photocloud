@@ -263,3 +263,4 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 /* бэкап: токен показывается один раз */
 .bk-new { margin-top: 12px; padding: 12px; border: 1px solid var(--line, #444); border-radius: 10px; }
 .bk-new input { flex: 1; min-width: 0; }
+.bk-cur { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

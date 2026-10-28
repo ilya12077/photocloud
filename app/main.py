@@ -1215,18 +1215,82 @@ async def backup_manifest(request: Request, t=Depends(require_backup)):
     return Response(body, media_type="application/json", headers=headers)
 
 
+# Сжатие блоками: файл идёт кадрами [тип 1 байт][длина 4 байта][данные], каждый кадр — до 1 МБ
+# исходных байт. Блок отправляется сжатым (zlib), только если так меньше хотя бы на 3%.
+# JPEG/MP4/HEIC уже сжаты — после пары неудачных блоков сервер перестаёт их жать и лишь
+# изредка пробует снова (внутри файла бывают и несжатые куски), чтобы не тратить процессор.
+FRAME_RAW, FRAME_ZLIB = 0, 1
+FRAME_BLOCK = 1024 * 1024
+
+
+def _frame(raw: bytes, try_zip: bool) -> tuple[bytes, bool]:
+    import zlib
+    if try_zip:
+        z = zlib.compress(raw, 3)
+        if len(z) < len(raw) * 0.97:
+            return bytes([FRAME_ZLIB]) + len(z).to_bytes(4, "big") + z, True
+    return bytes([FRAME_RAW]) + len(raw).to_bytes(4, "big") + raw, False
+
+
+async def _framed(p, start: int) -> Response:
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
+    try:
+        f = await on_pc(storage.open, p.rel, timeout=30)
+        size = await on_pc(_size, f, timeout=30)
+    except Exception:  # noqa: BLE001
+        PC.suspect()
+        raise HTTPException(503, "pc") from None
+    if start > size:
+        await on_pc(f.close, timeout=10)
+        return Response(status_code=416, headers={"content-range": f"bytes */{size}"})
+
+    async def gen():
+        misses, skip = 0, 0
+        try:
+            f.seek(start)
+            left = size - start
+            while left > 0:
+                raw = await on_pc(f.read, min(FRAME_BLOCK, left), timeout=60)
+                if not raw:
+                    break
+                left -= len(raw)
+                frame, ok = await run_in_threadpool(_frame, raw, skip == 0)
+                if skip:
+                    skip -= 1
+                elif ok:
+                    misses = 0
+                else:
+                    misses += 1
+                    skip = min(32, 2 ** misses)       # не жмётся — следующие блоки без попыток
+                yield frame
+        except Exception as e:  # noqa: BLE001 — ПК пропал посреди файла: клиент докачает
+            PC.suspect()
+            log.info("бэкап: отдача %s прервана (%s)", p.name, type(e).__name__)
+        finally:
+            with contextlib.suppress(Exception):
+                await on_pc(f.close, timeout=10)
+
+    return StreamingResponse(gen(), media_type="application/octet-stream", headers={
+        "cache-control": "no-store", "x-pc-frames": "1", "x-file-size": str(size),
+        "x-file-mtime": str(int(p.mtime)), "x-start": str(start)})
+
+
 @app.get("/api/backup/file")
-async def backup_file(request: Request, path: str = "", t=Depends(require_backup)):
+async def backup_file(request: Request, path: str = "", z: int = 0, start: int = 0, t=Depends(require_backup)):
     p = _by_rel(path) if 0 < len(path) <= 2000 else None
     if p is None or not folder_ok(p.rel, _token_access(t)):
         raise HTTPException(404)
+    if z == 1:                                        # клиент 1.1+: сжатие блоками
+        return await _framed(p, max(0, start))
     return await serve_file(request, p, {"cache-control": "no-store",
                                          "content-disposition": "attachment",
                                          "x-file-size": str(p.size), "x-file-mtime": str(int(p.mtime))})
 
 
 _REPORT_NUM = ("files", "bytes", "copied", "copied_bytes", "left_files", "left_bytes", "moved",
-               "versions", "deleted", "errors", "pending_delete")
+               "versions", "deleted", "errors", "pending_delete", "speed", "cur_done", "cur_size",
+               "wire_bytes", "raw_bytes", "limit_mbps")
 
 
 @app.post("/api/backup/report")
@@ -1234,9 +1298,9 @@ async def backup_report(request: Request, t=Depends(require_backup)):
     d = await read_json(request)
     rep = {k: int(d[k]) for k in _REPORT_NUM
            if isinstance(d.get(k), int) and not isinstance(d.get(k), bool) and 0 <= d[k] < 2**53}
-    for k in ("state", "client", "error"):
+    for k in ("state", "client", "error", "current"):
         if isinstance(d.get(k), str):
-            rep[k] = clean(d[k], 120)
+            rep[k] = clean(d[k], 200)
     rep["at"] = int(time.time())
     await run_in_threadpool(tokens.set_report, t, rep)
     return no_store(JSONResponse({"ok": True}))
