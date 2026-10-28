@@ -8,7 +8,7 @@ const dt = (ts) => (ts ? fmtDT.format(new Date(ts * 1000)) : '—');
 const EVENTS = {
   login: 'каждый вход', login_new_ip: 'вход с нового IP', login_failed: 'неудачный вход', lockout: 'блокировка IP',
   wake: 'кто-то будит ПК', wake_timeout: 'ПК не проснулся', index_error: 'ошибка чтения папки',
-  backup_stale: 'бэкап давно не выходил на связь',
+  backup_stale: 'бэкап давно не выходил на связь', hash_mismatch: 'файл изменился без смены даты (проверка хешей)',
 };
 const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
@@ -17,7 +17,8 @@ const AUDIT = {
   user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
   backup_token_add: 'создан токен бэкапа', backup_token_revoke: 'отозван токен бэкапа', backup_denied: 'бэкап: неверный токен',
-  hash_stop: 'остановлен подсчёт хешей',
+  hash_stop: 'остановлен подсчёт хешей', hash_verify: 'запущена проверка хешей', hash_verify_done: 'проверка хешей завершена',
+  hash_mismatch: 'хеш не совпал',
 };
 
 async function api(path, body) {
@@ -312,6 +313,14 @@ function hashText(h) {
   if (h.state === 'done') return 'все посчитаны';
   return 'ждут сканирования папок';
 }
+const dday = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString('ru') : '—');
+function verifyText(v) {
+  const bad = v.bad ? ` · не совпало: ${v.bad}` : '';
+  if (v.state === 'running') return `идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} (${gb(v.bytes_done)} из ${gb(v.bytes_total)})${bad}`;
+  if (v.since && v.paused) return `остановлена, ${v.done ? 'проверено ' + v.done.toLocaleString('ru') : 'продолжится по кнопке'}${bad}`;
+  if (v.since) return `продолжится, когда ПК включится${bad}`;
+  return v.last ? `последняя ${dday(v.last)}, следующая ${dday(v.next)}${bad}` : 'ещё не было';
+}
 function ago(ts) {
   if (!ts) return 'ещё не было';
   const s = Math.max(0, Date.now() / 1000 - ts);
@@ -327,10 +336,15 @@ async function loadBackup() {
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
   // «на связи N мин назад» тоже должно идти, поэтому сравниваем с точностью до минуты
   if (unchanged('backup', { ...r, now: Math.floor(Date.now() / 60000) })) return;
-  const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Клиентов', String(r.tokens.length)]];
+  const v = r.verify;
+  const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Проверка хешей', verifyText(v)], ['Клиентов', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
   $('bk-hash-stop').hidden = r.hashes.state !== 'running';
   $('bk-hash-start').hidden = !r.tokens.length || !['stopped', 'error', ''].includes(r.hashes.state);
+  const vRun = v.state === 'running', hRun = r.hashes.state === 'running';
+  $('bk-verify-stop').hidden = !vRun;
+  $('bk-verify-start').hidden = vRun || hRun || !r.tokens.length;
+  $('bk-verify-start').textContent = v.since ? 'Продолжить проверку хешей' : 'Проверить хеши всех файлов';
   const sel = $('bk-user'), cur = sel.value;
   if ([...sel.options].map((o) => o.value).join('\n') !== r.users.join('\n')) {     // открытый список не закрываем зря
     sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
@@ -361,6 +375,9 @@ async function loadBackup() {
         const f = el('div', 'dim2 bk-cur', rp.current.split('/').pop() + pct); f.title = rp.current; st.append(f);
       }
     } else if (rp.state === 'copying') st.firstChild.textContent = 'копировал, давно нет связи';
+    if (rp.verify_total) st.append(el('div', 'dim2', `проверка копий: ${rp.verify_done.toLocaleString('ru')} из ${rp.verify_total.toLocaleString('ru')}`));
+    else if (rp.verify_last) st.append(el('div', 'dim2', `копии проверены ${dday(rp.verify_last)}`));
+    if (rp.verify_bad) st.append(el('div', 'err', `повреждённых копий: ${rp.verify_bad} (скачиваются заново)`));
     if (rp.errors) st.append(el('div', 'dim2', `ошибок: ${rp.errors}`));
     if (rp.error) st.append(el('div', 'err', rp.error));
     const seen = el('td', null, ago(t.last_seen)); if (t.last_ip) seen.title = t.last_ip;
@@ -379,6 +396,8 @@ $('bk-copy').onclick = async () => {
   try { await navigator.clipboard.writeText($('bk-token').value); toast('Скопировано'); } catch (_) { $('bk-token').select(); document.execCommand('copy'); toast('Скопировано'); }
 };
 $('bk-hash-stop').onclick = () => act(() => api('/api/admin/backup/hashes/stop', {}), 'Подсчёт остановлен').then(loadBackup);
+$('bk-verify-start').onclick = () => act(() => api('/api/admin/backup/verify/start', {}), 'Проверка хешей запущена').then(loadBackup);
+$('bk-verify-stop').onclick = () => act(() => api('/api/admin/backup/verify/stop', {}), 'Проверка остановлена').then(loadBackup);
 $('bk-hash-start').onclick = () => act(() => api('/api/admin/backup/hashes/start', {}), 'Подсчёт запущен').then(loadBackup);
 
 // ================================================================== настройки

@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"
@@ -37,8 +37,10 @@ CHUNK = 256 * 1024
 PASS_MAX = 15 * 60          # с: проход не дольше — потом свежий список (досчитались новые хеши)
 IDLE_EVERY = 10             # с: всё скопировано — спрашивать сервер о новом так часто
 PC_OFF_EVERY = 10           # с: ПК выключен — проверять так часто
-LOCAL_EVERY = 10 * 60       # с: сверять папку бэкапа с базой (на месте ли файлы) не чаще
+LOCAL_EVERY = 60            # с: сверять папку бэкапа с базой (на месте ли файлы): удалил копию — через минуту скачается
 DISK_EVERY = 10             # с: мало места — так часто смотреть, не освободилось ли
+VERIFY_EVERY = 30 * 86400   # с: проверка копий (пересчёт хешей скопированного) — раз в 30 дней
+VERIFY_SLICE = 20           # с: проверять кусками, между ними — обычный опрос сервера
 REPORT_EVERY = 5 * 60       # с: отчёт серверу, если состояние не меняется
 REPORT_COPYING = 5          # с: а во время копирования — так часто (админка видит ход в реальном времени)
 DELETE_SUSPICIOUS = (100, 0.05)   # больше стольких И больше такой доли — ждём подтверждения
@@ -115,21 +117,54 @@ class State:
             sha TEXT NOT NULL, copied REAL NOT NULL) WITHOUT ROWID""")
         self.con.execute("""CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY, ts REAL NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, detail TEXT NOT NULL)""")
+        self.con.execute("""CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID""")
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(files)")}
+        if "verified" not in cols:            # когда копию последний раз сверяли с хешем (клиент 1.2+)
+            self.con.execute("ALTER TABLE files ADD COLUMN verified REAL NOT NULL DEFAULT 0")
+            self.con.execute("UPDATE files SET verified = copied")
         self.mu = threading.Lock()
 
     def files(self) -> dict[str, tuple[int, int, str]]:
         with self.mu:
             return {p: (s, m, h) for p, s, m, h in self.con.execute("SELECT path, size, mtime, sha FROM files")}
 
+    _PUT = "INSERT OR REPLACE INTO files(path, size, mtime, sha, copied, verified) VALUES(?, ?, ?, ?, ?, ?)"
+
     def put(self, path: str, size: int, mtime: int, sha: str) -> None:
+        now = time.time()                       # только что скачан и сверен — он же проверен
         with self.mu:
-            self.con.execute("INSERT OR REPLACE INTO files VALUES(?, ?, ?, ?, ?)", (path, size, mtime, sha, time.time()))
+            self.con.execute(self._PUT, (path, size, mtime, sha, now, now))
 
     def put_many(self, rows) -> None:
+        """rows: (path, size, mtime, sha, ts)"""
         with self.mu:
             self.con.execute("BEGIN")
-            self.con.executemany("INSERT OR REPLACE INTO files VALUES(?, ?, ?, ?, ?)", rows)
+            self.con.executemany(self._PUT, [(*r, r[4]) for r in rows])
             self.con.execute("COMMIT")
+
+    def unverified(self, since: float, limit: int) -> list[tuple[str, int, str]]:
+        with self.mu:
+            return list(self.con.execute("SELECT path, size, sha FROM files WHERE verified < ? LIMIT ?", (since, limit)))
+
+    def count_unverified(self, since: float) -> int:
+        with self.mu:
+            return self.con.execute("SELECT count(*) FROM files WHERE verified < ?", (since,)).fetchone()[0]
+
+    def set_verified(self, path: str, ts: float) -> None:
+        with self.mu:
+            self.con.execute("UPDATE files SET verified = ? WHERE path = ?", (ts, path))
+
+    def kv_get(self, key: str) -> str | None:
+        with self.mu:
+            r = self.con.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return r[0] if r else None
+
+    def kv_set(self, key: str, value) -> None:
+        with self.mu:
+            if value is None:
+                self.con.execute("DELETE FROM kv WHERE key = ?", (key,))
+            else:
+                self.con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES(?, ?)", (key, str(value)))
 
     def drop(self, path: str) -> None:
         with self.mu:
@@ -232,7 +267,7 @@ class Engine(threading.Thread):
         self.ev = threading.Event()             # разбудить цикл (кнопки, смена настроек)
         self.halt = threading.Event()           # прервать текущую работу
         self.quit = False
-        self._want_sync = self._want_wake = self._confirm = False
+        self._want_sync = self._want_wake = self._confirm = self._want_verify = False
         self._reload = True
         self.mu = threading.Lock()
         self.log = collections.deque(maxlen=300)
@@ -240,7 +275,9 @@ class Engine(threading.Thread):
                        files=0, bytes=0, have_files=0, have_bytes=0, left_files=0, left_bytes=0,
                        waiting_hash=0, current="", cur_done=0, cur_size=0, speed=0.0, errors=0,
                        pending_delete=0, copied=0, copied_bytes=0, last_ok=0.0, server="",
-                       wire_bytes=0, raw_bytes=0)
+                       wire_bytes=0, raw_bytes=0,
+                       verifying=False, verify_done=0, verify_total=0, verify_bad=0, verify_last=0.0,
+                       verify_next=0.0)
         self.api: Api | None = None
         self.db: State | None = None
         self.root: Path | None = None
@@ -275,10 +312,15 @@ class Engine(threading.Thread):
 
     def sync_now(self) -> None:
         self._want_sync = True
+        self._checked_local = 0.0              # и папку бэкапа сверить сразу
         self.ev.set()
 
     def wake_now(self) -> None:
         self._want_wake = True
+        self.ev.set()
+
+    def verify_now(self) -> None:
+        self._want_verify = True
         self.ev.set()
 
     def confirm_delete(self) -> None:
@@ -401,11 +443,14 @@ class Engine(threading.Thread):
             self._set(state="pc_off", text="Компьютер просыпается…" if waking else "Компьютер выключен",
                       detail="Копирование продолжится, когда он включится", current="", speed=0.0)
             self._report("pc_off")
-            self._sleep(15 if waking else PC_OFF_EVERY)
+            more = self._verify_slice()        # проверке копий ПК не нужен — можно и сейчас
+            self._sleep(0 if more else (15 if waking else PC_OFF_EVERY))
             return
         self._woke = True              # ПК уже включён — будить при запуске не нужно
         if self._pass():
-            self._sleep(IDLE_EVERY if not self._want_sync else 0)
+            # всё скопировано — в свободное время проверяем уже скопированное (кусками по 20 с)
+            more = self._verify_slice() if self.st["state"] in ("done", "waiting") else False
+            self._sleep(0 if (more or self._want_sync) else IDLE_EVERY)
         self._want_sync = False
 
     def _wake(self, st: dict) -> None:
@@ -533,39 +578,127 @@ class Engine(threading.Thread):
         deletes = [p for p in missing if p not in used]
         return moves, copies, downloads, deletes, waiting
 
+    def _scan_archive(self) -> dict[str, int]:
+        """Что реально лежит в Архиве: путь -> размер. Обход папок (os.scandir) — в Windows размер
+        приходит вместе со списком файла, без открытия каждого: 40 тысяч файлов — доли секунды."""
+        top = lp(self.root / ARCHIVE)
+        out: dict[str, int] = {}
+        stack = [(top, "")]
+        while stack:
+            d, prefix = stack.pop()
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    rel = f"{prefix}/{e.name}" if prefix else e.name
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append((e.path, rel))
+                        elif e.is_file(follow_symlinks=False):
+                            out[rel] = e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        return out
+
     def _verify_local(self, local: dict) -> dict:
         """Файлы, которые пропали из Архива или изменились руками, считаем отсутствующими —
         их скачаем заново (изменённый сначала уйдёт в Версии)."""
+        have = self._scan_archive()
         out, gone = {}, []
         for p, v in local.items():
-            try:
-                st = os.stat(lp(self._arch(p)))
-            except OSError:
+            if have.get(p) != v[0]:
                 gone.append(p)
-                continue
-            except ValueError:
-                gone.append(p)
-                continue
-            if st.st_size != v[0]:
-                gone.append(p)
-                continue
-            out[p] = v
+            else:
+                out[p] = v
         for p in gone:
             self.db.drop(p)
         if gone:
-            self._note(f"в папке бэкапа пропали или изменились {len(gone)} файлов — скопирую заново", "warn")
+            self._note(f"в папке бэкапа пропали или изменились {len(gone)} файлов — скопирую заново", "warn",
+                       gone[0] if len(gone) == 1 else "")
         return out
+
+    # ------------------------------------------------------------ проверка копий
+
+    def _verify_since(self) -> float | None:
+        """Начало текущей проверки: продолжаем начатую, начинаем новую раз в 30 дней или по кнопке."""
+        db, now = self.db, time.time()
+        since, last = db.kv_get("verify_since"), db.kv_get("verify_last")
+        if self._want_verify and not since:
+            since = str(now)
+            db.kv_set("verify_since", since)
+        self._want_verify = False
+        if last is None and not since:
+            db.kv_set("verify_last", now)           # всё только что скачано и сверено — следующая через месяц
+            last = str(now)
+        if not since and now - float(last) >= VERIFY_EVERY:
+            since = str(now)
+            db.kv_set("verify_since", since)
+        lastf = float(db.kv_get("verify_last") or now)
+        self._set(verify_last=lastf, verify_next=lastf + VERIFY_EVERY)
+        return float(since) if since else None
+
+    def _verify_slice(self) -> bool:
+        """Пересчитать хеши части копий (до 20 с). True — есть ещё что проверять."""
+        if not self.db or self.cfg.paused:
+            return False
+        since = self._verify_since()
+        if since is None:
+            self._set(verifying=False)
+            return False
+        if not self.st["verifying"]:
+            left = self.db.count_unverified(since)
+            self._set(verifying=True, verify_total=left + self.st["verify_done"])
+            self._note(f"проверяю скопированное: {left} файлов")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < VERIFY_SLICE:
+            rows = self.db.unverified(since, 50)
+            if not rows:
+                n, bad = self.st["verify_done"], self.st["verify_bad"]
+                now = time.time()
+                self.db.kv_set("verify_last", now)
+                self.db.kv_set("verify_since", None)
+                self.db.event("verify", "", f"проверено {n}, повреждено {bad}")
+                self._note(f"проверка копий завершена: {n} файлов, повреждено {bad}", "error" if bad else "info")
+                self._set(verifying=False, verify_done=0, verify_total=0, verify_last=now,
+                          verify_next=now + VERIFY_EVERY)
+                self._report(self.st["state"], f"повреждённых копий: {bad}" if bad else "")
+                return False
+            for rel, size, sha in rows:
+                if self._reload or self.quit or self.cfg.paused or self._want_sync:
+                    return False
+                try:
+                    a = self._arch(rel)
+                    got = self._sha(a) if os.path.exists(lp(a)) else None
+                except (OSError, ValueError) as e:
+                    got = None
+                    log.warning("проверка %s: %s", rel, e)
+                if got == sha:
+                    self.db.set_verified(rel, time.time())
+                else:
+                    self._set(verify_bad=self.st["verify_bad"] + 1)
+                    if got is not None:
+                        dst = self._aside(a, VERSIONS, rel, tag="повреждён")
+                        self.db.event("corrupt", rel, str(dst))
+                        self._note(f"копия повреждена — отложена в «{VERSIONS}», скачаю заново", "error", rel)
+                    else:
+                        self._note("копии нет в папке — скачаю заново", "warn", rel)
+                    self.db.drop(rel)                    # следующий проход скачает файл снова
+                    self._idle = False                   # и не через минуту, а сразу
+                self._set(verify_done=self.st["verify_done"] + 1)
+        return True
 
     # ------------------------------------------------------------ операции с файлами
 
     def _arch(self, rel: str) -> Path:
         return self.root.joinpath(ARCHIVE, *safe_rel(rel))
 
-    def _aside(self, src: Path, folder: str, rel: str) -> Path:
+    def _aside(self, src: Path, folder: str, rel: str, tag: str = "") -> Path:
         """Убрать файл в Версии/Удалённые, не затирая то, что там уже лежит."""
         dst = self.root.joinpath(folder, *safe_rel(rel))
-        if folder == VERSIONS or os.path.exists(lp(dst)):
-            dst = dst.with_name(f"{dst.stem} ({stamp()}){dst.suffix}")
+        if folder == VERSIONS or tag or os.path.exists(lp(dst)):
+            dst = dst.with_name(f"{dst.stem} ({(tag + ' ') if tag else ''}{stamp()}){dst.suffix}")
         n = 1
         while os.path.exists(lp(dst)):
             dst = dst.with_name(f"{dst.stem}-{n}{dst.suffix}")
@@ -820,7 +953,7 @@ class Engine(threading.Thread):
         """Отчёт серверу — при смене состояния или раз в 5 минут, а не на каждый опрос."""
         if not self.api:
             return
-        every = REPORT_COPYING if state == "copying" else REPORT_EVERY
+        every = REPORT_COPYING if state == "copying" or self.st["verifying"] else REPORT_EVERY
         if state == self._reported and not error and time.monotonic() - self._last_report < every:
             return
         self._reported = state
@@ -834,4 +967,6 @@ class Engine(threading.Thread):
                          "cur_done": s["cur_done"], "cur_size": s["cur_size"],
                          "wire_bytes": s["wire_bytes"], "raw_bytes": s["raw_bytes"],
                          "limit_mbps": int(float(self.cfg.limit_mbps or 0)),
+                         "verify_last": int(s["verify_last"]), "verify_done": s["verify_done"],
+                         "verify_total": s["verify_total"] if s["verifying"] else 0, "verify_bad": s["verify_bad"],
                          **({"error": error} if error else {})})

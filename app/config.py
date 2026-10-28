@@ -105,7 +105,7 @@ _SERVICE_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 _NOTIFY_RE = re.compile(r"^(notify|input_text|input_select|sensor|text|select)\.[a-z0-9_]+$")
 
 ALL_NOTIFY_EVENTS = {"login", "login_new_ip", "login_failed", "lockout", "wake", "wake_timeout", "index_error",
-                     "backup_stale"}
+                     "backup_stale", "hash_mismatch"}
 
 
 @dataclass
@@ -228,7 +228,7 @@ def load() -> Settings:
             raise ConfigError("HA_WAKE_DATA: должен быть JSON-объект")
     if s.storage == "smb" and not (s.ha_token and s.ha_wake_service):
         raise ConfigError("нужны HA_TOKEN и HA_WAKE_SERVICE (пробуждение ПК идёт через Home Assistant)")
-    ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale") or ""
+    ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale,hash_mismatch") or ""
     s.notify_events = {e.strip() for e in ev.split(",") if e.strip()}
     bad = s.notify_events - ALL_NOTIFY_EVENTS
     if bad:

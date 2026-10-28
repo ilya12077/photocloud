@@ -200,6 +200,11 @@ class Library:
         self._hash_stop = threading.Event()
         self._hlock = threading.Lock()
         self._hthread: threading.Thread | None = None
+        # проверка хешей: заново читаем файлы и сверяем с базой (раз в месяц или по кнопке)
+        self.verify_state = ""        # "" | running | stopped | done | error
+        self.verify_total = self.verify_done = self.verify_bad = 0
+        self.verify_bytes_total = self.verify_bytes_done = 0
+        self.on_mismatch = None       # (photo, old_sha, new_sha) -> None; задаёт main
         self.skipped = 0              # папок, не прочитанных при последнем обходе (индекс неполный)
         self.version = ""
         self.by_id: dict[str, Photo] = {}
@@ -473,6 +478,88 @@ class Library:
 
     def stop_hashes(self) -> None:
         self._hash_stop.set()
+
+    def hash_busy(self) -> bool:
+        return bool(self._hthread and self._hthread.is_alive())
+
+    def start_verify(self, storage, since: float) -> bool:
+        """Сверить хеши всех файлов, не проверенных с момента since. Отметка «проверен»
+        у каждого файла — в базе, поэтому прерванная проверка продолжается с того же места."""
+        with self._hlock:
+            if self.hash_busy() or not self.by_id:
+                return False
+
+            def run():
+                photos = list(self.by_id.values())
+                self._collect_hashes(storage, photos)          # сначала новые файлы
+                if self.hash_state not in ("stopped", "error"):
+                    self._verify(storage, photos, since)
+
+            self._hthread = threading.Thread(target=run, name="meta-verify", daemon=True)
+            self._hthread.start()
+            return True
+
+    def _verify(self, storage, photos: list[Photo], since: float) -> None:
+        db, reader = self.cache.db, self.hash_reader
+        if reader is None or db is None:
+            return
+        try:
+            stored = db.hashes_unchecked(since)
+        except Exception as e:  # noqa: BLE001
+            log.warning("проверка хешей: база недоступна (%s)", e)
+            return
+        todo = [p for p in photos if p.cache_key() in stored]
+        self._hash_stop.clear()
+        self.verify_total, self.verify_done, self.verify_bad = len(todo), 0, 0
+        self.verify_bytes_total, self.verify_bytes_done = sum(p.size for p in todo), 0
+        self.verify_state = "running"
+        t0, failures, batch, aborted = time.time(), 0, [], False
+        log.info("проверка хешей: %d файлов (%.1f ГБ)", len(todo), self.verify_bytes_total / 2**30)
+
+        def one(p: Photo):
+            if self._hash_stop.is_set():
+                return None
+            return p, reader(p, self._hash_stop)
+
+        with ThreadPoolExecutor(2, thread_name_prefix="meta-verify") as ex:
+            futs = [ex.submit(one, p) for p in todo]
+            for i, fut in enumerate(as_completed(futs), 1):
+                if self._hash_stop.is_set():
+                    for f2 in futs:
+                        f2.cancel()
+                    break
+                try:
+                    r = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    failures += 1
+                    if failures > 20 and failures > i // 2:
+                        log.warning("проверка хешей: слишком много ошибок (%s), прерываю", type(e).__name__)
+                        aborted = True
+                        for f2 in futs:
+                            f2.cancel()
+                        break
+                    continue
+                if r and r[1]:
+                    p, sha = r
+                    old = stored.get(p.cache_key())
+                    if old != sha:
+                        self.verify_bad += 1
+                        log.warning("проверка хешей: %s изменился без смены размера и даты", p.rel)
+                        db.hashes_checked_many([(sha, time.time(), p.cache_key())])   # сразу: клиент увидит
+                        if self.on_mismatch:
+                            self.on_mismatch(p, old, sha)
+                    else:
+                        batch.append((sha, time.time(), p.cache_key()))
+                    self.verify_bytes_done += p.size
+                self.verify_done = i
+                if len(batch) >= 100:
+                    db.hashes_checked_many(batch)
+                    batch = []
+        db.hashes_checked_many(batch)
+        stopped = self._hash_stop.is_set()
+        self.verify_state = "stopped" if stopped else "error" if aborted else "done"
+        log.info("проверка хешей: %d из %d за %.0fс, не совпало %d%s", self.verify_done, self.verify_total,
+                 time.time() - t0, self.verify_bad, " — остановлено" if stopped else "")
 
     def _collect_hashes(self, storage, photos: list[Photo]) -> None:
         """SHA-256 всех файлов, которых ещё нет в базе. Читает файлы целиком, поэтому
