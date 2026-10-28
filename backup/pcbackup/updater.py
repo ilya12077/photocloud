@@ -37,14 +37,7 @@ def parse(v: str) -> tuple:
 
 
 def default_branch() -> str:
-    """Клиент взят git-клоном — ветка из .git/HEAD, иначе master."""
-    head = HERE.parent / ".git" / "HEAD"
-    try:
-        m = re.match(r"ref: refs/heads/(.+)", head.read_text().strip())
-        if m:
-            return m.group(1)
-    except OSError:
-        pass
+    """Обновления — из основной ветки репозитория (в настройках можно указать другую)."""
     return "master"
 
 
