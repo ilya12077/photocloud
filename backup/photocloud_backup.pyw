@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.0"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.1"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
