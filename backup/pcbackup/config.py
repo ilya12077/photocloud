@@ -81,7 +81,7 @@ class Config:
         self.autostart = True
         self.hide_on_autostart = True     # при автозапуске — только значок в трее, без окна
         self.check_updates = True         # искать новую версию клиента на GitHub
-        self.update_branch = ""           # пусто — ветка git-клона (.git/HEAD) или master
+        self.update_branch = ""           # пусто — основная ветка (master)
         self._mu = threading.Lock()
         self.load()
 
