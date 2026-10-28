@@ -315,11 +315,11 @@ function hashText(h) {
 }
 const dday = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString('ru') : '—');
 function verifyText(v) {
-  const bad = v.bad ? ` Найдено изменённых файлов: ${v.bad}.` : '';
-  if (v.state === 'running') return `Идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} файлов (${gb(v.bytes_done)} из ${gb(v.bytes_total)}).${bad}`;
-  if (v.since && v.paused) return `Остановлена${v.done ? ` на ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}` : ''} — продолжится только по кнопке.${bad}`;
-  if (v.since) return `Начата и прервалась — продолжится, когда ПК включится, или по кнопке.${bad}`;
-  return v.last ? `Последняя: ${dday(v.last)}, следующая: ${dday(v.next)}.${bad}` : 'Ещё не было.';
+  const bad = v.bad ? ` · изменённых: ${v.bad}` : '';
+  if (v.state === 'running') return `идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} (${gb(v.bytes_done)} из ${gb(v.bytes_total)})${bad}`;
+  if (v.since && v.paused) return `остановлена${v.done ? ` на ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}` : ''} — продолжится по кнопке${bad}`;
+  if (v.since) return `прервалась — продолжится, когда ПК включится${bad}`;
+  return v.last ? `последняя ${dday(v.last)}, следующая ${dday(v.next)}${bad}` : 'ещё не было';
 }
 function plural(n, one, few, many) {
   const m10 = n % 10, m100 = n % 100;
@@ -342,20 +342,19 @@ async function loadBackup() {
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
     if (unchanged('backup', r)) return;
   const v = r.verify;
-  const cards = [['Файлов с хешем', `${(r.files - r.unhashed).toLocaleString('ru')} из ${r.files.toLocaleString('ru')}`], ['Клиентов', String(r.tokens.length)]];
-  $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
   const hRun = r.hashes.state === 'running', vRun = v.state === 'running';
-  // хеши новых: кнопка — только если правда есть что считать и подсчёт сейчас не идёт
-  $('bk-hash-text').textContent = !r.tokens.length ? 'Не считаются: пока нет ни одного клиента.'
-    : hRun ? hashText(r.hashes)
-    : r.unhashed ? `Без хеша: ${r.unhashed.toLocaleString('ru')} файлов` + (r.hashes.state === 'stopped' ? ' — подсчёт остановлен.' : r.hashes.state === 'error' ? ' — подсчёт прервался (ошибки чтения).' : ' — посчитаются после сканирования.')
-    : 'Посчитаны для всех файлов.';
+  const hText = !r.tokens.length ? 'не считаются — нет клиентов' : hRun ? hashText(r.hashes)
+    : !r.unhashed ? 'все посчитаны'
+    : `без хеша ${r.unhashed.toLocaleString('ru')}` + (r.hashes.state === 'stopped' ? ' — подсчёт остановлен' : r.hashes.state === 'error' ? ' — подсчёт прервался' : ' — посчитаются после сканирования');
+  const cards = [['Хеши новых файлов', hText],
+    ['Файлов с хешем', `${(r.files - r.unhashed).toLocaleString('ru')} из ${r.files.toLocaleString('ru')}`],
+    ['Проверка хешей', !r.tokens.length ? 'не нужна — нет клиентов' : verifyText(v)], ['Клиентов', String(r.tokens.length)]];
+  $('bk-cards').replaceChildren(...cards.map(([k, val]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', val)); return c; }));
   $('bk-hash-start').hidden = hRun || vRun || !r.unhashed || !r.tokens.length;
   $('bk-hash-stop').hidden = !hRun;
-  $('bk-verify-text').textContent = !r.tokens.length ? 'Не нужна: пока нет ни одного клиента.' : verifyText(v);
   $('bk-verify-stop').hidden = !vRun;
   $('bk-verify-start').hidden = vRun || hRun || !r.tokens.length;
-  $('bk-verify-start').textContent = v.since ? 'Продолжить проверку' : 'Проверить сейчас';
+  $('bk-verify-start').textContent = v.since ? 'Продолжить проверку хешей' : 'Проверить хеши всех файлов';
   const sel = $('bk-user'), cur = sel.value;
   if ([...sel.options].map((o) => o.value).join('\n') !== r.users.join('\n')) {     // открытый список не закрываем зря
     sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
