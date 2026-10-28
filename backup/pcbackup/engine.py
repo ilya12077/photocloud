@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 log = logging.getLogger("pcbackup")
 
 ARCHIVE, VERSIONS, DELETED, META = "Архив", "Версии", "Удалённые", ".photocloud-backup"
@@ -51,6 +51,10 @@ class Stop(Exception):
 
 class PcOff(Exception):
     pass
+
+
+class Gone(Exception):
+    """Файла уже нет на ПК: список на сервере ещё старый, сервер его сейчас обновляет."""
 
 
 class DiskFull(Exception):
@@ -455,6 +459,7 @@ class Engine(threading.Thread):
         t0 = time.monotonic()
         downloads.sort(key=lambda p: files[p][3], reverse=True)      # сначала новые снимки
         left_files, left_b = len(downloads) + waiting, left_bytes + sum(f[1] for f in files.values() if not f[4])
+        gone = 0
         for p in downloads:
             if self.cfg.paused or self._reload or self.quit:
                 raise Stop()
@@ -471,6 +476,12 @@ class Engine(threading.Thread):
                 return False
             except (Stop, AuthError, DiskFull):
                 raise
+            except Gone:
+                gone += 1
+                self._note("удалён на компьютере — уберу в «Удалённые», когда сервер обновит список", "info", p)
+                if gone >= 20:
+                    return True                    # много подряд — сервер пересканирует папки, ждём список
+                continue
             except httpx.HTTPError as e:
                 self._error(p, f"сеть: {type(e).__name__}")
                 return False
@@ -686,7 +697,7 @@ class Engine(threading.Thread):
             if r.status_code == 503:
                 raise PcOff()
             if r.status_code == 404:
-                raise ValueError("файла уже нет на сервере")
+                raise Gone()
             if r.status_code == 416:
                 os.remove(lp(tmp))
                 raise ValueError("размер файла изменился — повторю позже")
