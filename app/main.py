@@ -1382,11 +1382,25 @@ async def backup_report(request: Request, t=Depends(require_backup)):
 
 # ---- админка: токены бэкапа
 
+_unhashed_cache: tuple = (None, 0)
+
+
+def _unhashed() -> int:
+    """Сколько файлов индекса ещё без хеша (пересчёт — только когда поменялся индекс или число хешей)."""
+    global _unhashed_cache
+    key = (library.version, db.hashes_count())
+    if _unhashed_cache[0] != key:
+        have = set(db.hashes_load())
+        _unhashed_cache = (key, sum(1 for p in library.by_id.values() if p.cache_key() not in have))
+    return _unhashed_cache[1]
+
+
 @app.get("/api/admin/backup")
 async def admin_backup(_: Session = Depends(require_admin)):
     return no_store(JSONResponse({"tokens": tokens.list(), "hashes": _hash_progress(),
                                   "verify": await run_in_threadpool(_verify_info),
                                   "hashed": await run_in_threadpool(db.hashes_count),
+                                  "unhashed": await run_in_threadpool(_unhashed), "files": len(library.by_id),
                                   "users": [u["user"] for u in users.list()]}))
 
 
