@@ -19,12 +19,21 @@ from pcbackup.config import Config, app_dir  # noqa: E402
 
 def main() -> None:
     d = app_dir()
-    h = logging.handlers.RotatingFileHandler(d / "backup.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    # журнал — рядом с программой: там его точно видно (Python из Microsoft Store прячет
+    # файлы в %APPDATA% в свою «песочницу», и Проводник их не показывает)
+    log_path = HERE / "backup.log"
+    try:
+        h = logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    except OSError:
+        log_path = d / "backup.log"
+        h = logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     logging.basicConfig(level=logging.INFO, handlers=[h], format="%(asctime)s %(levelname)s %(message)s")
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
     log = logging.getLogger("pcbackup")
-    log.info("старт: %s, python %s", Path(__file__).resolve(), sys.executable)
+    log.info("старт: %s, python %s, настройки в %s", Path(__file__).resolve(), sys.executable, d)
+    if "WindowsApps" in sys.executable or "PythonSoftwareFoundation" in sys.prefix:
+        log.warning("Python из Microsoft Store: файлы в %%APPDATA%% он хранит в своей песочнице")
 
     app = None
     inst = winutil.SingleInstance(d, lambda: app and app.q.put(app.show))
@@ -47,7 +56,7 @@ def main() -> None:
     engine = Engine(cfg)
     engine.start()
     log.info("запуск, папка: %s", cfg.root or "—")
-    app = App(cfg, engine, Path(__file__).resolve(), start_hidden="--tray" in sys.argv)
+    app = App(cfg, engine, Path(__file__).resolve(), start_hidden="--tray" in sys.argv, log_path=log_path)
     try:
         app.run()
     finally:

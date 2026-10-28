@@ -46,8 +46,9 @@ def tray_image(color: str) -> Image.Image:
 
 
 class App:
-    def __init__(self, cfg, engine, script: Path, start_hidden: bool):
+    def __init__(self, cfg, engine, script: Path, start_hidden: bool, log_path: Path | None = None):
         self.cfg, self.engine, self.script = cfg, engine, script
+        self.log_path = log_path
         self.q: queue.Queue = queue.Queue()
         self._last_state, self._last_paused, self._log_top = None, None, None
         if sys.platform == "win32":
@@ -59,6 +60,12 @@ class App:
         self.root = tk.Tk()
         self.root.report_callback_exception = self._tk_error     # под pythonw консоли нет — пишем в журнал
         self.root.title("Photocloud — бэкап")
+        if sys.platform == "win32":
+            try:                                   # своя группа на панели задач и свой значок, а не python.exe
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("photocloud.backup")
+            except Exception:  # noqa: BLE001
+                pass
         self.root.geometry("700x620")
         self.root.minsize(600, 540)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
@@ -69,6 +76,8 @@ class App:
             pass
         self._build()
         self.tray = None
+        self._tray_thread = None
+        self._tray_status = "Photocloud — бэкап"
         self._start_tray()
         configured = bool(cfg.server and cfg.token and cfg.root)
         if not configured:
@@ -142,6 +151,12 @@ class App:
         # --- журнал
         lg = ttk.Frame(self.nb)
         self.nb.add(lg, text="Журнал")
+        lb = ttk.Frame(lg)
+        lb.pack(fill="x", side="bottom", pady=(6, 0))
+        if self.log_path:
+            ttk.Label(lb, text=f"Подробный журнал: {self.log_path}", foreground="#999", wraplength=480).pack(
+                side="left", padx=4)
+            ttk.Button(lb, text="Открыть", command=lambda: winutil.open_folder(str(self.log_path))).pack(side="right")
         self.logbox = tk.Text(lg, wrap="none", height=10, state="disabled", font=("Consolas", 9))
         ys = ttk.Scrollbar(lg, orient="vertical", command=self.logbox.yview)
         self.logbox.configure(yscrollcommand=ys.set)
@@ -354,13 +369,21 @@ class App:
     def quit(self) -> None:
         self.engine.shutdown()
         if self.tray:
-            self.tray.stop()
+            try:
+                self.tray.stop()
+                self._tray_thread.join(3)
+            except Exception:  # noqa: BLE001
+                pass
         self.engine.join(5)
         self.root.destroy()
 
     # ------------------------------------------------------------ трей
 
     def _start_tray(self) -> None:
+        """Значок в трее (pystray). Важно для Windows: значок создаётся и работает в ОДНОМ своём
+        потоке — его цикл сообщений видит только окна своего потока; если создать Icon в потоке
+        окна, а run() вызвать в другом, значок висит или не появляется (pystray #94).
+        Окно tkinter — в главном потоке; из меню значка команды идут в окно через очередь."""
         try:
             import pystray
         except ImportError:
@@ -369,7 +392,7 @@ class App:
             return
         call = lambda fn: (lambda *_a: self.q.put(fn))        # noqa: E731 — из потока трея в поток окна
         self._tray_status = "Photocloud — бэкап"
-        menu = pystray.Menu(
+        self._tray_menu = pystray.Menu(
             pystray.MenuItem(lambda _i: self._tray_status, None, enabled=False),      # состояние
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Открыть окно", call(self.show), default=True),        # и по щелчку по значку
@@ -382,19 +405,31 @@ class App:
             pystray.MenuItem("Выход", call(self.quit)),
         )
         self._tray_imgs = {c: tray_image(c) for c in set(COLORS.values())}
-        self._tray_menu, self._pystray = menu, pystray
+        base = pystray.Icon
+        if sys.platform == "win32":
+            from pystray._util import win32 as w32
+
+            class TrayIcon(base):
+                def _on_notify(self, wparam, lparam):
+                    # меню собираем заново прямо перед показом, в потоке значка: всегда свежее состояние
+                    if lparam == w32.WM_RBUTTONUP:
+                        try:
+                            self._update_menu()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return super()._on_notify(wparam, lparam)
+            self._tray_cls = TrayIcon
+        else:
+            self._tray_cls = base
         self._tray_attempt = 0
         self._launch_tray()
 
     def _launch_tray(self) -> None:
-        """Значок в трее живёт в своём потоке. Не поднялся (бывает при автозапуске, пока панель
-        задач Windows ещё не готова) — пробуем снова через 15 с, окно при этом не показываем."""
+        """Не поднялся (бывает при автозапуске, пока панель задач ещё не готова) — снова через 15 с."""
         import logging
         lg = logging.getLogger("pcbackup")
         self._tray_attempt += 1
-        state = self._last_state or "setup"
-        icon = self._pystray.Icon("photocloud-backup", self._tray_imgs[COLORS.get(state, COLORS["setup"])],
-                                  self._tray_status[:120], self._tray_menu)
+        img = self._tray_imgs[COLORS.get(self._last_state or "setup", COLORS["setup"])]
 
         def setup(ic):
             for i in range(120):                     # панель задач может появиться не сразу
@@ -409,13 +444,15 @@ class App:
 
         def run():
             try:
+                icon = self._tray_cls("photocloud-backup", img, self._tray_status[:120], self._tray_menu)
+                self.tray = icon                     # создан в этом же потоке, где и run()
                 icon.run(setup)
             except Exception:  # noqa: BLE001
                 lg.exception("значок в трее не запустился (попытка %d)", self._tray_attempt)
                 self.q.put(self._tray_failed)
 
-        self.tray = icon
-        threading.Thread(target=run, name="tray", daemon=True).start()
+        self._tray_thread = threading.Thread(target=run, name="tray", daemon=True)
+        self._tray_thread.start()
 
     def _tray_failed(self) -> None:
         self.tray = None
@@ -487,9 +524,8 @@ class App:
                 if text != self._tray_status:
                     self._tray_status = text
                     self.tray.title = text[:120]           # подсказка при наведении (Windows: до 127 символов)
-                    self.tray.update_menu()
-                elif s["paused"] != self._last_paused:
-                    self.tray.update_menu()
+                    if sys.platform != "win32":            # в Windows меню пересобирается при каждом показе
+                        self.tray.update_menu()
             except Exception:  # noqa: BLE001 — значок не обновился: окно всё равно работает
                 pass
         self._last_state, self._last_paused = state, s["paused"]
