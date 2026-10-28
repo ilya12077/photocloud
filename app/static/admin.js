@@ -294,7 +294,7 @@ function ago(ts) {
   if (s < 172800) return Math.round(s / 3600) + ' ч назад';
   return Math.round(s / 86400) + ' дн назад';
 }
-const BK_STATE = { copying: 'копирует', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
+const BK_STATE = { copying: 'копирует', disk_full: 'мало места на диске', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
 
 async function loadBackup() {
   const r = await act(() => api('/api/admin/backup')); if (!r) return;

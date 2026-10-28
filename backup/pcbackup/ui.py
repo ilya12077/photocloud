@@ -17,9 +17,9 @@ from . import winutil
 from .engine import VERSION, Api, AuthError, PcOff, human
 
 COLORS = {"copying": "#2f80ed", "done": "#27ae60", "paused": "#9aa0a6", "pc_off": "#f2994a", "waiting": "#2f80ed",
-          "error": "#eb5757", "confirm": "#eb5757", "setup": "#9aa0a6", "scan": "#2f80ed"}
+          "error": "#eb5757", "confirm": "#eb5757", "disk_full": "#eb5757", "setup": "#9aa0a6", "scan": "#2f80ed"}
 TITLES = {"copying": "копирует", "done": "всё скопировано", "paused": "пауза", "pc_off": "компьютер выключен",
-          "waiting": "ждёт хеши с сервера", "error": "ошибка", "confirm": "ждёт подтверждения", "setup": "не настроен",
+          "waiting": "ждёт хеши с сервера", "error": "ошибка", "disk_full": "мало места на диске", "confirm": "ждёт подтверждения", "setup": "не настроен",
           "scan": "проверяет папку бэкапа"}
 KIND = {"info": "", "warn": "⚠ ", "error": "✖ ", "move": "↪ ", "copy": "", "update": "✎ ", "delete": "🗑 "}
 
@@ -149,6 +149,7 @@ class App:
         self.v_root = tk.StringVar(value=self.cfg.root)
         self.v_auto = tk.BooleanVar(value=self.cfg.autostart)
         self.v_wake = tk.BooleanVar(value=self.cfg.wake_on_start)
+        self.v_free = tk.StringVar(value=self._fmt_limit(self.cfg.min_free_gb))
         self.v_test = tk.StringVar()
         r = 0
         ttk.Label(s, text="Адрес сайта:").grid(row=r, column=0, sticky="w", padx=12, pady=(14, 4))
@@ -163,6 +164,13 @@ class App:
         ttk.Label(s, text="Папка бэкапа:").grid(row=r, column=0, sticky="w", padx=12, pady=4)
         ttk.Entry(s, textvariable=self.v_root).grid(row=r, column=1, sticky="ew", padx=(12, 4), pady=4)
         ttk.Button(s, text="Выбрать…", command=self.pick_root).grid(row=r, column=2, padx=(0, 12), pady=4)
+        r += 1
+        ttk.Label(s, text="Оставлять свободным:").grid(row=r, column=0, sticky="w", padx=12, pady=4)
+        fr = ttk.Frame(s)
+        fr.grid(row=r, column=1, columnspan=2, sticky="w", padx=12, pady=4)
+        ttk.Spinbox(fr, from_=0, to=10000, increment=1, width=7, textvariable=self.v_free).pack(side="left")
+        ttk.Label(fr, text="ГБ на диске — если меньше, новые файлы не скачиваются", foreground="#666").pack(
+            side="left", padx=6)
         r += 1
         ttk.Checkbutton(s, text="Запускать при входе в Windows", variable=self.v_auto).grid(
             row=r, column=1, columnspan=2, sticky="w", padx=12, pady=(10, 2))
@@ -231,6 +239,13 @@ class App:
         except OSError as e:
             messagebox.showerror("Бэкап", f"Не создать папку: {e}", parent=self.root)
             return
+        try:
+            free_gb = float(self.v_free.get().replace(",", "."))
+            if not 0 <= free_gb <= 100000:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Бэкап", "Свободное место: число ГБ, 0 — без ограничения", parent=self.root)
+            return
         tok = self.v_token.get().strip()
         if not tok and not self.cfg.token:
             messagebox.showerror("Бэкап", "Вставьте токен", parent=self.root)
@@ -245,6 +260,7 @@ class App:
         if tok:
             self.cfg.token = tok
         self.cfg.autostart, self.cfg.wake_on_start = self.v_auto.get(), self.v_wake.get()
+        self.cfg.min_free_gb = free_gb
         self.cfg.save()
         try:
             winutil.set_autostart(self.cfg.autostart, self.script)
