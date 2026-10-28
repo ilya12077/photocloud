@@ -1189,12 +1189,14 @@ async def backup_wake(t=Depends(require_backup)):
 async def backup_manifest(request: Request, t=Depends(require_backup)):
     """Все видимые токену файлы: [путь, размер, mtime, дата снимка, sha256 | null]."""
     access = _token_access(t)
-    hashes = await run_in_threadpool(db.hashes_load)
+    # клиенты спрашивают раз в 10 с: «ничего не поменялось» отвечаем без чтения всех хешей
+    n_hashes = await run_in_threadpool(db.hashes_count)
     ver = library.version
-    tag = hashlib.blake2b(f"{ver}|{len(hashes)}|{access!r}|{library.skipped}".encode(), digest_size=10).hexdigest()
+    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{access!r}|{library.skipped}".encode(), digest_size=10).hexdigest()
     etag = f'"{tag}"'
     if ver and request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"etag": etag, "cache-control": "no-store"})
+    hashes = await run_in_threadpool(db.hashes_load)
 
     def build() -> bytes:
         files = [[p.rel, p.size, int(p.mtime), int(p.date), hashes.get(p.cache_key())]
