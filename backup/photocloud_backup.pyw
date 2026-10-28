@@ -24,6 +24,7 @@ def main() -> None:
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
     log = logging.getLogger("pcbackup")
+    log.info("старт: %s, python %s", Path(__file__).resolve(), sys.executable)
 
     app = None
     inst = winutil.SingleInstance(d, lambda: app and app.q.put(app.show))

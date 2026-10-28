@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sys
 import threading
 from pathlib import Path
 
 IS_WIN = sys.platform == "win32"
+log = logging.getLogger("pcbackup.config")
 
 
 def app_dir() -> Path:
@@ -64,7 +66,7 @@ else:                                      # для проверки на Linux:
 
 
 class Config:
-    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart", "min_free_gb")
+    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart", "min_free_gb", "hide_on_autostart")
 
     def __init__(self, path: Path | None = None):
         self.path = path or app_dir() / "config.json"
@@ -76,13 +78,20 @@ class Config:
         self.paused = False
         self.wake_on_start = True
         self.autostart = True
+        self.hide_on_autostart = True     # при автозапуске — только значок в трее, без окна
         self._mu = threading.Lock()
         self.load()
 
     def load(self) -> None:
+        self.load_error = ""
+        if not self.path.exists():
+            log.info("настройки: %s — файла нет, нужна настройка", self.path)
+            return
         try:
             d = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            self.load_error = f"{type(e).__name__}: {e}"
+            log.error("настройки: %s не читается: %s", self.path, self.load_error)
             return
         for k in self.FIELDS:
             if k in d:
@@ -91,14 +100,22 @@ class Config:
         if enc:
             try:
                 self.token = unprotect(base64.b64decode(enc)).decode()
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
                 self.token = ""               # другой пользователь/компьютер — токен надо ввести заново
+                self.load_error = "токен не расшифровался (другая учётная запись Windows?)"
+                log.error("настройки: токен не расшифровался: %s", e)
+        log.info("настройки: %s — сервер %s, папка %s, токен %s", self.path, self.server or "—",
+                 self.root or "—", "есть" if self.token else "нет")
 
     def save(self) -> None:
         with self._mu:
             d = {k: getattr(self, k) for k in self.FIELDS}
-            if self.token:
-                d["token_dpapi"] = base64.b64encode(protect(self.token.encode())).decode()
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-            os.replace(tmp, self.path)
+            try:
+                if self.token:
+                    d["token_dpapi"] = base64.b64encode(protect(self.token.encode())).decode()
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+                os.replace(tmp, self.path)
+            except Exception:
+                log.exception("настройки: не удалось сохранить %s", self.path)
+                raise

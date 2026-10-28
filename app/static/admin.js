@@ -40,8 +40,18 @@ function toast(msg, bad) {
   const t = $('toast'); t.textContent = msg; t.hidden = false; t.classList.toggle('bad', !!bad);
   clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, 3500);
 }
+// Живое обновление: открытая вкладка сама перезапрашивает свои данные и перерисовывается,
+// только если что-то поменялось. Ошибки фонового опроса не всплывают тостами.
+let POLL = false;
+const lastData = {};
+function unchanged(key, data) {
+  const j = JSON.stringify(data);
+  const same = lastData[key] === j;
+  lastData[key] = j;
+  return POLL && same;
+}
 async function act(fn, okMsg) {
-  try { const r = await fn(); if (okMsg) toast(okMsg); return r; } catch (e) { toast(e.message, true); return null; }
+  try { const r = await fn(); if (okMsg) toast(okMsg); return r; } catch (e) { if (!POLL) toast(e.message, true); return null; }
 }
 // подписи ячеек для телефона: там таблица показывается карточками «подпись — значение»
 function labelize(tbody) {
@@ -90,8 +100,19 @@ function showSetup(token) {
 
 // ================================================================== вкладки
 
+const POLL_MS = { overview: 3000, users: 10000, security: 5000, backup: 2000, perf: 5000, logs: 5000 };   // settings — нет: там форма
+let curTab = 'overview', polledAt = 0, polling = false;
+setInterval(async () => {
+  const ms = POLL_MS[curTab];
+  if (!ms || polling || document.hidden || $('panel').hidden || Date.now() - polledAt < ms) return;
+  polling = true; POLL = true;
+  try { await loaders[curTab](); } catch (_) { /* следующий раз */ } finally { POLL = false; polling = false; polledAt = Date.now(); }
+}, 500);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) polledAt = 0; });   // вернулся во вкладку — сразу свежее
+
 const loaders = { overview: loadOverview, users: loadUsers, security: loadSecurity, backup: loadBackup, settings: loadSettings, perf: loadPerf, logs: loadLogs };
 function showTab(name) {
+  curTab = name; polledAt = Date.now();
   for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.tab === name);
   for (const p of document.querySelectorAll('[data-pane]')) p.hidden = p.dataset.pane !== name;
   loaders[name]();
@@ -105,6 +126,7 @@ function dur(s) { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 36
 
 async function loadOverview() {
   const o = await act(() => api('/api/admin/overview')); if (!o) return;
+  if (unchanged('overview', { ...o, uptime: Math.floor(o.uptime / 60) })) return;
   const ix = o.index;
   const cards = [
     ['Версия', o.version || '—'],
@@ -146,7 +168,10 @@ $('act-cache').onclick = () => act(() => api('/api/admin/cache/clear', {}), 'К�
 // ================================================================== пользователи
 
 async function loadUsers() {
+  // пока открыт редактор папок или что-то в таблице в фокусе — не перерисовываем под рукой
+  if (POLL && (document.querySelector('#users .fold-edit') || (document.activeElement && document.activeElement.closest('#users')))) return;
   const r = await act(() => api('/api/admin/users')); if (!r) return;
+  if (unchanged('users', r)) return;
   const tb = $('users').tBodies[0];
   tb.replaceChildren(...r.users.map((u) => {
     const tr = el('tr');
@@ -258,7 +283,7 @@ $('add-user').addEventListener('submit', async (e) => {
 
 async function loadSecurity() {
   const r = await act(() => api('/api/admin/sessions')); if (!r) return;
-  $('sessions').tBodies[0].replaceChildren(...r.sessions.map((s) => {
+  if (!unchanged('sessions', r)) $('sessions').tBodies[0].replaceChildren(...r.sessions.map((s) => {
     const tr = el('tr'); const ops = el('td', 'ops');
     if (s.id === r.current) ops.append(el('span', 'dim2', 'текущая'));
     else ops.append(btn('закрыть', async () => { await act(() => api(`/api/admin/sessions/${s.id}/revoke`, {}), 'Сессия закрыта'); loadSecurity(); }, 'danger'));
@@ -266,6 +291,7 @@ async function loadSecurity() {
     return tr;
   }));
   const l = await act(() => api('/api/admin/lockouts')); if (!l) return;
+  if (unchanged('locks', l.locked.map((x) => [x.ip, Math.ceil(x.left / 60)]))) return;
   const tb = $('locks').tBodies[0];
   if (!l.locked.length) { const tr = el('tr'); const td = el('td', 'dim2', 'нет'); td.colSpan = 3; tr.append(td); tb.replaceChildren(tr); return; }
   tb.replaceChildren(...l.locked.map((x) => {
@@ -296,15 +322,20 @@ function ago(ts) {
 }
 const BK_STATE = { copying: 'копирует', disk_full: 'мало места на диске', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
 
+const mbs = (b) => (b >= 1048576 ? (b / 1048576).toFixed(1).replace('.', ',') + ' МБ/с' : Math.round(b / 1024) + ' КБ/с');
 async function loadBackup() {
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
+  // «на связи N мин назад» тоже должно идти, поэтому сравниваем с точностью до минуты
+  if (unchanged('backup', { ...r, now: Math.floor(Date.now() / 60000) })) return;
   const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Клиентов', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
   $('bk-hash-stop').hidden = r.hashes.state !== 'running';
   $('bk-hash-start').hidden = !r.tokens.length || !['stopped', 'error', ''].includes(r.hashes.state);
-  const sel = $('bk-user'); const cur = sel.value;
-  sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
-  if (cur && r.users.includes(cur)) sel.value = cur;
+  const sel = $('bk-user'), cur = sel.value;
+  if ([...sel.options].map((o) => o.value).join('\n') !== r.users.join('\n')) {     // открытый список не закрываем зря
+    sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
+    if (cur && r.users.includes(cur)) sel.value = cur;
+  }
   const tb = $('bk-tokens').tBodies[0];
   if (!r.tokens.length) { const tr = el('tr'); const td = el('td', 'dim2', 'клиентов пока нет'); td.colSpan = 8; tr.append(td); tb.replaceChildren(tr); return; }
   tb.replaceChildren(...r.tokens.map((t) => {
@@ -315,11 +346,25 @@ async function loadBackup() {
     }, 'danger'));
     const copied = rp.files != null ? `${(rp.files - (rp.left_files || 0)).toLocaleString('ru')} файлов, ${gb((rp.bytes || 0) - (rp.left_bytes || 0))}` : '—';
     const left = rp.left_files != null ? (rp.left_files ? `${rp.left_files.toLocaleString('ru')} (${gb(rp.left_bytes || 0)})` : 'ничего') : '—';
-    let state = BK_STATE[rp.state] || rp.state || '—';
-    if (rp.errors) state += ` · ошибок: ${rp.errors}`;
-    if (rp.error) state += ` · ${rp.error}`;
+    const st = el('td');
+    st.append(el('div', null, BK_STATE[rp.state] || rp.state || '—'));
+    // давно не было отчёта — «копирует» уже не правда
+    const fresh = rp.at && Date.now() / 1000 - rp.at < 60;
+    if (rp.state === 'copying' && fresh) {
+      const bits = [];
+      if (rp.speed) bits.push(mbs(rp.speed));
+      if (rp.limit_mbps) bits.push(`лимит ${rp.limit_mbps} Мбит/с`);
+      if (rp.raw_bytes > rp.wire_bytes && rp.wire_bytes) bits.push(`сжатие −${Math.round((1 - rp.wire_bytes / rp.raw_bytes) * 100)}%`);
+      if (bits.length) st.append(el('div', 'dim2', bits.join(' · ')));
+      if (rp.current) {
+        const pct = rp.cur_size ? ` — ${Math.floor(rp.cur_done / rp.cur_size * 100)}%` : '';
+        const f = el('div', 'dim2 bk-cur', rp.current.split('/').pop() + pct); f.title = rp.current; st.append(f);
+      }
+    } else if (rp.state === 'copying') st.firstChild.textContent = 'копировал, давно нет связи';
+    if (rp.errors) st.append(el('div', 'dim2', `ошибок: ${rp.errors}`));
+    if (rp.error) st.append(el('div', 'err', rp.error));
     const seen = el('td', null, ago(t.last_seen)); if (t.last_ip) seen.title = t.last_ip;
-    tr.append(el('td', null, t.name), el('td', 'mono', t.user), seen, el('td', null, copied), el('td', null, left), el('td', null, state), el('td', null, dt(t.created)), ops);
+    tr.append(el('td', null, t.name), el('td', 'mono', t.user), seen, el('td', null, copied), el('td', null, left), st, el('td', null, dt(t.created)), ops);
     return tr;
   }));
 }
@@ -377,6 +422,7 @@ const ms = (v) => (v == null ? '—' : v >= 1000 ? (v / 1000).toFixed(1) + ' с'
 
 async function loadPerf() {
   const r = await act(() => api('/api/admin/perf')); if (!r) return;
+  if (unchanged('perf', r)) return;
   $('perf-meta').textContent = `потоков: ${r.workers} · из кэша: ${r.hit_ratio ?? '—'}% из ${r.requests} · сейчас в работе: ${r.inflight}`;
   const tb = $('perf').tBodies[0];
   if (!r.rows.length) { const tr = el('tr'); const td = el('td', 'dim2', 'пока нет данных — полистай ленту или запусти тест'); td.colSpan = 11; tr.append(td); tb.replaceChildren(tr); return; }
@@ -419,6 +465,7 @@ async function loadLogs() {
   $('log-level').hidden = kind !== 'server';
   const q = kind === 'server' ? `?kind=server&level=${$('log-level').value}` : '?kind=audit';
   const r = await act(() => api('/api/admin/logs' + q)); if (!r) return;
+  if (unchanged('logs' + q, r.items.length ? [r.items.length, r.items[r.items.length - 1]] : [])) return;
   logItems = r.items.slice().reverse();
   drawLogs();
 }

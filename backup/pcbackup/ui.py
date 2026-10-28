@@ -57,9 +57,10 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
         self.root = tk.Tk()
+        self.root.report_callback_exception = self._tk_error     # под pythonw консоли нет — пишем в журнал
         self.root.title("Photocloud — бэкап")
-        self.root.geometry("620x500")
-        self.root.minsize(520, 420)
+        self.root.geometry("700x620")
+        self.root.minsize(600, 540)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         try:
             self._icon_img = tk.PhotoImage(data=self._png(tray_image(COLORS["done"])))
@@ -72,9 +73,17 @@ class App:
         configured = bool(cfg.server and cfg.token and cfg.root)
         if not configured:
             self.nb.select(self.tab_set)
-        if start_hidden and configured:
+        if getattr(cfg, "load_error", ""):
+            self.root.after(500, lambda: messagebox.showwarning(
+                "Бэкап", f"Настройки не прочитались: {cfg.load_error}\nФайл: {cfg.path}", parent=self.root))
+        if start_hidden and configured and cfg.hide_on_autostart and self.tray is not None:
             self.root.withdraw()
         self.root.after(300, self.tick)
+
+    def _tk_error(self, exc, val, tb) -> None:
+        import logging
+        logging.getLogger("pcbackup").error("ошибка в окне", exc_info=(exc, val, tb))
+        messagebox.showerror("Бэкап", f"Ошибка: {exc.__name__}: {val}", parent=self.root)
 
     @staticmethod
     def _png(im: Image.Image) -> bytes:
@@ -100,11 +109,11 @@ class App:
         self.v_current = tk.StringVar()
         self.v_speed = tk.StringVar()
         ttk.Label(t, textvariable=self.v_state, font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=12, pady=(12, 0))
-        ttk.Label(t, textvariable=self.v_detail, foreground="#666", wraplength=560).pack(anchor="w", **pad)
+        ttk.Label(t, textvariable=self.v_detail, foreground="#666", wraplength=640).pack(anchor="w", **pad)
         self.bar = ttk.Progressbar(t, maximum=1000)
         self.bar.pack(fill="x", padx=12, pady=(8, 4))
         ttk.Label(t, textvariable=self.v_counts).pack(anchor="w", **pad)
-        ttk.Label(t, textvariable=self.v_current, foreground="#666", wraplength=560).pack(anchor="w", **pad)
+        ttk.Label(t, textvariable=self.v_current, foreground="#666", wraplength=640).pack(anchor="w", **pad)
         ttk.Label(t, textvariable=self.v_speed).pack(anchor="w", **pad)
 
         self.confirm = ttk.Frame(t)
@@ -148,6 +157,7 @@ class App:
         self.v_token = tk.StringVar()
         self.v_root = tk.StringVar(value=self.cfg.root)
         self.v_auto = tk.BooleanVar(value=self.cfg.autostart)
+        self.v_hide = tk.BooleanVar(value=self.cfg.hide_on_autostart)
         self.v_wake = tk.BooleanVar(value=self.cfg.wake_on_start)
         self.v_free = tk.StringVar(value=self._fmt_limit(self.cfg.min_free_gb))
         self.v_test = tk.StringVar()
@@ -169,11 +179,16 @@ class App:
         fr = ttk.Frame(s)
         fr.grid(row=r, column=1, columnspan=2, sticky="w", padx=12, pady=4)
         ttk.Spinbox(fr, from_=0, to=10000, increment=1, width=7, textvariable=self.v_free).pack(side="left")
-        ttk.Label(fr, text="ГБ на диске — если меньше, новые файлы не скачиваются", foreground="#666").pack(
+        ttk.Label(fr, text="ГБ на диске (иначе новые файлы не качаются)", foreground="#666").pack(
             side="left", padx=6)
         r += 1
-        ttk.Checkbutton(s, text="Запускать при входе в Windows", variable=self.v_auto).grid(
-            row=r, column=1, columnspan=2, sticky="w", padx=12, pady=(10, 2))
+        ttk.Checkbutton(s, text="Запускать при входе в Windows", variable=self.v_auto,
+                        command=self._sync_hide).grid(row=r, column=1, columnspan=2, sticky="w", padx=12, pady=(10, 2))
+        r += 1
+        self.c_hide = ttk.Checkbutton(s, text="Не показывать окно при автозапуске (только значок в трее)",
+                                      variable=self.v_hide)
+        self.c_hide.grid(row=r, column=1, columnspan=2, sticky="w", padx=(32, 12), pady=2)
+        self._sync_hide()
         r += 1
         ttk.Checkbutton(s, text="Будить домашний компьютер при запуске", variable=self.v_wake).grid(
             row=r, column=1, columnspan=2, sticky="w", padx=12, pady=2)
@@ -185,10 +200,21 @@ class App:
         r += 1
         ttk.Label(s, textvariable=self.v_test, wraplength=440).grid(row=r, column=1, columnspan=2, sticky="w", padx=12)
         r += 1
+        ttk.Label(s, text="Закрытие окна оставляет программу в трее (значок у часов; в Windows 11 он может "
+                          "быть спрятан под стрелкой ^ — его можно перетащить на панель). Выход — правой кнопкой "
+                          "по значку → «Выход».", foreground="#666", wraplength=640).grid(
+            row=r, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 0))
+        r += 1
+        ttk.Label(s, text=f"Настройки: {self.cfg.path}", foreground="#999", wraplength=640).grid(
+            row=r, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 0))
+        r += 1
         ttk.Label(s, text=f"photocloud-backup {VERSION}", foreground="#999").grid(
             row=r, column=0, columnspan=3, sticky="sw", padx=12, pady=12)
         s.rowconfigure(r, weight=1)
         self._token_hint()
+
+    def _sync_hide(self) -> None:
+        self.c_hide.state(["!disabled"] if self.v_auto.get() else ["disabled"])
 
     def _token_hint(self) -> None:
         self.l_token.configure(text="Токен сохранён (зашифрован). Оставьте поле пустым, чтобы не менять."
@@ -260,8 +286,14 @@ class App:
         if tok:
             self.cfg.token = tok
         self.cfg.autostart, self.cfg.wake_on_start = self.v_auto.get(), self.v_wake.get()
+        self.cfg.hide_on_autostart = self.v_hide.get()
         self.cfg.min_free_gb = free_gb
-        self.cfg.save()
+        try:
+            self.cfg.save()
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Бэкап", f"Не удалось сохранить настройки в {self.cfg.path}:\n{type(e).__name__}: {e}",
+                                 parent=self.root)
+            return
         try:
             winutil.set_autostart(self.cfg.autostart, self.script)
         except OSError as e:
@@ -315,8 +347,8 @@ class App:
         self.root.focus_force()
 
     def hide(self) -> None:
-        if self.tray is None:              # без значка в трее закрытие окна = выход
-            self.quit()
+        if self.tray is None:              # значка в трее нет — сворачиваем, чтобы копирование не остановилось
+            self.root.iconify()
         else:
             self.root.withdraw()
 
@@ -333,19 +365,50 @@ class App:
         try:
             import pystray
         except ImportError:
+            import logging
+            logging.getLogger("pcbackup").error("нет библиотеки pystray — значка в трее не будет")
             return
         call = lambda fn: (lambda *_a: self.q.put(fn))        # noqa: E731 — из потока трея в поток окна
+        self._tray_status = "Photocloud — бэкап"
         menu = pystray.Menu(
-            pystray.MenuItem("Открыть", call(self.show), default=True),
-            pystray.MenuItem(lambda _i: "Продолжить" if self.cfg.paused else "Пауза", call(self.toggle_pause)),
+            pystray.MenuItem(lambda _i: self._tray_status, None, enabled=False),      # состояние
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Открыть окно", call(self.show), default=True),        # и по щелчку по значку
+            pystray.MenuItem(lambda _i: "Продолжить копирование" if self.cfg.paused else "Пауза",
+                             call(self.toggle_pause)),
             pystray.MenuItem("Проверить сейчас", call(self.engine.sync_now)),
-            pystray.MenuItem("Разбудить ПК", call(self.engine.wake_now)),
+            pystray.MenuItem("Разбудить домашний ПК", call(self.engine.wake_now)),
+            pystray.MenuItem("Открыть папку бэкапа", call(self.open_root)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", call(self.quit)),
         )
         self._tray_imgs = {c: tray_image(c) for c in set(COLORS.values())}
         self.tray = pystray.Icon("photocloud-backup", self._tray_imgs[COLORS["setup"]], "Photocloud — бэкап", menu)
-        threading.Thread(target=self.tray.run, name="tray", daemon=True).start()
+
+        def run():
+            try:
+                self.tray.run()
+            except Exception:  # noqa: BLE001
+                import logging
+                logging.getLogger("pcbackup").exception("значок в трее не запустился")
+                self.q.put(self._tray_failed)
+
+        threading.Thread(target=run, name="tray", daemon=True).start()
+
+    def _tray_failed(self) -> None:
+        self.tray = None
+        self.show()
+
+    def _tray_text(self, s: dict, state: str) -> str:
+        t = TITLES.get(state, state)
+        if state == "copying":
+            if s["bytes"]:
+                t += f" · {100 * s['have_bytes'] // s['bytes']}%"
+            if s["speed"]:
+                t += f" · {human(s['speed'])}/с"
+        elif state in ("done", "waiting") and s["files"]:
+            t += f" · {num(s['have_files'])} из {num(s['files'])}"
+        return "Бэкап: " + t
 
     # ------------------------------------------------------------ обновление
 
@@ -394,11 +457,17 @@ class App:
                 self.logbox.insert("end", f"{time.strftime('%d.%m %H:%M:%S', time.localtime(ts))}  "
                                           f"{KIND.get(kind, '')}{text}{'  ' + path if path else ''}\n")
             self.logbox.configure(state="disabled")
-        if self.tray and (state != self._last_state or s["paused"] != self._last_paused):
+        if self.tray:
+            text = self._tray_text(s, state)
             try:
-                self.tray.icon = self._tray_imgs[COLORS.get(state, COLORS["setup"])]
-                self.tray.title = f"Photocloud — бэкап: {TITLES.get(state, state)}"
-                self.tray.update_menu()
+                if state != self._last_state or s["paused"] != self._last_paused:
+                    self.tray.icon = self._tray_imgs[COLORS.get(state, COLORS["setup"])]
+                if text != self._tray_status:
+                    self._tray_status = text
+                    self.tray.title = text[:120]           # подсказка при наведении (Windows: до 127 символов)
+                    self.tray.update_menu()
+                elif s["paused"] != self._last_paused:
+                    self.tray.update_menu()
             except Exception:  # noqa: BLE001 — значок не обновился: окно всё равно работает
                 pass
         self._last_state, self._last_paused = state, s["paused"]
