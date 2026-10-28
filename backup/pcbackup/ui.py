@@ -76,7 +76,7 @@ class App:
         if getattr(cfg, "load_error", ""):
             self.root.after(500, lambda: messagebox.showwarning(
                 "Бэкап", f"Настройки не прочитались: {cfg.load_error}\nФайл: {cfg.path}", parent=self.root))
-        if start_hidden and configured and cfg.hide_on_autostart and self.tray is not None:
+        if start_hidden and configured and cfg.hide_on_autostart:
             self.root.withdraw()
         self.root.after(300, self.tick)
 
@@ -347,10 +347,9 @@ class App:
         self.root.focus_force()
 
     def hide(self) -> None:
-        if self.tray is None:              # значка в трее нет — сворачиваем, чтобы копирование не остановилось
-            self.root.iconify()
-        else:
-            self.root.withdraw()
+        """Крестик — окно прячется совсем (и из панели задач); программа остаётся значком в трее.
+        Если значок вдруг не поднялся, окно снова открывается повторным запуском программы."""
+        self.root.withdraw()
 
     def quit(self) -> None:
         self.engine.shutdown()
@@ -383,21 +382,44 @@ class App:
             pystray.MenuItem("Выход", call(self.quit)),
         )
         self._tray_imgs = {c: tray_image(c) for c in set(COLORS.values())}
-        self.tray = pystray.Icon("photocloud-backup", self._tray_imgs[COLORS["setup"]], "Photocloud — бэкап", menu)
+        self._tray_menu, self._pystray = menu, pystray
+        self._tray_attempt = 0
+        self._launch_tray()
+
+    def _launch_tray(self) -> None:
+        """Значок в трее живёт в своём потоке. Не поднялся (бывает при автозапуске, пока панель
+        задач Windows ещё не готова) — пробуем снова через 15 с, окно при этом не показываем."""
+        import logging
+        lg = logging.getLogger("pcbackup")
+        self._tray_attempt += 1
+        state = self._last_state or "setup"
+        icon = self._pystray.Icon("photocloud-backup", self._tray_imgs[COLORS.get(state, COLORS["setup"])],
+                                  self._tray_status[:120], self._tray_menu)
+
+        def setup(ic):
+            for i in range(120):                     # панель задач может появиться не сразу
+                try:
+                    ic.visible = True
+                    lg.info("значок в трее показан (попытка %d)", self._tray_attempt)
+                    return
+                except Exception:  # noqa: BLE001
+                    if i == 0:
+                        lg.exception("значок в трее пока не показывается — повторяю")
+                    time.sleep(5)
 
         def run():
             try:
-                self.tray.run()
+                icon.run(setup)
             except Exception:  # noqa: BLE001
-                import logging
-                logging.getLogger("pcbackup").exception("значок в трее не запустился")
+                lg.exception("значок в трее не запустился (попытка %d)", self._tray_attempt)
                 self.q.put(self._tray_failed)
 
+        self.tray = icon
         threading.Thread(target=run, name="tray", daemon=True).start()
 
     def _tray_failed(self) -> None:
         self.tray = None
-        self.show()
+        self.root.after(15000, self._launch_tray)
 
     def _tray_text(self, s: dict, state: str) -> str:
         t = TITLES.get(state, state)
