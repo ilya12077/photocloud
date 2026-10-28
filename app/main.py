@@ -40,7 +40,7 @@ from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
 from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
-from .storage import make_storage
+from .storage import is_missing, make_storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("photocloud")
@@ -916,7 +916,9 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
         return Response(status_code=499)
     except TooLarge:
         raise HTTPException(413) from None
-    except (ConnectionError, TimeoutError):
+    except (ConnectionError, TimeoutError) as e:
+        if e.__cause__ is not None and is_missing(e.__cause__):
+            raise _gone(p) from None             # эскиз удалённого файла: 404, а не «ПК выключен»
         PC.suspect()
         raise HTTPException(503, "pc") from None
     except (UnidentifiedImageError, Image.DecompressionBombWarning, Image.DecompressionBombError,
@@ -936,6 +938,19 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
                     headers={"cache-control": cc, "server-timing": timing})
 
 
+def _gone(p) -> HTTPException:
+    """Файл из списка пропал с ПК — список устарел: пересканировать папки (не чаще раза в минуту)."""
+    global _gone_rescan
+    log.info("%s уже нет на компьютере — обновляю список файлов", p.rel)
+    if time.time() - _gone_rescan > 60:
+        _gone_rescan = time.time()
+        library.start_build(storage, _index_error)
+    return HTTPException(404, "gone")
+
+
+_gone_rescan = 0.0
+
+
 def _size(f) -> int:
     n = f.seek(0, 2)
     f.seek(0)
@@ -949,7 +964,9 @@ async def serve_file(request: Request, p, extra: dict) -> Response:
     try:
         f = await on_pc(storage.open, p.rel, timeout=30)
         size = await on_pc(_size, f, timeout=30)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        if is_missing(e):
+            raise _gone(p) from None             # удалили на ПК: 404, а не «компьютер выключен»
         PC.suspect()
         raise HTTPException(503, "pc") from None
     start, end, status = 0, size - 1, 200
@@ -1232,13 +1249,17 @@ def _frame(raw: bytes, try_zip: bool) -> tuple[bytes, bool]:
     return bytes([FRAME_RAW]) + len(raw).to_bytes(4, "big") + raw, False
 
 
+
+
 async def _framed(p, start: int) -> Response:
     if not await PC.is_up():
         raise HTTPException(503, "pc")
     try:
         f = await on_pc(storage.open, p.rel, timeout=30)
         size = await on_pc(_size, f, timeout=30)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        if is_missing(e):
+            raise _gone(p) from None
         PC.suspect()
         raise HTTPException(503, "pc") from None
     if start > size:

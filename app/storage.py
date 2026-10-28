@@ -64,6 +64,16 @@ def _not_connection_error(e: BaseException) -> bool:
     return nt is not None and nt not in _RECONNECT_NT
 
 
+_MISSING_NT = {0xC0000034, 0xC000003A, 0xC000000F, 0xC0000056, 0xC0000033}   # нет файла/пути, удаляется, плохое имя
+
+
+def is_missing(e: BaseException) -> bool:
+    """Файла больше нет (удалили или переименовали на ПК) — это не «ПК недоступен»."""
+    if isinstance(e, FileNotFoundError) or getattr(e, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
+        return True
+    return _ntstatus(e) in _MISSING_NT
+
+
 def _skip(name: str) -> bool:
     return name.startswith(".") or name.lower() in SKIP_NAMES
 
