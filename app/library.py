@@ -191,6 +191,16 @@ class Library:
         self.info_total = self.info_done = 0
         self.info_state = ""          # "" | running | stopped | done
         self._info_stop = threading.Event()
+        # фаза 4: SHA-256 содержимого для клиентов бэкапа -> в базу (только если они есть)
+        self.hash_reader = None       # p -> hex; задаёт main
+        self.hash_wanted = lambda: False
+        self.hash_total = self.hash_done = 0
+        self.hash_bytes_total = self.hash_bytes_done = 0
+        self.hash_state = ""          # "" | running | stopped | done
+        self._hash_stop = threading.Event()
+        self._hlock = threading.Lock()
+        self._hthread: threading.Thread | None = None
+        self.skipped = 0              # папок, не прочитанных при последнем обходе (индекс неполный)
         self.version = ""
         self.by_id: dict[str, Photo] = {}
         self.payload = b"{}"
@@ -320,6 +330,7 @@ class Library:
                 photos.append(p)
                 self.progress = len(photos)
             self._publish(photos, folder_list)
+            self.skipped = getattr(storage, "skipped", 0)
             self.built_at, self.state, self.error = time.time(), "ready", ""
             log.info("индекс: %d файлов, %d папок за %.1fс, живых фото: %d", len(photos), len(folder_list),
                      time.time() - t0, sum(1 for p in photos if p.live and not p.video))
@@ -335,7 +346,7 @@ class Library:
         todo = [p for p in photos if p.cache_key() not in self.cache.d and meta.needs_scan(p.ext)]
         if not todo:
             self.cache.save(keep={p.cache_key() for p in photos})
-            self._collect_info(storage, photos)
+            self._after(storage, photos)
             return
         self.meta_total, self.meta_done = len(todo), 0
         t1 = time.time()
@@ -369,7 +380,11 @@ class Library:
         self._publish(photos, folder_list)
         log.info("даты съёмки: %d файлов за %.1fс, найдено у %d", len(todo), time.time() - t1,
                  sum(1 for p in todo if p.taken))
+        self._after(storage, photos)
+
+    def _after(self, storage, photos: list[Photo]) -> None:
         self._collect_info(storage, photos)
+        self.start_hashes(storage)
 
     # ------------------------------------------------------------ фаза 3: подробности в базу
 
@@ -434,3 +449,88 @@ class Library:
         self.info_state = "stopped" if stopped else "done"
         log.info("подробности: %d из %d файлов за %.1fс%s", self.info_done, self.info_total,
                  time.time() - t0, " — остановлено" if stopped else "")
+
+    # ------------------------------------------------------------ фаза 4: хеши для бэкапа
+
+    def start_hashes(self, storage) -> bool:
+        """Хеши считаются в своём потоке: первый проход по архиву — это часы, и всё это
+        время сканирование папок и даты должны работать как обычно. Если пока считали,
+        список файлов обновился — сразу ещё круг по новым."""
+        with self._hlock:
+            if (self._hthread and self._hthread.is_alive()) or not self.by_id or not self.hash_wanted():
+                return False
+
+            def run():
+                while True:
+                    ver = self.version
+                    self._collect_hashes(storage, list(self.by_id.values()))
+                    if self.version == ver or self.hash_state in ("stopped", "error") or not self.hash_wanted():
+                        return
+
+            self._hthread = threading.Thread(target=run, name="meta-hashes", daemon=True)
+            self._hthread.start()
+            return True
+
+    def stop_hashes(self) -> None:
+        self._hash_stop.set()
+
+    def _collect_hashes(self, storage, photos: list[Photo]) -> None:
+        """SHA-256 всех файлов, которых ещё нет в базе. Читает файлы целиком, поэтому
+        только когда есть клиенты бэкапа, в два потока и в фоновой очереди SMB."""
+        db, reader = self.cache.db, self.hash_reader
+        if reader is None or db is None or not self.hash_wanted():
+            return
+        try:
+            gone = db.hashes_prune({p.cache_key() for p in photos})
+            if gone:
+                log.info("хеши: убрано %d записей об отсутствующих файлах", gone)
+            have = set(db.hashes_load())
+        except Exception as e:  # noqa: BLE001
+            log.warning("хеши: база недоступна (%s)", e)
+            return
+        # сначала новые: их бэкап ждёт в первую очередь
+        todo = sorted((p for p in photos if p.cache_key() not in have), key=lambda p: p.date, reverse=True)
+        if not todo:
+            self.hash_state = "done"
+            return
+        self._hash_stop.clear()
+        self.hash_total, self.hash_done, self.hash_state = len(todo), 0, "running"
+        self.hash_bytes_total, self.hash_bytes_done = sum(p.size for p in todo), 0
+        t0, failures, batch, aborted = time.time(), 0, [], False
+
+        def one(p: Photo):
+            if self._hash_stop.is_set():
+                return None
+            return p, reader(p, self._hash_stop)
+
+        with ThreadPoolExecutor(2, thread_name_prefix="meta-hash") as ex:
+            futs = [ex.submit(one, p) for p in todo]
+            for i, fut in enumerate(as_completed(futs), 1):
+                if self._hash_stop.is_set():
+                    for f2 in futs:
+                        f2.cancel()
+                    break
+                try:
+                    r = fut.result()
+                except Exception as e:  # noqa: BLE001 — не прочитали: попробуем в следующий раз
+                    failures += 1
+                    if failures > 20 and failures > i // 2:
+                        log.warning("хеши: слишком много ошибок (%s), прерываю", type(e).__name__)
+                        aborted = True
+                        for f2 in futs:
+                            f2.cancel()
+                        break
+                    continue
+                if r and r[1]:
+                    p, sha = r
+                    batch.append((p.cache_key(), sha))
+                    self.hash_bytes_done += p.size
+                self.hash_done = i
+                if len(batch) >= 100:
+                    db.hashes_put_many(batch)
+                    batch = []
+        db.hashes_put_many(batch)
+        stopped = self._hash_stop.is_set()
+        self.hash_state = "stopped" if stopped else "error" if aborted else "done"
+        log.info("хеши: %d из %d файлов (%.1f ГБ) за %.0fс%s", self.hash_done, self.hash_total,
+                 self.hash_bytes_done / 2**30, time.time() - t0, " — остановлено" if stopped else "")

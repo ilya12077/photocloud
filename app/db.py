@@ -27,6 +27,16 @@ SCHEMA = [
          key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime (как у дат)
          data TEXT NOT NULL)            -- JSON: размеры, камера, координаты
        WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS hashes (
+         key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime (как у дат)
+         sha TEXT NOT NULL)             -- SHA-256 содержимого, hex
+       WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS backup_tokens (
+         key TEXT PRIMARY KEY,          -- SHA-256 токена (сам токен не хранится)
+         id TEXT NOT NULL UNIQUE,       -- короткий id для админки
+         name TEXT NOT NULL, user TEXT NOT NULL,
+         created REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
+         report TEXT NOT NULL DEFAULT '{}', stale_sent INTEGER NOT NULL DEFAULT 0)""",
     """CREATE TABLE IF NOT EXISTS geo (
          key TEXT PRIMARY KEY,          -- «широта,долгота» с точностью ~10 м
          addr TEXT NOT NULL,            -- адрес по-русски; '' — не нашёлся
@@ -123,3 +133,44 @@ class DB:
         if gone:
             self.many("DELETE FROM info WHERE key = ?", gone)
         return len(gone)
+
+    # ------------------------------------------------------------ хеши файлов (для бэкапа)
+
+    def hashes_load(self) -> dict[str, str]:
+        return dict(self.run("SELECT key, sha FROM hashes"))
+
+    def hashes_count(self) -> int:
+        return self.run("SELECT count(*) FROM hashes")[0][0]
+
+    def hashes_put_many(self, items: list[tuple[str, str]]) -> None:
+        if items:
+            self.many("INSERT OR REPLACE INTO hashes(key, sha) VALUES(?, ?)", items)
+
+    def hashes_prune(self, keep: set[str]) -> int:
+        gone = [(k,) for (k,) in self.run("SELECT key FROM hashes") if k not in keep]
+        if gone:
+            self.many("DELETE FROM hashes WHERE key = ?", gone)
+        return len(gone)
+
+    # ------------------------------------------------------------ токены клиентов бэкапа
+
+    _TOKEN_COLS = "key, id, name, user, created, last_seen, last_ip, report, stale_sent"
+
+    def tokens_load(self) -> list[tuple]:
+        return self.run(f"SELECT {self._TOKEN_COLS} FROM backup_tokens ORDER BY created")
+
+    def token_add(self, key: str, tid: str, name: str, user: str, created: float) -> None:
+        self.run("INSERT INTO backup_tokens(key, id, name, user, created) VALUES(?, ?, ?, ?, ?)",
+                 (key, tid, name, user, created))
+
+    def token_delete(self, tid: str) -> None:
+        self.run("DELETE FROM backup_tokens WHERE id = ?", (tid,))
+
+    def token_delete_user(self, user: str) -> None:
+        self.run("DELETE FROM backup_tokens WHERE user = ?", (user,))
+
+    def token_save(self, rows: list[tuple]) -> None:
+        """rows: (last_seen, last_ip, report, stale_sent, id)"""
+        if rows:
+            self.many("UPDATE backup_tokens SET last_seen = ?, last_ip = ?, report = ?, stale_sent = ? WHERE id = ?",
+                      rows)

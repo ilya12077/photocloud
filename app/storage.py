@@ -88,14 +88,18 @@ class LocalStorage:
     def reachable(self) -> bool:
         return self.root.is_dir()
 
+    skipped = 0          # папок, которые не прочитались при последнем обходе
+
     def walk(self) -> Iterator[Item]:
         stack = [("", self.root)]
+        self.skipped = 0
         while stack:
             prefix, d = stack.pop()
             try:
                 it = os.scandir(d)
             except OSError as e:
                 log.warning("scandir %s: %s", prefix or "/", e)
+                self.skipped += 1
                 continue
             with it:
                 for e in it:
@@ -371,11 +375,14 @@ class SMBStorage:
             self._session()
             return fn()
 
+    skipped = 0          # папок, которые не прочитались при последнем обходе
+
     def walk(self) -> Iterator[Item]:
         # собираем список целиком внутри _retry, чтобы переподключение было атомарным
         def run() -> list[Item]:
             out: list[Item] = []
             stack = [("", self.base)]
+            self.skipped = 0
             while stack:
                 prefix, d = stack.pop()
                 try:
@@ -386,6 +393,7 @@ class SMBStorage:
                     if not prefix or not _not_connection_error(e) or _ntstatus(e) == NT_REQUEST_NOT_ACCEPTED:
                         raise
                     log.warning("scandir %s: %s", prefix, type(e).__name__)
+                    self.skipped += 1
                     continue
                 for e in entries:
                     if _skip(e.name):

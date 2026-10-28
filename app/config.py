@@ -104,7 +104,8 @@ _SERVICE_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 # уведомления: либо сервис notify.*, либо сущность, в которой записано имя такого сервиса
 _NOTIFY_RE = re.compile(r"^(notify|input_text|input_select|sensor|text|select)\.[a-z0-9_]+$")
 
-ALL_NOTIFY_EVENTS = {"login", "login_new_ip", "login_failed", "lockout", "wake", "wake_timeout", "index_error"}
+ALL_NOTIFY_EVENTS = {"login", "login_new_ip", "login_failed", "lockout", "wake", "wake_timeout", "index_error",
+                     "backup_stale"}
 
 
 @dataclass
@@ -169,6 +170,7 @@ class Settings:
     max_decode_mb: int = 150
     workers: int = 5
     index_ttl: int = 600
+    backup_stale_days: int = 7            # клиент бэкапа молчит столько дней — уведомление; 0 — не следить
 
 
 def load() -> Settings:
@@ -226,7 +228,7 @@ def load() -> Settings:
             raise ConfigError("HA_WAKE_DATA: должен быть JSON-объект")
     if s.storage == "smb" and not (s.ha_token and s.ha_wake_service):
         raise ConfigError("нужны HA_TOKEN и HA_WAKE_SERVICE (пробуждение ПК идёт через Home Assistant)")
-    ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error") or ""
+    ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale") or ""
     s.notify_events = {e.strip() for e in ev.split(",") if e.strip()}
     bad = s.notify_events - ALL_NOTIFY_EVENTS
     if bad:
@@ -293,6 +295,7 @@ def load() -> Settings:
     # ядра + 1: около половины времени эскиз ждёт чтения файла по сети, процессор при этом свободен
     s.workers = _int("WORKERS", max(2, min(8, (os.cpu_count() or 2) + 1)), 1, 32)
     s.index_ttl = _int("INDEX_TTL", 600, 30, 86400)
+    s.backup_stale_days = _int("BACKUP_STALE_DAYS", 7, 0, 365)
     load_overrides(s)   # то, что поменяли в админке, важнее .env
     return s
 
@@ -300,7 +303,7 @@ def load() -> Settings:
 # ---------------------------------------------------------------- настройки из админки
 # Только то, что безопасно менять на лету. Секреты и пути — в .env.
 EDITABLE = ("public_name", "notify_events", "ha_notify_service", "ha_wake_service", "ha_wake_data",
-            "wake_timeout", "index_ttl", "session_idle_hours")
+            "wake_timeout", "index_ttl", "session_idle_hours", "backup_stale_days")
 
 
 def validate_override(s: Settings, key: str, val):
@@ -324,7 +327,8 @@ def validate_override(s: Settings, key: str, val):
         if not isinstance(val, dict) or len(json.dumps(val)) > 2000:
             raise ConfigError("данные пробуждения: JSON-объект")
         return val
-    limits = {"wake_timeout": (10, 1800), "index_ttl": (30, 86400), "session_idle_hours": (1, 24 * 90)}
+    limits = {"wake_timeout": (10, 1800), "index_ttl": (30, 86400), "session_idle_hours": (1, 24 * 90),
+              "backup_stale_days": (0, 365)}
     if key in limits:
         lo, hi = limits[key]
         if not isinstance(val, int) or isinstance(val, bool) or not lo <= val <= hi:
