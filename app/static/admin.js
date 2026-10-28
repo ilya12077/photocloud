@@ -8,6 +8,7 @@ const dt = (ts) => (ts ? fmtDT.format(new Date(ts * 1000)) : '—');
 const EVENTS = {
   login: 'каждый вход', login_new_ip: 'вход с нового IP', login_failed: 'неудачный вход', lockout: 'блокировка IP',
   wake: 'кто-то будит ПК', wake_timeout: 'ПК не проснулся', index_error: 'ошибка чтения папки',
+  backup_stale: 'бэкап давно не выходил на связь',
 };
 const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
@@ -15,6 +16,8 @@ const AUDIT = {
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
   user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
+  backup_token_add: 'создан токен бэкапа', backup_token_revoke: 'отозван токен бэкапа', backup_denied: 'бэкап: неверный токен',
+  hash_stop: 'остановлен подсчёт хешей',
 };
 
 async function api(path, body) {
@@ -87,7 +90,7 @@ function showSetup(token) {
 
 // ================================================================== вкладки
 
-const loaders = { overview: loadOverview, users: loadUsers, security: loadSecurity, settings: loadSettings, perf: loadPerf, logs: loadLogs };
+const loaders = { overview: loadOverview, users: loadUsers, security: loadSecurity, backup: loadBackup, settings: loadSettings, perf: loadPerf, logs: loadLogs };
 function showTab(name) {
   for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.tab === name);
   for (const p of document.querySelectorAll('[data-pane]')) p.hidden = p.dataset.pane !== name;
@@ -112,6 +115,7 @@ async function loadOverview() {
     ['Год по папке', ix.files ? `${(ix.with_folder_year ?? 0).toLocaleString('ru')} (${Math.round((ix.with_folder_year ?? 0) / ix.files * 100)}%)` : '—'],
     ['Индекс', ix.state + (ix.error ? ` (${ix.error})` : '') + (ix.meta[1] && ix.meta[0] < ix.meta[1] ? `, даты ${ix.meta[0]}/${ix.meta[1]}` : '')],
     ['Обновлён', dt(ix.built_at)],
+    ...(o.hashes ? [['Хеши для бэкапа', hashText(o.hashes)]] : []),
     ['Эскизы в памяти сервера', `${mb(o.cache.thumb[0])} из ${mb(o.cache.thumb[1])}`],
     ['Превью в памяти сервера', `${mb(o.cache.preview[0])} из ${mb(o.cache.preview[1])}`],
     ['Сессий', String(o.sessions)],
@@ -272,6 +276,66 @@ async function loadSecurity() {
   }));
 }
 
+// ================================================================== бэкап
+
+const gb = (b) => (b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' ГБ' : mb(b));
+function hashText(h) {
+  if (h.state === 'running') return `считаются: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')} (${gb(h.bytes_done)} из ${gb(h.bytes_total)})`;
+  if (h.state === 'stopped') return `остановлено: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')}`;
+  if (h.state === 'error') return 'прервано из-за ошибок чтения — продолжится при следующем сканировании';
+  if (h.state === 'done') return 'все посчитаны';
+  return 'ждут сканирования папок';
+}
+function ago(ts) {
+  if (!ts) return 'ещё не было';
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 120) return 'только что';
+  if (s < 7200) return Math.round(s / 60) + ' мин назад';
+  if (s < 172800) return Math.round(s / 3600) + ' ч назад';
+  return Math.round(s / 86400) + ' дн назад';
+}
+const BK_STATE = { copying: 'копирует', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
+
+async function loadBackup() {
+  const r = await act(() => api('/api/admin/backup')); if (!r) return;
+  const cards = [['Хеши', hashText(r.hashes)], ['Посчитано всего', r.hashed.toLocaleString('ru')], ['Клиентов', String(r.tokens.length)]];
+  $('bk-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
+  $('bk-hash-stop').hidden = r.hashes.state !== 'running';
+  $('bk-hash-start').hidden = r.hashes.state === 'running' || !r.tokens.length;
+  const sel = $('bk-user'); const cur = sel.value;
+  sel.replaceChildren(...r.users.map((u) => { const o = el('option', null, u); o.value = u; return o; }));
+  if (cur && r.users.includes(cur)) sel.value = cur;
+  const tb = $('bk-tokens').tBodies[0];
+  if (!r.tokens.length) { const tr = el('tr'); const td = el('td', 'dim2', 'клиентов пока нет'); td.colSpan = 8; tr.append(td); tb.replaceChildren(tr); return; }
+  tb.replaceChildren(...r.tokens.map((t) => {
+    const tr = el('tr'), rp = t.report || {}, ops = el('td', 'ops');
+    ops.append(btn('отозвать', async () => {
+      if (!confirm(`Отозвать токен «${t.name}»? Клиент перестанет копировать, уже скопированное у него останется.`)) return;
+      await act(() => api(`/api/admin/backup/tokens/${t.id}/revoke`, {}), 'Токен отозван'); loadBackup();
+    }, 'danger'));
+    const copied = rp.files != null ? `${(rp.files - (rp.left_files || 0)).toLocaleString('ru')} файлов, ${gb((rp.bytes || 0) - (rp.left_bytes || 0))}` : '—';
+    const left = rp.left_files != null ? (rp.left_files ? `${rp.left_files.toLocaleString('ru')} (${gb(rp.left_bytes || 0)})` : 'ничего') : '—';
+    let state = BK_STATE[rp.state] || rp.state || '—';
+    if (rp.errors) state += ` · ошибок: ${rp.errors}`;
+    if (rp.error) state += ` · ${rp.error}`;
+    const seen = el('td', null, ago(t.last_seen)); if (t.last_ip) seen.title = t.last_ip;
+    tr.append(el('td', null, t.name), el('td', 'mono', t.user), seen, el('td', null, copied), el('td', null, left), el('td', null, state), el('td', null, dt(t.created)), ops);
+    return tr;
+  }));
+}
+$('bk-add').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = await act(() => api('/api/admin/backup/tokens', { name: $('bk-name').value.trim(), user: $('bk-user').value }), 'Токен создан');
+  if (!r) return;
+  $('bk-name').value = ''; $('bk-token').value = r.token; $('bk-new').hidden = false; $('bk-token').select();
+  loadBackup();
+});
+$('bk-copy').onclick = async () => {
+  try { await navigator.clipboard.writeText($('bk-token').value); toast('Скопировано'); } catch (_) { $('bk-token').select(); document.execCommand('copy'); toast('Скопировано'); }
+};
+$('bk-hash-stop').onclick = () => act(() => api('/api/admin/backup/hashes/stop', {}), 'Подсчёт остановлен').then(loadBackup);
+$('bk-hash-start').onclick = () => act(() => api('/api/admin/backup/hashes/start', {}), 'Подсчёт запущен').then(loadBackup);
+
 // ================================================================== настройки
 
 async function loadSettings() {
@@ -282,6 +346,7 @@ async function loadSettings() {
   $('s-wake').value = s.ha_wake_service;
   $('s-wakedata').value = Object.keys(s.ha_wake_data || {}).length ? JSON.stringify(s.ha_wake_data) : '';
   $('s-waket').value = s.wake_timeout; $('s-ttl').value = s.index_ttl; $('s-idle').value = s.session_idle_hours;
+  $('s-bkstale').value = s.backup_stale_days;
   $('s-events').replaceChildren(...r.events.map((ev) => {
     const l = el('label', 'chkline'); const c = el('input'); c.type = 'checkbox'; c.value = ev; c.checked = s.notify_events.includes(ev);
     l.append(c, document.createTextNode(' ' + (EVENTS[ev] || ev))); return l;
@@ -299,6 +364,7 @@ $('settings').addEventListener('submit', async (e) => {
     ha_wake_service: $('s-wake').value.trim(),
     ha_wake_data: wakeData,
     wake_timeout: +$('s-waket').value, index_ttl: +$('s-ttl').value, session_idle_hours: +$('s-idle').value,
+    backup_stale_days: +$('s-bkstale').value,
   };
   const r = await act(() => api('/api/admin/settings', body));
   if (r) toast(r.changed.length ? 'Сохранено: ' + r.changed.length : 'Без изменений');

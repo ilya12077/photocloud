@@ -1,0 +1,3 @@
+httpx>=0.27
+pystray>=0.19
+pillow>=10

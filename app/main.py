@@ -32,6 +32,7 @@ from . import config
 from . import geo
 from . import logs
 from .db import DB
+from .backup import TokenStore
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
 from .ha import HomeAssistant, clean
 from .images import LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_head, read_limited, render
@@ -73,6 +74,8 @@ except (OSError, ValueError) as e:
 # пока нет ни одного пользователя — первичная настройка по одноразовому токену из консоли
 SETUP_TOKEN = secrets.token_urlsafe(24) if users.empty() else ""
 sessions = SessionStore(S.session_idle_hours * 3600, S.session_max_hours * 3600, db)
+tokens = TokenStore(db)                       # клиенты бэкапа
+library.hash_wanted = tokens.any              # хеши файлов считаем, только если бэкап есть
 limiter = LoginLimiter()
 thumb_cache = LRUBytes(S.thumb_cache_mb * 1024 * 1024)
 preview_cache = LRUBytes(S.preview_cache_mb * 1024 * 1024)
@@ -603,6 +606,10 @@ async def _pc_watch() -> None:
                 bg(ha.notify("wake_timeout", "Компьютер не проснулся после WoL"))
         except Exception:  # noqa: BLE001
             log.exception("фоновая проверка компьютера")
+        try:
+            _backup_stale_check()
+        except Exception:  # noqa: BLE001
+            log.exception("проверка клиентов бэкапа")
         await asyncio.sleep(5 if PC.wake_at else 15)     # пока ждём включения — чаще
 
 
@@ -625,7 +632,11 @@ async def status(s: Session = Depends(require_user)):
 
 @app.post("/api/wake", dependencies=[Depends(require_csrf)])
 async def wake(s: Session = Depends(require_user)):
-    if not users.can_wake(s.user):
+    return await _wake(s.user, f"{s.user} будит компьютер")
+
+
+async def _wake(user: str, message: str, detail: str = "") -> Response:
+    if not users.can_wake(user):
         raise HTTPException(403, "wake not allowed")
     if await PC.is_up():
         return no_store(JSONResponse({"pc": "up"}))
@@ -637,8 +648,8 @@ async def wake(s: Session = Depends(require_user)):
     if not ok:
         return no_store(JSONResponse({"error": "ha"}, 502))
     PC.wake_at, PC.wake_notified = time.time(), False
-    audit("wake", s.user)
-    bg(ha.notify("wake", f"{s.user} будит компьютер"))
+    audit("wake", user, "", detail)
+    bg(ha.notify("wake", message))
     return no_store(JSONResponse({"pc": "waking"}))
 
 
@@ -1072,6 +1083,215 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), s: Ses
     })
 
 
+# ---------------------------------------------------------------- бэкап на другой компьютер
+# Клиент ходит с токеном (Authorization: Bearer …), cookie не нужны, поэтому и CSRF не нужен:
+# браузер сам такой заголовок не подставит.
+
+def _hash_file(p, stop) -> str | None:
+    h = hashlib.sha256()
+    with storage.open(p.rel) as f:
+        while True:
+            if stop.is_set():
+                return None
+            b = f.read(1024 * 1024)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+library.hash_reader = _hash_file
+
+
+def _hash_progress() -> dict:
+    return {"state": library.hash_state, "done": library.hash_done, "total": library.hash_total,
+            "bytes_done": library.hash_bytes_done, "bytes_total": library.hash_bytes_total}
+
+
+_last_stale_check = 0.0
+
+
+def _backup_stale_check() -> None:
+    """Раз в 10 минут: клиент бэкапа давно не выходил на связь — уведомление (один раз)."""
+    global _last_stale_check
+    now = time.time()
+    if now - _last_stale_check < 600 or not S.backup_stale_days:
+        return
+    _last_stale_check = now
+    limit = S.backup_stale_days * 86400
+    changed = False
+    for t in tokens.all():
+        if not t.stale_sent and now - (t.last_seen or t.created) > limit:
+            t.stale_sent, t.dirty, changed = 1, True, True
+            bg(ha.notify("backup_stale", f"Бэкап «{clean(t.name, 40)}» не выходил на связь больше "
+                                         f"{S.backup_stale_days} дн.", dedupe_s=0))
+    if changed:
+        tokens.flush()
+
+
+async def require_backup(request: Request):
+    ip = ip_of(request)
+    wait = limiter.blocked(ip)
+    if wait:
+        raise HTTPException(429, "locked", headers={"retry-after": str(wait)})
+    auth = request.headers.get("authorization", "")
+    t = tokens.get(auth[7:].strip() if auth[:7].lower() == "bearer " else "")
+    if t is None or users.role(t.user) is None:
+        if limiter.fail(ip):
+            audit("lockout", "", ip, "5 неверных токенов бэкапа, блок 15 мин")
+            bg(ha.notify("lockout", f"IP {clean(ip)} заблокирован на 15 мин: неверные токены бэкапа"))
+        audit("backup_denied", "", ip)
+        await asyncio.sleep(0.3)
+        raise HTTPException(401, "token")
+    tokens.seen(t, ip)
+    return t
+
+
+def _token_access(t):
+    return None if users.role(t.user) == "admin" else users.folders(t.user)
+
+
+_rel_map: tuple[str, dict] = ("", {})
+
+
+def _by_rel(rel: str):
+    global _rel_map
+    ver, m = _rel_map
+    if ver != library.version:
+        m = {p.rel: p for p in library.by_id.values()}
+        _rel_map = (library.version, m)
+    return m.get(rel)
+
+
+@app.get("/api/backup/status")
+async def backup_status(t=Depends(require_backup)):
+    up = await PC.is_up()
+    pc = pc_state(up)
+    return no_store(JSONResponse({
+        "server": config.app_version(),
+        "name": t.name,
+        "pc": pc,
+        "wake_left": max(0, int(S.wake_timeout - (time.time() - PC.wake_at))) if pc == "waking" else 0,
+        "can_wake": users.can_wake(t.user),
+        "index": {"state": library.state, "built_at": int(library.built_at), "version": library.version,
+                  "complete": library.state == "ready" and not library.skipped and not library.error,
+                  "skipped": library.skipped, "building": library.busy()},
+        "hashes": _hash_progress(),
+    }))
+
+
+@app.post("/api/backup/wake")
+async def backup_wake(t=Depends(require_backup)):
+    return await _wake(t.user, f"Бэкап «{clean(t.name, 40)}» будит компьютер", f"бэкап «{t.name}»")
+
+
+@app.get("/api/backup/manifest")
+async def backup_manifest(request: Request, t=Depends(require_backup)):
+    """Все видимые токену файлы: [путь, размер, mtime, дата снимка, sha256 | null]."""
+    access = _token_access(t)
+    hashes = await run_in_threadpool(db.hashes_load)
+    ver = library.version
+    tag = hashlib.blake2b(f"{ver}|{len(hashes)}|{access!r}|{library.skipped}".encode(), digest_size=10).hexdigest()
+    etag = f'"{tag}"'
+    if ver and request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"etag": etag, "cache-control": "no-store"})
+
+    def build() -> bytes:
+        files = [[p.rel, p.size, int(p.mtime), int(p.date), hashes.get(p.cache_key())]
+                 for p in library.by_id.values() if folder_ok(p.rel, access)]
+        return json.dumps({"v": tag, "index_version": ver,
+                           "complete": bool(ver) and library.state == "ready" and not library.skipped
+                           and not library.error, "files": files},
+                          ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass")
+
+    body = await run_in_threadpool(build)
+    headers = {"etag": etag, "cache-control": "no-store"}
+    if "gzip" in request.headers.get("accept-encoding", ""):
+        import gzip
+        body = await run_in_threadpool(gzip.compress, body, 6)
+        headers["content-encoding"] = "gzip"
+    return Response(body, media_type="application/json", headers=headers)
+
+
+@app.get("/api/backup/file")
+async def backup_file(request: Request, path: str = "", t=Depends(require_backup)):
+    p = _by_rel(path) if 0 < len(path) <= 2000 else None
+    if p is None or not folder_ok(p.rel, _token_access(t)):
+        raise HTTPException(404)
+    return await serve_file(request, p, {"cache-control": "no-store",
+                                         "content-disposition": "attachment",
+                                         "x-file-size": str(p.size), "x-file-mtime": str(int(p.mtime))})
+
+
+_REPORT_NUM = ("files", "bytes", "copied", "copied_bytes", "left_files", "left_bytes", "moved",
+               "versions", "deleted", "errors", "pending_delete")
+
+
+@app.post("/api/backup/report")
+async def backup_report(request: Request, t=Depends(require_backup)):
+    d = await read_json(request)
+    rep = {k: int(d[k]) for k in _REPORT_NUM
+           if isinstance(d.get(k), int) and not isinstance(d.get(k), bool) and 0 <= d[k] < 2**53}
+    for k in ("state", "client", "error"):
+        if isinstance(d.get(k), str):
+            rep[k] = clean(d[k], 120)
+    rep["at"] = int(time.time())
+    await run_in_threadpool(tokens.set_report, t, rep)
+    return no_store(JSONResponse({"ok": True}))
+
+
+# ---- админка: токены бэкапа
+
+@app.get("/api/admin/backup")
+async def admin_backup(_: Session = Depends(require_admin)):
+    return no_store(JSONResponse({"tokens": tokens.list(), "hashes": _hash_progress(),
+                                  "hashed": await run_in_threadpool(db.hashes_count),
+                                  "users": [u["user"] for u in users.list()]}))
+
+
+@app.post("/api/admin/backup/tokens", dependencies=[Depends(require_csrf)])
+async def admin_backup_token_add(request: Request, s: Session = Depends(require_admin)):
+    d = await read_json(request)
+    name, user = d.get("name"), d.get("user")
+    if not isinstance(name, str) or not isinstance(user, str) or users.role(user) is None:
+        return _bad("нужны название и существующий пользователь")
+    try:
+        token, t = await run_in_threadpool(tokens.create, name, user)
+    except ValueError as e:
+        return _bad(str(e))
+    audit("backup_token_add", s.user, ip_of(request), f"«{t.name}» для {user}")
+    if await PC.is_up():
+        library.start_hashes(storage)        # первый клиент — хеши начнём считать сразу
+    return no_store(JSONResponse({"token": token, "id": t.id}))
+
+
+@app.post("/api/admin/backup/tokens/{tid}/revoke", dependencies=[Depends(require_csrf)])
+async def admin_backup_token_revoke(request: Request, tid: str, s: Session = Depends(require_admin)):
+    if not re.fullmatch(r"[0-9a-f]{12}", tid):
+        raise HTTPException(400)
+    t = await run_in_threadpool(tokens.revoke, tid)
+    if t is None:
+        raise HTTPException(404)
+    if not tokens.any():
+        library.stop_hashes()
+    audit("backup_token_revoke", s.user, ip_of(request), f"«{t.name}» ({t.user})")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/backup/hashes/stop", dependencies=[Depends(require_csrf)])
+async def admin_backup_hashes_stop(request: Request, s: Session = Depends(require_admin)):
+    library.stop_hashes()
+    audit("hash_stop", s.user, ip_of(request), "остановлен подсчёт хешей")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/backup/hashes/start", dependencies=[Depends(require_csrf)])
+async def admin_backup_hashes_start(_: Session = Depends(require_admin)):
+    if not await PC.is_up():
+        raise HTTPException(409, "pc down")
+    return no_store(JSONResponse({"ok": library.start_hashes(storage)}))
+
+
 @app.get("/img/{kind}/{pid}")
 async def image(request: Request, kind: str = PathParam(pattern=r"^[stmqp]$"),
                 pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
@@ -1257,6 +1477,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
                   "with_folder_year": sum(1 for p in photos if p.folder_only()),
                   "built_at": int(library.built_at),
                   "meta": [library.meta_done, library.meta_total]},
+        "hashes": _hash_progress() if tokens.any() else None,
         "cache": {"thumb": [thumb_cache.size, thumb_cache.max], "preview": [preview_cache.size, preview_cache.max]},
         "sessions": len(sessions.list()),
         "config": {   # только для чтения; секреты не отдаём, лишь факт их наличия
@@ -1393,7 +1614,8 @@ async def admin_user_delete(request: Request, name: str, s: Session = Depends(re
     except UserError as e:
         return _bad(str(e))
     n = sessions.revoke_user(name)
-    audit("user_delete", s.user, ip_of(request), f"{name}, закрыто сессий: {n}")
+    nt = tokens.revoke_user(name)
+    audit("user_delete", s.user, ip_of(request), f"{name}, закрыто сессий: {n}" + (f", токенов бэкапа: {nt}" if nt else ""))
     return no_store(JSONResponse({"ok": True}))
 
 

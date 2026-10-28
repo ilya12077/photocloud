@@ -12,9 +12,10 @@ name: Publish Docker image
 on:
   release:
     types: [published]
-  # сборка и при изменении файла VERSION в master — новая версия без релиза в интерфейсе
+  # сборка и при изменении файла VERSION — новая версия без релиза в интерфейсе.
+  # master -> теги <версия> и latest; ветка backup-cluster -> только тег backup-cluster
   push:
-    branches: [master]
+    branches: [master, backup-cluster]
     paths: [VERSION]
 
 jobs:
@@ -42,8 +43,9 @@ jobs:
           images: ilya1207/photocloud
           tags: |
             type=ref,event=tag
-            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.event_name == 'push' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            type=raw,value=backup-cluster,enable=${{ github.ref == 'refs/heads/backup-cluster' }}
           labels: |
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
       
