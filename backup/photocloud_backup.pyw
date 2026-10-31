@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.3"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.4"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -392,6 +392,11 @@ class State:
             self.con.execute("UPDATE files SET verified = copied")
         self.mu = threading.Lock()
 
+    def get(self, path: str) -> tuple[int, int, str] | None:
+        with self.mu:
+            r = self.con.execute("SELECT size, mtime, sha FROM files WHERE path = ?", (path,)).fetchone()
+        return tuple(r) if r else None
+
     def files(self) -> dict[str, tuple[int, int, str]]:
         with self.mu:
             return {p: (s, m, h) for p, s, m, h in self.con.execute("SELECT path, size, mtime, sha FROM files")}
@@ -555,6 +560,9 @@ class Engine(threading.Thread):
                        verify_next=0.0)
         self.api: Api | None = None
         self._rep_mu = threading.Lock()         # отчёт шлют и цикл копирования, и «пульс»
+        self._fmu = threading.Lock()            # перенос/замена файла в Архиве — копирование и проверка копий
+        self._vmu = threading.Lock()            # проверка копий идёт в одном месте за раз
+        self._vthread: threading.Thread | None = None
         self._last_data = time.monotonic()      # когда последний раз пришли данные файла
         self.db: State | None = None
         self.root: Path | None = None
@@ -588,8 +596,10 @@ class Engine(threading.Thread):
         self.ev.set()
 
     def sync_now(self) -> None:
+        """Свежий список с сервера и сверка папки — сразу, а если идёт копирование — после текущего файла."""
         self._want_sync = True
         self._checked_local = 0.0              # и папку бэкапа сверить сразу
+        self._note("«Проверить сейчас»: беру свежий список с сервера")
         self.ev.set()
 
     def wake_now(self) -> None:
@@ -597,8 +607,20 @@ class Engine(threading.Thread):
         self.ev.set()
 
     def verify_now(self) -> None:
+        """Проверка копий — сразу, отдельным потоком: копированию не мешает (читает только свой диск)."""
         self._want_verify = True
+        if self.db and not (self._vthread and self._vthread.is_alive()):
+            self._vthread = threading.Thread(target=self._verify_bg, name="verify", daemon=True)
+            self._vthread.start()
         self.ev.set()
+
+    def _verify_bg(self) -> None:
+        try:
+            while not (self.quit or self._reload or self.cfg.paused):
+                if not self._verify_slice(bg=True):
+                    return
+        except Exception:  # noqa: BLE001
+            log.exception("проверка копий")
 
     def confirm_delete(self) -> None:
         self._confirm = True
@@ -789,9 +811,11 @@ class Engine(threading.Thread):
                   have_bytes=total_bytes - left_bytes - sum(f[1] for f in files.values() if not f[4]))
 
         for src, dst in moves:
-            self._move(src, files[dst])
+            with self._fmu:
+                self._move(src, files[dst])
         for src, dst in copies:
-            self._copy_local(src, files[dst])
+            with self._fmu:
+                self._copy_local(src, files[dst])
         self._deletes(deletes, local, complete=m.get("complete", False))
 
         t0 = time.monotonic()
@@ -801,6 +825,8 @@ class Engine(threading.Thread):
         for p in downloads:
             if self.cfg.paused or self._reload or self.quit:
                 raise Stop()
+            if self._want_sync:
+                return False                       # «Проверить сейчас»: новый проход со свежим списком
             f = files[p]
             pend = self.st.get("pending_delete")
             # копирование не отменяет ожидание подтверждения — пишем и то и другое
@@ -941,10 +967,18 @@ class Engine(threading.Thread):
         self._set(verify_last=lastf, verify_next=lastf + VERIFY_EVERY)
         return float(since) if since else None
 
-    def _verify_slice(self) -> bool:
+    def _verify_slice(self, bg: bool = False) -> bool:
         """Пересчитать хеши части копий (до 20 с). True — есть ещё что проверять."""
         if not self.db or self.cfg.paused:
             return False
+        if not self._vmu.acquire(blocking=False):
+            return False                               # уже проверяет другой поток
+        try:
+            return self._verify_part(bg)
+        finally:
+            self._vmu.release()
+
+    def _verify_part(self, bg: bool) -> bool:
         since = self._verify_since()
         if since is None:
             self._set(verifying=False)
@@ -968,7 +1002,7 @@ class Engine(threading.Thread):
                 self._report(self.st["state"], f"повреждённых копий: {bad}" if bad else "")
                 return False
             for rel, size, sha in rows:
-                if self._reload or self.quit or self.cfg.paused or self._want_sync:
+                if self._reload or self.quit or self.cfg.paused or (self._want_sync and not bg):
                     return False
                 try:
                     a = self._arch(rel)
@@ -979,15 +1013,22 @@ class Engine(threading.Thread):
                 if got == sha:
                     self.db.set_verified(rel, time.time())
                 else:
-                    self._set(verify_bad=self.st["verify_bad"] + 1)
-                    if got is not None:
-                        dst = self._aside(a, VERSIONS, rel, tag="повреждён")
-                        self.db.event("corrupt", rel, str(dst))
-                        self._note(f"копия повреждена — отложена в «{VERSIONS}», скачаю заново", "error", rel)
-                    else:
-                        self._note("копии нет в папке — скачаю заново", "warn", rel)
-                    self.db.drop(rel)                    # следующий проход скачает файл снова
-                    self._idle = False                   # и не через минуту, а сразу
+                    with self._fmu:
+                        cur = self.db.get(rel)
+                        if cur is None or cur[2] != sha:
+                            continue                     # пока считали, файл заменили или перенесли — не трогаем
+                        if got is not None and os.path.exists(lp(a)) and self._sha(a) == sha:
+                            self.db.set_verified(rel, time.time())
+                            continue
+                        self._set(verify_bad=self.st["verify_bad"] + 1)
+                        if got is not None and os.path.exists(lp(a)):
+                            dst = self._aside(a, VERSIONS, rel, tag="повреждён")
+                            self.db.event("corrupt", rel, str(dst))
+                            self._note(f"копия повреждена — отложена в «{VERSIONS}», скачаю заново", "error", rel)
+                        else:
+                            self._note("копии нет в папке — скачаю заново", "warn", rel)
+                        self.db.drop(rel)                # следующий проход скачает файл снова
+                        self._idle = False               # и не через минуту, а сразу
                 self._set(verify_done=self.st["verify_done"] + 1)
         return True
 
@@ -1073,12 +1114,13 @@ class Engine(threading.Thread):
         self._confirm = False
         for p in deletes:
             a = self._arch(p)
-            try:
-                dst = self._aside(a, DELETED, p) if os.path.exists(lp(a)) else None
-            except OSError as e:
-                self._error(p, f"не перенести в «{DELETED}»: {e}")
-                continue
-            self.db.drop(p)
+            with self._fmu:
+                try:
+                    dst = self._aside(a, DELETED, p) if os.path.exists(lp(a)) else None
+                except OSError as e:
+                    self._error(p, f"не перенести в «{DELETED}»: {e}")
+                    continue
+                self.db.drop(p)
             self.db.event("delete", p, str(dst or ""))
             self._note(f"удалён на компьютере → «{DELETED}»", "delete", p)
             self._prune_dirs(a.parent)
@@ -1119,12 +1161,13 @@ class Engine(threading.Thread):
             raise ValueError("контрольная сумма не совпала (файл менялся во время копирования?) — повторю позже")
         os.makedirs(lp(b.parent), exist_ok=True)
         replaced = False
-        if os.path.exists(lp(b)):
-            self._aside(b, VERSIONS, rel)
-            replaced = True
-        os.replace(lp(tmp), lp(b))
-        self._set_mtime(b, mtime)
-        self.db.put(rel, size, mtime, sha)
+        with self._fmu:
+            if os.path.exists(lp(b)):
+                self._aside(b, VERSIONS, rel)
+                replaced = True
+            os.replace(lp(tmp), lp(b))
+            self._set_mtime(b, mtime)
+            self.db.put(rel, size, mtime, sha)
         self.db.event("update" if replaced else "copy", rel, str(size))
         self._set(copied=self.st["copied"] + 1, copied_bytes=self.st["copied_bytes"] + size)
         if replaced:
