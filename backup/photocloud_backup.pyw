@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.5"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.6"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -800,9 +800,10 @@ class Engine(threading.Thread):
         self._idle = False
         self._checked_local = time.monotonic()
         files = {f[0]: f for f in m["files"]}            # путь -> [путь, размер, mtime, дата, sha]
-        local = self._verify_local(self.db.files())
+        local, extras = self._verify_local(self.db.files(), files)
         plan = self._plan(files, local)
         moves, copies, downloads, deletes, waiting = plan
+        deletes = deletes + [p for p in extras if p not in set(deletes)]   # посторонние файлы в Архиве — тоже прочь
         total_bytes = sum(f[1] for f in files.values())
         left_bytes = sum(files[p][1] for p in downloads)
         self._set(files=len(files), bytes=total_bytes, waiting_hash=waiting,
@@ -930,9 +931,14 @@ class Engine(threading.Thread):
                         continue
         return out
 
-    def _verify_local(self, local: dict) -> dict:
-        """Файлы, которые пропали из Архива или изменились руками, считаем отсутствующими —
-        их скачаем заново (изменённый сначала уйдёт в Версии)."""
+    def _verify_local(self, local: dict, files: dict) -> tuple[dict, list[str]]:
+        """Сверка Архива с базой клиента.
+        Файлы из базы, которые пропали из Архива или изменились руками, считаем отсутствующими —
+        их скачаем заново (изменённый сначала уйдёт в Версии).
+        Файлы в Архиве, которых нет в базе (положили руками, вернули из «Удалённых»): если такой
+        файл есть на ПК и хеш совпал — берём в базу без скачивания; если его нет на ПК или он
+        другой — его заменит обычное скачивание (старый уйдёт в «Версии»); если его нет на ПК —
+        возвращаем в списке «лишних», они уйдут в «Удалённые» как удалённые на ПК."""
         have = self._scan_archive()
         out, gone = {}, []
         for p, v in local.items():
@@ -945,7 +951,31 @@ class Engine(threading.Thread):
         if gone:
             self._note(f"в папке бэкапа пропали или изменились {len(gone)} файлов — скопирую заново", "warn",
                        gone[0] if len(gone) == 1 else "")
-        return out
+        extras, adopted = [], 0
+        for p, size in have.items():
+            if p in local:
+                continue
+            f = files.get(p)
+            if f is not None and not f[4]:
+                continue                                  # на сервере ещё нет хеша — решим в следующий раз
+            if f is not None and f[1] == size:
+                try:
+                    if self._sha(self._arch(p)) == f[4]:
+                        self.db.put(p, f[1], f[2], f[4])
+                        self._set_mtime(self._arch(p), f[2])
+                        out[p] = (f[1], f[2], f[4])
+                        adopted += 1
+                        continue
+                except (OSError, ValueError):
+                    continue
+            if f is None:
+                extras.append(p)       # на ПК такого нет; если есть, но другой — его заменит скачивание (старый — в «Версии»)
+        if adopted:
+            self._note(f"в Архиве нашлись уже скопированные файлы: {adopted} — взял без скачивания")
+        if extras:
+            self._note(f"в Архиве лишние файлы (их нет на ПК): {len(extras)} — уберу в «{DELETED}»",
+                       "warn", extras[0] if len(extras) == 1 else "")
+        return out, extras
 
     # ------------------------------------------------------------ проверка копий
 
