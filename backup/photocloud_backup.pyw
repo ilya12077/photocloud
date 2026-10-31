@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.4"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.5"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -599,7 +599,7 @@ class Engine(threading.Thread):
         """Свежий список с сервера и сверка папки — сразу, а если идёт копирование — после текущего файла."""
         self._want_sync = True
         self._checked_local = 0.0              # и папку бэкапа сверить сразу
-        self._note("«Проверить сейчас»: беру свежий список с сервера")
+        self._note("«Получить список файлов»: беру свежий список с сервера")
         self.ev.set()
 
     def wake_now(self) -> None:
@@ -695,7 +695,7 @@ class Engine(threading.Thread):
         на файл, который не влез, или поменяли порог в настройках — продолжаем."""
         self._note(f"мало места на диске ({e}) — новые файлы не скачиваю", "error")
         self._report("disk_full", f"мало места: {e}")
-        self._want_sync = False                   # «Проверить сейчас» — заново проверить и место тоже
+        self._want_sync = False                   # «Получить список файлов» — заново проверить и место тоже
         while not (self.quit or self._reload or self.cfg.paused or self._want_sync):
             keep = int(max(0.0, float(self.cfg.min_free_gb or 0)) * 2**30)
             try:
@@ -826,7 +826,7 @@ class Engine(threading.Thread):
             if self.cfg.paused or self._reload or self.quit:
                 raise Stop()
             if self._want_sync:
-                return False                       # «Проверить сейчас»: новый проход со свежим списком
+                return False                       # «Получить список файлов»: новый проход со свежим списком
             f = files[p]
             pend = self.st.get("pending_delete")
             # копирование не отменяет ожидание подтверждения — пишем и то и другое
@@ -1570,10 +1570,10 @@ class App:
         row.pack(fill="x", padx=12, pady=(12, 4), side="bottom")
         self.b_pause = ttk.Button(row, text="Пауза", command=self.toggle_pause, width=14)
         self.b_pause.pack(side="left")
-        ttk.Button(row, text="Проверить сейчас", command=self.engine.sync_now).pack(side="left", padx=6)
+        ttk.Button(row, text="Получить список файлов", command=self.engine.sync_now).pack(side="left", padx=6)
         ttk.Button(row, text="Разбудить ПК", command=self.engine.wake_now).pack(side="left")
         ttk.Button(row, text="Открыть папку", command=self.open_root).pack(side="right")
-        ttk.Button(row, text="Проверить копии", command=self.engine.verify_now).pack(side="right", padx=6)
+        ttk.Button(row, text="Проверить хеши", command=self.engine.verify_now).pack(side="right", padx=6)
 
         lim = ttk.Frame(t)
         lim.pack(fill="x", padx=12, pady=4, side="bottom")
@@ -1941,9 +1941,9 @@ class App:
             pystray.MenuItem("Открыть окно", call(self.show), default=True),        # и по щелчку по значку
             pystray.MenuItem(lambda _i: "Продолжить копирование" if self.cfg.paused else "Пауза",
                              call(self.toggle_pause)),
-            pystray.MenuItem("Проверить сейчас", call(self.engine.sync_now)),
+            pystray.MenuItem("Получить список файлов", call(self.engine.sync_now)),
             pystray.MenuItem("Разбудить домашний ПК", call(self.engine.wake_now)),
-            pystray.MenuItem("Проверить копии", call(self.engine.verify_now)),
+            pystray.MenuItem("Проверить хеши", call(self.engine.verify_now)),
             pystray.MenuItem("Открыть папку бэкапа", call(self.open_root)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", call(self.quit)),
