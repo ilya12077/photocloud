@@ -13,6 +13,34 @@
 """
 from __future__ import annotations
 
+# --- самое первое: любая ошибка при старте — в журнал. Под pythonw консоли нет, и без этого
+# программа, упавшая при входе в Windows, просто молча исчезает.
+import os
+import sys
+import time
+import traceback
+
+
+def _boot_log(text: str) -> None:
+    try:
+        base = os.environ.get("USERPROFILE") if sys.platform == "win32" else \
+            os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+        d = os.path.join(base or os.path.expanduser("~"), ".photocloud-backup" if sys.platform == "win32"
+                         else "photocloud-backup")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "backup.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + text.rstrip() + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _crash(exc_type, exc, tb) -> None:
+    _boot_log("CRITICAL программа упала:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+
+
+sys.excepthook = _crash
+_boot_log(f"BOOT процесс запущен: {' '.join(sys.argv)} (python {sys.executable})")
+
 import base64
 import collections
 import datetime
@@ -22,16 +50,13 @@ import importlib.util
 import json
 import logging
 import logging.handlers
-import os
 import queue
 import re
 import shutil
 import socket
 import sqlite3
 import subprocess
-import sys
 import threading
-import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,7 +75,8 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.8"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.9"           # по этой строке клиент сравнивает себя с версией на GitHub
+AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -2265,6 +2291,8 @@ def main() -> None:
     if "WindowsApps" in sys.executable or "PythonSoftwareFoundation" in sys.prefix:
         log.warning("Python из Microsoft Store: файлы в %%APPDATA%% он хранит в своей песочнице")
 
+    threading.excepthook = lambda a: log.critical("ошибка в потоке %s", a.thread.name if a.thread else "?",
+                                                  exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
     if "--wait-pid" in sys.argv:             # перезапуск после обновления: ждём, пока старая копия выйдет
         try:
             winutil.wait_pid(int(sys.argv[sys.argv.index("--wait-pid") + 1]), 30)
@@ -2273,7 +2301,13 @@ def main() -> None:
     app = None
     inst = winutil.SingleInstance(d, lambda: app and app.q.put(app.show))
     if not inst.acquire():
+        log.info("уже запущен — показываю окно работающей копии")
         return                                   # уже запущен — показали его окно
+    if "--tray" in sys.argv and "--wait-pid" not in sys.argv:
+        # автозапуск: сразу после входа Windows ещё поднимает панель задач, сеть и OneDrive —
+        # даём ей полминуты, иначе значок в трее и первые запросы могут не получиться
+        log.info("автозапуск: жду 30 с, пока Windows догрузится")
+        time.sleep(AUTOSTART_DELAY)
     if not _ensure_deps():
         return
     cfg = Config()
