@@ -65,6 +65,7 @@ def playlist(duration: float, seg_url) -> str:
 
 def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, duration: float,
             profile: str) -> bytes:
+    from .video import picture_fix
     p = PROFILES[profile]
     start = index * SEG
     length = min(SEG, duration - start)
@@ -77,7 +78,7 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
            # 60 к/с -> 30 (для просмотра хватает, а кодирование вдвое легче; кадры отбрасываются
            # до уменьшения, так что и масштабировать вдвое меньше). Не больше p["h"] по короткой
            # стороне (вертикальные тоже), чётные размеры, 8 бит.
-           "-vf", ("fps=30," if fps_of.get(src, 0) > 32 else "") + f"scale='if(gt(iw,ih),-2,min({p['h']},iw))':'if(gt(iw,ih),min({p['h']},ih),-2)':flags=bilinear,format=yuv420p",
+           "-vf", picture_fix(demuxer) + ("fps=30," if fps_of.get(src, 0) > 32 else "") + f"scale='if(gt(iw,ih),-2,min({p['h']},iw))':'if(gt(iw,ih),min({p['h']},ih),-2)':flags=bilinear,format=yuv420p",
            "-c:v", "libx264", "-preset", "superfast", "-crf", p["crf"],
            "-maxrate", p["maxrate"], "-bufsize", p["bufsize"],
            "-profile:v", "high", "-level", "4.1", "-g", "48",

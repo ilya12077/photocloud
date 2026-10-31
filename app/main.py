@@ -97,6 +97,7 @@ CONTENT_TYPES = {
     # .mov отдаём как mp4: Chrome/Edge тогда тоже пытаются его играть (кодек тот же H.264/HEVC)
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/mp4", ".3gp": "video/3gpp", ".webm": "video/webm",
     ".mts": "video/mp2t", ".m2ts": "video/mp2t", ".avi": "video/x-msvideo",
+    ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".vob": "video/mpeg",
 }
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 

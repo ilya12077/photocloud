@@ -13,7 +13,16 @@ import threading
 log = logging.getLogger("photocloud.video")
 
 DEMUXER = {".mp4": "mov", ".mov": "mov", ".m4v": "mov", ".3gp": "mov", ".webm": "matroska",
-           ".mts": "mpegts", ".m2ts": "mpegts", ".avi": "avi"}
+           ".mts": "mpegts", ".m2ts": "mpegts", ".avi": "avi",
+           ".mpg": "mpeg", ".mpeg": "mpeg", ".vob": "mpeg"}         # MPEG-PS: DVD, старые камеры и ТВ-тюнеры
+
+
+def picture_fix(demuxer: str) -> str:
+    """Для MPEG-PS (DVD и старые камеры): картинка там чересстрочная и с неквадратными пикселями
+    (720×576 — это 4:3 или 16:9) — убираем «гребёнку» и приводим пиксели к квадратным."""
+    if demuxer != "mpeg":
+        return ""
+    return "yadif=deint=interlaced,scale='trunc(iw*sar/2)*2':ih,setsar=1,"
 
 
 def find_ffmpeg(configured: str) -> str | None:
@@ -207,7 +216,7 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                    "-protocol_whitelist", protocols, "-threads", "1",
                    "-f", fmt, *_MODES[mode], "-i", src,
                    "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
-                   "-vf", f"scale={box}:{box}:force_original_aspect_ratio=decrease:flags=bilinear,format={pix}",
+                   "-vf", picture_fix(fmt) + f"scale={box}:{box}:force_original_aspect_ratio=decrease:flags=bilinear,format={pix}",
                    "-f", "image2pipe", "-c:v", codec, "pipe:1"]
             r = run_ff(cmd, src, protocols, fmt, 25)
             if r.returncode == 0 and r.stdout[:len(magic)] == magic:
