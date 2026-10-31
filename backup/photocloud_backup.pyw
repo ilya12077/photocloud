@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.2"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.3"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -488,11 +488,18 @@ class Api:
         self._check(r)
         return r.json(), r.headers.get("etag")
 
+    _report_warned = 0.0
+
     def report(self, rep: dict) -> None:
+        """Отчёт серверу. Неудача не мешает копированию, но пишется в журнал (не чаще раза в минуту)."""
         try:
-            self.c.post(self.base + "/api/backup/report", json=rep, timeout=20)
-        except httpx.HTTPError:
-            pass
+            r = self.c.post(self.base + "/api/backup/report", json=rep, timeout=20)
+            err = "" if r.status_code < 400 else f"HTTP {r.status_code}"
+        except httpx.HTTPError as e:
+            err = type(e).__name__
+        if err and time.monotonic() - self._report_warned > 60:
+            self._report_warned = time.monotonic()
+            log.warning("отчёт серверу не ушёл: %s", err)
 
     def stream(self, rel: str, start: int):
         h = {"accept-encoding": "identity"}
@@ -795,7 +802,10 @@ class Engine(threading.Thread):
             if self.cfg.paused or self._reload or self.quit:
                 raise Stop()
             f = files[p]
-            self._set(state="copying", text="Копирую", detail="", left_files=left_files, left_bytes=left_b)
+            pend = self.st.get("pending_delete")
+            # копирование не отменяет ожидание подтверждения — пишем и то и другое
+            self._set(state="copying", text="Копирую", left_files=left_files, left_bytes=left_b,
+                      detail=f"{self._confirm_text(pend)} — ждёт «Подтвердить»" if pend else "")
             try:
                 self._download(f)
                 left_files -= 1
@@ -818,7 +828,8 @@ class Engine(threading.Thread):
                 self._set(stall=0)
                 return False                       # сразу новый проход: статус ПК, докачка с того же места
             except httpx.HTTPError as e:
-                self._error(p, f"сеть: {type(e).__name__}")
+                code = f"HTTP {e.response.status_code}" if isinstance(e, httpx.HTTPStatusError) else type(e).__name__
+                self._error(p, f"сеть: {code}")
                 return False
             except Exception as e:  # noqa: BLE001
                 self._error(p, f"{type(e).__name__}: {e}")
@@ -831,8 +842,9 @@ class Engine(threading.Thread):
         if waiting:
             self._set(state="waiting", text="Жду хеши с сервера",
                       detail=f"Сервер ещё считает контрольные суммы: {waiting} файлов")
-        elif self.st.get("pending_delete"):
-            pass                                   # ждём «Подтвердить» — состояние уже выставлено
+        elif self.st.get("pending_delete"):         # скопировали, что могли, — снова ждём «Подтвердить»
+            self._set(state="confirm", text=self._confirm_text(self.st["pending_delete"]),
+                      detail=f"Нажмите «Подтвердить», чтобы убрать их в «{DELETED}»")
         else:
             self._set(state="done", text="Всё скопировано",
                       detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
@@ -1041,6 +1053,10 @@ class Engine(threading.Thread):
         self.db.event("copy", rel, src)
         self._note("скопирован с соседнего", "copy", rel)
 
+    @staticmethod
+    def _confirm_text(n: int) -> str:
+        return f"С компьютера пропало {n} файлов"
+
     def _deletes(self, deletes: list[str], local: dict, complete: bool) -> None:
         self._set(pending_delete=0)
         if not deletes:
@@ -1050,8 +1066,7 @@ class Engine(threading.Thread):
             return
         lim_n, lim_share = DELETE_SUSPICIOUS
         if len(deletes) > lim_n and len(deletes) > lim_share * max(1, len(local)) and not self._confirm:
-            self._set(state="confirm", pending_delete=len(deletes),
-                      text=f"С компьютера пропало {len(deletes)} файлов",
+            self._set(state="confirm", pending_delete=len(deletes), text=self._confirm_text(len(deletes)),
                       detail=f"Нажмите «Подтвердить», чтобы убрать их в «{DELETED}»")
             self._note(f"пропало сразу {len(deletes)} файлов — жду подтверждения", "warn")
             return
@@ -2028,7 +2043,7 @@ class App:
                              + (f" · ошибок: {s['errors']}" if s["errors"] else ""))
         else:
             self.v_speed.set(f"Ошибок: {s['errors']}" if s["errors"] else "")
-        if state == "confirm":
+        if s["pending_delete"]:                    # кнопка видна и пока идёт копирование
             self.confirm.pack(fill="x", padx=12, pady=8)
         else:
             self.confirm.pack_forget()
