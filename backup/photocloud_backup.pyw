@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.6"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.8"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -305,7 +305,6 @@ CHUNK = 256 * 1024
 PASS_MAX = 15 * 60          # с: проход не дольше — потом свежий список (досчитались новые хеши)
 IDLE_EVERY = 10             # с: всё скопировано — спрашивать сервер о новом так часто
 PC_OFF_EVERY = 10           # с: ПК выключен — проверять так часто
-LOCAL_EVERY = 60            # с: сверять папку бэкапа с базой (на месте ли файлы): удалил копию — через минуту скачается
 DISK_EVERY = 10             # с: мало места — так часто смотреть, не освободилось ли
 VERIFY_EVERY = 30 * 86400   # с: проверка копий (пересчёт хешей скопированного) — раз в 30 дней
 VERIFY_SLICE = 20           # с: проверять кусками, между ними — обычный опрос сервера
@@ -570,7 +569,7 @@ class Engine(threading.Thread):
         self._speed_t, self._speed_b = time.monotonic(), 0
         self._last_report = 0.0
         self._reported = ""                    # состояние из последнего отчёта
-        self._checked_local = 0.0              # когда последний раз проверяли папку бэкапа
+        self._force_local = False              # обойти папку бэкапа (вместе с проверкой хешей)
         self._idle = False                     # прошлый проход всё сделал — ждём новое
         self._manifest = None
         self._etag = None
@@ -596,9 +595,8 @@ class Engine(threading.Thread):
         self.ev.set()
 
     def sync_now(self) -> None:
-        """Свежий список с сервера и сверка папки — сразу, а если идёт копирование — после текущего файла."""
+        """Свежий список с сервера — сразу, а если идёт копирование — после текущего файла (папку не обходит)."""
         self._want_sync = True
-        self._checked_local = 0.0              # и папку бэкапа сверить сразу
         self._note("«Получить список файлов»: беру свежий список с сервера")
         self.ev.set()
 
@@ -607,8 +605,10 @@ class Engine(threading.Thread):
         self.ev.set()
 
     def verify_now(self) -> None:
-        """Проверка копий — сразу, отдельным потоком: копированию не мешает (читает только свой диск)."""
+        """Проверка копий — сразу, отдельным потоком: копированию не мешает (читает только свой диск).
+        Вместе с ней — обход папки бэкапа (пропавшие и посторонние файлы)."""
         self._want_verify = True
+        self._force_local = True
         if self.db and not (self._vthread and self._vthread.is_alive()):
             self._vthread = threading.Thread(target=self._verify_bg, name="verify", daemon=True)
             self._vthread.start()
@@ -732,7 +732,7 @@ class Engine(threading.Thread):
         self.api = Api(c.server, c.token)
         self._manifest, self._etag, self._woke = None, None, False
         if not self.db.files() and any(os.scandir(lp(self.root / ARCHIVE))):
-            self._rebuild_db()
+            self.db.kv_set("rebuild_pending", 1)       # пересчёт уже скопированного — в цикле, с паузой
         return True
 
     def _loop_once(self) -> None:
@@ -747,6 +747,9 @@ class Engine(threading.Thread):
             self._sleep(3600)
             return
         self.halt.clear()
+        if self.db.kv_get("rebuild_pending"):
+            self._rebuild_db()
+            self.db.kv_set("rebuild_pending", None)
         st = self.api.status()
         self._set(server=st.get("server", ""))
         if st["pc"] != "up" and ((self.cfg.wake_on_start and not self._woke) or self._want_wake):
@@ -789,7 +792,9 @@ class Engine(threading.Thread):
         """True — всё, что можно, сделано (дальше ждём новое); False — сразу следующий проход
         (прервали по времени, выключился ПК, обрыв связи)."""
         m, etag = self.api.manifest(self._etag)
-        if m is None and self._idle and time.monotonic() - self._checked_local < LOCAL_EVERY:
+        # обход папки бэкапа долгий: только вместе с проверкой хешей (раз в месяц и по кнопке «Проверить хеши»)
+        do_local = self._force_local
+        if m is None and self._idle and not do_local:
             # на сервере ничего не поменялось, у нас всё скопировано — проверять нечего
             self._set(detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
             self._report(self.st["state"])
@@ -798,9 +803,13 @@ class Engine(threading.Thread):
             self._manifest, self._etag = m, etag
         m = self._manifest
         self._idle = False
-        self._checked_local = time.monotonic()
         files = {f[0]: f for f in m["files"]}            # путь -> [путь, размер, mtime, дата, sha]
-        local, extras = self._verify_local(self.db.files(), files)
+        if do_local:
+            self._force_local = False
+            self._set(detail="Сверяю папку бэкапа…")
+            local, extras = self._verify_local(self.db.files(), files)
+        else:
+            local, extras = self.db.files(), []          # в остальное время — по своей базе, без обхода папки
         plan = self._plan(files, local)
         moves, copies, downloads, deletes, waiting = plan
         deletes = deletes + [p for p in extras if p not in set(deletes)]   # посторонние файлы в Архиве — тоже прочь
@@ -812,9 +821,13 @@ class Engine(threading.Thread):
                   have_bytes=total_bytes - left_bytes - sum(f[1] for f in files.values() if not f[4]))
 
         for src, dst in moves:
+            if self._halted():
+                raise Stop()
             with self._fmu:
                 self._move(src, files[dst])
         for src, dst in copies:
+            if self._halted():
+                raise Stop()
             with self._fmu:
                 self._copy_local(src, files[dst])
         self._deletes(deletes, local, complete=m.get("complete", False))
@@ -921,6 +934,8 @@ class Engine(threading.Thread):
                 continue
             with it:
                 for e in it:
+                    if self._halted():
+                        raise Stop()
                     rel = f"{prefix}/{e.name}" if prefix else e.name
                     try:
                         if e.is_dir(follow_symlinks=False):
@@ -986,6 +1001,7 @@ class Engine(threading.Thread):
         if self._want_verify and not since:
             since = str(now)
             db.kv_set("verify_since", since)
+            self._force_local = True
         self._want_verify = False
         if last is None and not since:
             db.kv_set("verify_last", now)           # всё только что скачано и сверено — следующая через месяц
@@ -993,6 +1009,8 @@ class Engine(threading.Thread):
         if not since and now - float(last) >= VERIFY_EVERY:
             since = str(now)
             db.kv_set("verify_since", since)
+            self._force_local = True                    # раз в месяц — и обход папки бэкапа
+            self.ev.set()
         lastf = float(db.kv_get("verify_last") or now)
         self._set(verify_last=lastf, verify_next=lastf + VERIFY_EVERY)
         return float(since) if since else None
@@ -1037,6 +1055,8 @@ class Engine(threading.Thread):
                 try:
                     a = self._arch(rel)
                     got = self._sha(a) if os.path.exists(lp(a)) else None
+                except Stop:
+                    return False                         # пауза — продолжим с этого же файла
                 except (OSError, ValueError) as e:
                     got = None
                     log.warning("проверка %s: %s", rel, e)
@@ -1047,7 +1067,11 @@ class Engine(threading.Thread):
                         cur = self.db.get(rel)
                         if cur is None or cur[2] != sha:
                             continue                     # пока считали, файл заменили или перенесли — не трогаем
-                        if got is not None and os.path.exists(lp(a)) and self._sha(a) == sha:
+                        try:
+                            again = got is not None and os.path.exists(lp(a)) and self._sha(a) == sha
+                        except Stop:
+                            return False
+                        if again:
                             self.db.set_verified(rel, time.time())
                             continue
                         self._set(verify_bad=self.st["verify_bad"] + 1)
@@ -1118,7 +1142,7 @@ class Engine(threading.Thread):
         os.makedirs(lp(b.parent), exist_ok=True)
         if os.path.exists(lp(b)):
             self._aside(b, VERSIONS, rel)
-        shutil.copyfile(lp(self._arch(src)), lp(b))
+        self._copy_file(self._arch(src), b)
         self._set_mtime(b, f[2])
         self.db.put(rel, f[1], f[2], f[4])
         self.db.event("copy", rel, src)
@@ -1143,6 +1167,8 @@ class Engine(threading.Thread):
             return
         self._confirm = False
         for p in deletes:
+            if self._halted():
+                raise Stop()
             a = self._arch(p)
             with self._fmu:
                 try:
@@ -1294,13 +1320,29 @@ class Engine(threading.Thread):
         if time.monotonic() - self._last_report > REPORT_COPYING:
             self._report("copying")              # большой файл — ход виден в админке и посреди него
 
-    @staticmethod
-    def _sha(p: Path) -> str:
+    def _sha(self, p: Path) -> str:
+        """SHA-256 файла. Пауза, выход или смена настроек прерывают даже большой файл (Stop)."""
         h = hashlib.sha256()
         with open(lp(p), "rb") as f:
             for b in iter(lambda: f.read(1024 * 1024), b""):
+                if self._halted():
+                    raise Stop()
                 h.update(b)
         return h.hexdigest()
+
+    def _copy_file(self, src: Path, dst: Path) -> None:
+        """Копия внутри папки бэкапа, которую тоже прерывает пауза (недоделанная — удаляется)."""
+        tmp = dst.with_name(dst.name + ".part")
+        try:
+            with open(lp(src), "rb") as a, open(lp(tmp), "wb") as b:
+                for chunk in iter(lambda: a.read(1024 * 1024), b""):
+                    if self._halted():
+                        raise Stop()
+                    b.write(chunk)
+            os.replace(lp(tmp), lp(dst))
+        finally:
+            if os.path.exists(lp(tmp)):
+                os.remove(lp(tmp))
 
     def _rebuild_db(self) -> None:
         """Базы нет, а файлы в Архиве есть (перенесли диск, удалили базу) — пересчитываем хеши."""
@@ -1308,15 +1350,23 @@ class Engine(threading.Thread):
         self._set(state="scan", text="Проверяю уже скопированное", detail="Считаю контрольные суммы файлов в Архиве")
         self._note("база бэкапа пуста — пересчитываю хеши уже скопированных файлов")
         rows, n = [], 0
+        done = self.db.files()                     # прерванный паузой пересчёт продолжается, а не начинается заново
         for dirpath, _dirs, names in os.walk(lp(top)):
             for name in names:
-                if self._reload or self.quit:
+                if self._halted() or self._reload:
+                    self.db.put_many(rows)
                     raise Stop()
                 full = Path(dirpath) / name
                 rel = os.path.relpath(full, lp(top)).replace(os.sep, "/")
+                if rel in done:
+                    n += 1
+                    continue
                 try:
                     st = os.stat(full)
                     rows.append((rel, st.st_size, int(st.st_mtime), self._sha(full), time.time()))
+                except Stop:
+                    self.db.put_many(rows)             # посчитанное сохраняем — продолжим с этого места
+                    raise
                 except OSError:
                     continue
                 n += 1
