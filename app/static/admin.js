@@ -376,7 +376,8 @@ async function loadBackup() {
     const fresh = rp.at && Date.now() / 1000 - rp.at < 60;
     if (rp.state === 'copying' && fresh) {
       const bits = [];
-      if (rp.speed) bits.push(mbs(rp.speed));
+      if (rp.stall) bits.push(`ждёт данные с ПК ${rp.stall} с`);
+      else if (rp.speed) bits.push(mbs(rp.speed));
       if (rp.limit_mbps) bits.push(`лимит ${rp.limit_mbps} Мбит/с`);
       if (rp.raw_bytes > rp.wire_bytes && rp.wire_bytes) bits.push(`сжатие −${Math.round((1 - rp.wire_bytes / rp.raw_bytes) * 100)}%`);
       if (bits.length) st.append(el('div', 'dim2', bits.join(' · ')));

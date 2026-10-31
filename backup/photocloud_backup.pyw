@@ -50,7 +50,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.1"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.2"           # по этой строке клиент сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
 IS_WIN = sys.platform == "win32"
@@ -310,6 +310,7 @@ DISK_EVERY = 10             # с: мало места — так часто см
 VERIFY_EVERY = 30 * 86400   # с: проверка копий (пересчёт хешей скопированного) — раз в 30 дней
 VERIFY_SLICE = 20           # с: проверять кусками, между ними — обычный опрос сервера
 REPORT_EVERY = 5 * 60       # с: отчёт серверу, если состояние не меняется
+STALL_LIMIT = 30            # с: данные файла не приходят столько — рвём соединение и докачиваем заново
 REPORT_COPYING = 5          # с: а во время копирования — так часто (админка видит ход в реальном времени)
 DELETE_SUSPICIOUS = (100, 0.05)   # больше стольких И больше такой доли — ждём подтверждения
 
@@ -499,7 +500,7 @@ class Api:
             h["range"] = f"bytes={start}-"
         # z=1 — сжатие блоками (сервер 1.6+); старый сервер параметр не знает и отдаёт файл как есть по Range
         return self.c.stream("GET", f"{self.base}/api/backup/file?path={quote(rel, safe='')}&z=1&start={start}", headers=h,
-                             timeout=httpx.Timeout(90, connect=15))
+                             timeout=httpx.Timeout(STALL_LIMIT, connect=15))
 
     def close(self) -> None:
         self.c.close()
@@ -542,10 +543,12 @@ class Engine(threading.Thread):
                        files=0, bytes=0, have_files=0, have_bytes=0, left_files=0, left_bytes=0,
                        waiting_hash=0, current="", cur_done=0, cur_size=0, speed=0.0, errors=0,
                        pending_delete=0, copied=0, copied_bytes=0, last_ok=0.0, server="",
-                       wire_bytes=0, raw_bytes=0,
+                       wire_bytes=0, raw_bytes=0, stall=0,
                        verifying=False, verify_done=0, verify_total=0, verify_bad=0, verify_last=0.0,
                        verify_next=0.0)
         self.api: Api | None = None
+        self._rep_mu = threading.Lock()         # отчёт шлют и цикл копирования, и «пульс»
+        self._last_data = time.monotonic()      # когда последний раз пришли данные файла
         self.db: State | None = None
         self.root: Path | None = None
         self._woke = False
@@ -620,7 +623,23 @@ class Engine(threading.Thread):
 
     # ------------------------------------------------------------ главный цикл
 
+    def _heartbeat(self) -> None:
+        """Отдельный поток: пока идёт копирование, отчёт уходит раз в 5 с, даже если данные
+        файла не приходят (ПК подвис) — тогда в отчёте видно, сколько секунд ждём."""
+        while not self.quit:
+            time.sleep(1)
+            if self.st["state"] != "copying" or self.cfg.paused:
+                continue
+            stall = int(time.monotonic() - self._last_data) if self.st["current"] else 0
+            self._set(stall=stall if stall >= 5 else 0)
+            if time.monotonic() - self._last_report > REPORT_COPYING:
+                try:
+                    self._report("copying")
+                except Exception:  # noqa: BLE001
+                    pass
+
     def run(self) -> None:
+        threading.Thread(target=self._heartbeat, name="heartbeat", daemon=True).start()
         while not self.quit:
             try:
                 self._loop_once()
@@ -794,6 +813,10 @@ class Engine(threading.Thread):
                 if gone >= 20:
                     return True                    # много подряд — сервер пересканирует папки, ждём список
                 continue
+            except httpx.TimeoutException:
+                self._note(f"компьютер не отдаёт данные {STALL_LIMIT} с — переподключаюсь и докачиваю", "warn", p)
+                self._set(stall=0)
+                return False                       # сразу новый проход: статус ПК, докачка с того же места
             except httpx.HTTPError as e:
                 self._error(p, f"сеть: {type(e).__name__}")
                 return False
@@ -1071,7 +1094,8 @@ class Engine(threading.Thread):
             os.remove(lp(tmp))
             have = 0
         self._space(size - have)
-        self._set(current=rel, cur_done=have, cur_size=size)
+        self._last_data = time.monotonic()
+        self._set(current=rel, cur_done=have, cur_size=size, stall=0)
         if have < size:
             self._fetch(rel, tmp, have, size)
         got = self._sha(tmp)
@@ -1163,6 +1187,7 @@ class Engine(threading.Thread):
         return done
 
     def _wire(self, wire: int, raw: int) -> None:
+        self._last_data = time.monotonic()
         with self.mu:
             self.st["wire_bytes"] += wire
             self.st["raw_bytes"] += raw
@@ -1223,10 +1248,21 @@ class Engine(threading.Thread):
         every = REPORT_COPYING if state == "copying" or self.st["verifying"] else REPORT_EVERY
         if state == self._reported and not error and time.monotonic() - self._last_report < every:
             return
+        if not self._rep_mu.acquire(blocking=False):
+            return                                 # отчёт уже отправляется из другого потока
+        try:
+            self._send_report(state, error)
+        finally:
+            self._rep_mu.release()
+
+    def _send_report(self, state: str, error: str) -> None:
+        api = self.api
+        if not api:
+            return
         self._reported = state
         self._last_report = time.monotonic()
         s = self.snapshot()
-        self.api.report({"state": state, "client": f"photocloud-backup {VERSION}", "files": s["files"],
+        api.report({"state": state, "client": f"photocloud-backup {VERSION}", "files": s["files"],
                          "bytes": s["bytes"], "left_files": s["left_files"], "left_bytes": s["left_bytes"],
                          "copied": s["copied"], "copied_bytes": s["copied_bytes"], "errors": s["errors"],
                          "pending_delete": s["pending_delete"], "speed": int(s["speed"]),
@@ -1236,6 +1272,7 @@ class Engine(threading.Thread):
                          "limit_mbps": int(float(self.cfg.limit_mbps or 0)),
                          "verify_last": int(s["verify_last"]), "verify_done": s["verify_done"],
                          "verify_total": s["verify_total"] if s["verifying"] else 0, "verify_bad": s["verify_bad"],
+                         "stall": s["stall"] if state == "copying" else 0,
                          **({"error": error} if error else {})})
 
 
@@ -1979,7 +2016,8 @@ class App:
             self.v_counts.set("")
         if s["current"] and state == "copying":
             pct = f" — {100 * s['cur_done'] // max(1, s['cur_size'])}% из {human(s['cur_size'])}" if s["cur_size"] else ""
-            self.v_current.set(f"Файл: {s['current']}{pct}")
+            wait = f" · ждёт данные с ПК {s['stall']} с" if s.get("stall") else ""
+            self.v_current.set(f"Файл: {s['current']}{pct}{wait}")
         else:
             self.v_current.set("")
         if state == "copying" and s["speed"] > 0:

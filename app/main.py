@@ -1106,7 +1106,25 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), s: Ses
 # Клиент ходит с токеном (Authorization: Bearer …), cookie не нужны, поэтому и CSRF не нужен:
 # браузер сам такой заголовок не подставит.
 
+_hash_one = threading.Lock()
+
+
+def _backup_copying() -> bool:
+    """Какой-то клиент бэкапа сейчас качает файлы (свежий отчёт «копирует»)."""
+    now = time.time()
+    return any(t.report.get("state") == "copying" and now - t.report.get("at", 0) < 30 for t in tokens.all())
+
+
 def _hash_file(p, stop) -> str | None:
+    """Хеш файла. Пока клиент бэкапа качает, хеши считаются по одному файлу, а не в два потока:
+    диск ПК отдаёт и то и другое, и при двух потоках чтения отдача клиенту подвисала."""
+    if _backup_copying():
+        with _hash_one:
+            return _hash_read(p, stop)
+    return _hash_read(p, stop)
+
+
+def _hash_read(p, stop) -> str | None:
     h = hashlib.sha256()
     with storage.open(p.rel) as f:
         while True:
@@ -1364,7 +1382,7 @@ async def backup_file(request: Request, path: str = "", z: int = 0, start: int =
 
 _REPORT_NUM = ("files", "bytes", "copied", "copied_bytes", "left_files", "left_bytes", "moved",
                "versions", "deleted", "errors", "pending_delete", "speed", "cur_done", "cur_size",
-               "wire_bytes", "raw_bytes", "limit_mbps", "verify_last", "verify_done", "verify_total", "verify_bad")
+               "wire_bytes", "raw_bytes", "limit_mbps", "stall", "verify_last", "verify_done", "verify_total", "verify_bad")
 
 
 @app.post("/api/backup/report")
