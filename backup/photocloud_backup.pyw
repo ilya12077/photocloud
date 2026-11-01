@@ -75,7 +75,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.9"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.10"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -444,9 +444,12 @@ class State:
         with self.mu:
             return list(self.con.execute("SELECT path, size, sha FROM files WHERE verified < ? LIMIT ?", (since, limit)))
 
-    def count_unverified(self, since: float) -> int:
+    def count_unverified(self, since: float) -> tuple[int, int]:
+        """(файлов, байт) ещё не проверенных в этом цикле."""
         with self.mu:
-            return self.con.execute("SELECT count(*) FROM files WHERE verified < ?", (since,)).fetchone()[0]
+            n, b = self.con.execute("SELECT count(*), coalesce(sum(size), 0) FROM files WHERE verified < ?",
+                                    (since,)).fetchone()
+        return n, b
 
     def set_verified(self, path: str, ts: float) -> None:
         with self.mu:
@@ -582,6 +585,7 @@ class Engine(threading.Thread):
                        pending_delete=0, copied=0, copied_bytes=0, last_ok=0.0, server="",
                        wire_bytes=0, raw_bytes=0, stall=0,
                        verifying=False, verify_done=0, verify_total=0, verify_bad=0, verify_last=0.0,
+                       verify_bytes=0, verify_bytes_total=0, verify_cur="", verify_cur_done=0, verify_cur_size=0,
                        verify_next=0.0)
         self.api: Api | None = None
         self._rep_mu = threading.Lock()         # отчёт шлют и цикл копирования, и «пульс»
@@ -618,6 +622,9 @@ class Engine(threading.Thread):
     def resume(self) -> None:
         self.cfg.paused = False
         self.cfg.save()
+        if self.st["verifying"] and self.db and not (self._vthread and self._vthread.is_alive()):
+            self._vthread = threading.Thread(target=self._verify_bg, name="verify", daemon=True)
+            self._vthread.start()                  # прерванная паузой проверка хешей — продолжить сразу
         self.ev.set()
 
     def sync_now(self) -> None:
@@ -635,6 +642,12 @@ class Engine(threading.Thread):
         Вместе с ней — обход папки бэкапа (пропавшие и посторонние файлы)."""
         self._want_verify = True
         self._force_local = True
+        if self.cfg.paused:
+            self._note("«Проверить хеши»: сейчас пауза — проверка начнётся после «Продолжить»")
+        elif self.st["verifying"]:
+            self._note("«Проверить хеши»: проверка уже идёт")
+        else:
+            self._note("«Проверить хеши»: начинаю — обход папки бэкапа и пересчёт хешей копий")
         if self.db and not (self._vthread and self._vthread.is_alive()):
             self._vthread = threading.Thread(target=self._verify_bg, name="verify", daemon=True)
             self._vthread.start()
@@ -781,6 +794,8 @@ class Engine(threading.Thread):
         if st["pc"] != "up" and ((self.cfg.wake_on_start and not self._woke) or self._want_wake):
             self._wake(st)
             return
+        if self._want_wake and st["pc"] == "up":
+            self._note("«Разбудить ПК»: компьютер уже включён")
         self._want_wake = False
         if st["pc"] != "up":
             waking = st["pc"] == "waking"
@@ -820,7 +835,9 @@ class Engine(threading.Thread):
         m, etag = self.api.manifest(self._etag)
         # обход папки бэкапа долгий: только вместе с проверкой хешей (раз в месяц и по кнопке «Проверить хеши»)
         do_local = self._force_local
-        if m is None and self._idle and not do_local:
+        # короткий путь «ничего не поменялось» — только если и состояние уже итоговое: после паузы,
+        # выключения ПК или ошибки проходим полностью, иначе в окне так и висело бы «Пауза»
+        if m is None and self._idle and not do_local and self.st["state"] in ("done", "waiting", "confirm"):
             # на сервере ничего не поменялось, у нас всё скопировано — проверять нечего
             self._set(detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
             self._report(self.st["state"])
@@ -1058,9 +1075,10 @@ class Engine(threading.Thread):
             self._set(verifying=False)
             return False
         if not self.st["verifying"]:
-            left = self.db.count_unverified(since)
-            self._set(verifying=True, verify_total=left + self.st["verify_done"])
-            self._note(f"проверяю скопированное: {left} файлов")
+            left, left_b = self.db.count_unverified(since)
+            self._set(verifying=True, verify_total=left + self.st["verify_done"],
+                      verify_bytes_total=left_b + self.st["verify_bytes"])
+            self._note(f"проверяю хеши копий: {left} файлов, {human(left_b)}")
         t0 = time.monotonic()
         while time.monotonic() - t0 < VERIFY_SLICE:
             rows = self.db.unverified(since, 50)
@@ -1071,7 +1089,8 @@ class Engine(threading.Thread):
                 self.db.kv_set("verify_since", None)
                 self.db.event("verify", "", f"проверено {n}, повреждено {bad}")
                 self._note(f"проверка копий завершена: {n} файлов, повреждено {bad}", "error" if bad else "info")
-                self._set(verifying=False, verify_done=0, verify_total=0, verify_last=now,
+                self._set(verifying=False, verify_done=0, verify_total=0, verify_bytes=0, verify_bytes_total=0,
+                          verify_cur="", verify_last=now,
                           verify_next=now + VERIFY_EVERY)
                 self._report(self.st["state"], f"повреждённых копий: {bad}" if bad else "")
                 return False
@@ -1080,7 +1099,8 @@ class Engine(threading.Thread):
                     return False
                 try:
                     a = self._arch(rel)
-                    got = self._sha(a) if os.path.exists(lp(a)) else None
+                    self._set(verify_cur=rel, verify_cur_done=0, verify_cur_size=size)
+                    got = self._sha(a, self._verify_progress) if os.path.exists(lp(a)) else None
                 except Stop:
                     return False                         # пауза — продолжим с этого же файла
                 except (OSError, ValueError) as e:
@@ -1109,7 +1129,8 @@ class Engine(threading.Thread):
                             self._note("копии нет в папке — скачаю заново", "warn", rel)
                         self.db.drop(rel)                # следующий проход скачает файл снова
                         self._idle = False               # и не через минуту, а сразу
-                self._set(verify_done=self.st["verify_done"] + 1)
+                self._set(verify_done=self.st["verify_done"] + 1, verify_bytes=self.st["verify_bytes"] + size,
+                          verify_cur="", verify_cur_done=0)
         return True
 
     # ------------------------------------------------------------ операции с файлами
@@ -1346,15 +1367,23 @@ class Engine(threading.Thread):
         if time.monotonic() - self._last_report > REPORT_COPYING:
             self._report("copying")              # большой файл — ход виден в админке и посреди него
 
-    def _sha(self, p: Path) -> str:
+    def _sha(self, p: Path, progress=None) -> str:
         """SHA-256 файла. Пауза, выход или смена настроек прерывают даже большой файл (Stop)."""
         h = hashlib.sha256()
+        done = 0
         with open(lp(p), "rb") as f:
             for b in iter(lambda: f.read(1024 * 1024), b""):
                 if self._halted():
                     raise Stop()
                 h.update(b)
+                done += len(b)
+                if progress:
+                    progress(done)
         return h.hexdigest()
+
+    def _verify_progress(self, done: int) -> None:
+        with self.mu:
+            self.st["verify_cur_done"] = done
 
     def _copy_file(self, src: Path, dst: Path) -> None:
         """Копия внутри папки бэкапа, которую тоже прерывает пауза (недоделанная — удаляется)."""
@@ -2200,9 +2229,17 @@ class App:
         day = lambda ts: time.strftime("%d.%m.%Y", time.localtime(ts)) if ts else "—"     # noqa: E731
         bad = f" · повреждено и скачивается заново: {s['verify_bad']}" if s["verify_bad"] else ""
         if s["verifying"]:
-            self.v_verify.set(f"Проверка копий: {num(s['verify_done'])} из {num(s['verify_total'])}{bad}")
+            done_b = s["verify_bytes"] + s["verify_cur_done"]
+            cur = ""
+            if s["verify_cur"]:
+                cur = f" · {s['verify_cur'].rsplit('/', 1)[-1]}"
+                if s["verify_cur_size"] > 50 * 2**20:          # большой файл — видно, что идёт
+                    cur += f" {100 * s['verify_cur_done'] // max(1, s['verify_cur_size'])}%"
+            paused = " · на паузе" if s["paused"] else ""
+            self.v_verify.set(f"Проверка хешей: {num(s['verify_done'])} из {num(s['verify_total'])} файлов, "
+                              f"{human(done_b)} из {human(s['verify_bytes_total'])}{cur}{paused}{bad}")
         elif s["verify_last"]:
-            self.v_verify.set(f"Проверка копий: последняя {day(s['verify_last'])}, следующая {day(s['verify_next'])}{bad}")
+            self.v_verify.set(f"Проверка хешей: последняя {day(s['verify_last'])}, следующая {day(s['verify_next'])}{bad}")
         else:
             self.v_verify.set("")
         top = s["log"][0] if s["log"] else None
