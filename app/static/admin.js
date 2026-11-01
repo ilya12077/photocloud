@@ -312,8 +312,22 @@ async function loadSecurity() {
 // ================================================================== бэкап
 
 const gb = (b) => (b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' ГБ' : mb(b));
+// скорость чтения с ПК — в битах, как у сети: 320 Мбит/с, 1,2 Гбит/с
+function mbit(bps) {
+  const m = bps * 8 / 1e6;
+  return m >= 1000 ? `${(m / 1000).toFixed(1).replace('.', ',')} Гбит/с` : `${m < 10 ? m.toFixed(1).replace('.', ',') : Math.round(m)} Мбит/с`;
+}
+function leftTime(sec) {
+  if (sec < 60) return 'меньше минуты';
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60), d = Math.floor(h / 24);
+  return d ? `${d} д ${h % 24} ч` : `${h} ч ${m % 60} мин`;
+}
+// «· 320 Мбит/с · осталось ≈ 2 ч 10 мин» — пока скорость не набралась (первые секунды), ничего
+const pace = (x) => (x.speed ? ` · ${mbit(x.speed)}` + (x.eta ? ` · осталось ≈ ${leftTime(x.eta)}` : '') : '');
 function hashText(h) {
-  if (h.state === 'running') return `считаются: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')} (${gb(h.bytes_done)} из ${gb(h.bytes_total)})`;
+  if (h.state === 'running') return `считаются: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')} (${gb(h.bytes_done)} из ${gb(h.bytes_total)})${pace(h)}`;
   if (h.state === 'stopped') return `остановлено: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')}`;
   if (h.state === 'error') return 'прервано из-за ошибок чтения — продолжится при следующем сканировании';
   if (h.state === 'done') return 'все посчитаны';
@@ -322,9 +336,10 @@ function hashText(h) {
 const dday = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString('ru') : '—');
 function verifyText(v) {
   const bad = v.bad ? ` · изменённых: ${v.bad}` : '';
-  if (v.state === 'running') return `идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} (${gb(v.bytes_done)} из ${gb(v.bytes_total)})${bad}`;
-  if (v.since && v.paused) return `остановлена${v.done ? ` на ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}` : ''} — продолжится по кнопке${bad}`;
-  if (v.since) return `прервалась — продолжится, когда ПК включится${bad}`;
+  if (v.state === 'running') return `идёт: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')} (${gb(v.bytes_done)} из ${gb(v.bytes_total)})${pace(v)}${bad}`;
+  const at = v.total ? ` на ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}` : '';
+  if (v.since && v.paused) return `остановлена${at} — продолжится по кнопке${bad}`;
+  if (v.since) return `прервалась${at} — продолжится ${v.pc ? 'сама в течение минуты' : 'когда ПК включится'}${bad}`;
   return v.last ? `последняя ${dday(v.last)}, следующая ${dday(v.next)}${bad}` : 'ещё не было';
 }
 function plural(n, one, few, many) {

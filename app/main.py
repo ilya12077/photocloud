@@ -1143,6 +1143,7 @@ def _hash_read(p, stop) -> str | None:
                 if not b:
                     break
                 h.update(b)
+                library.io.add(len(b))
     except Exception as e:  # noqa: BLE001
         if is_read_error(e):
             good = db.hash_get(p.cache_key())
@@ -1320,14 +1321,26 @@ def _safe(fn, *a) -> None:
 library.on_built = _after_scan
 
 
+def _speed_eta(left_bytes: int) -> dict:
+    """Скорость чтения (байт/с, за последнюю минуту) и сколько осталось секунд."""
+    sp = library.io.speed()
+    return {"speed": int(sp), "eta": int(left_bytes / sp) if sp > 0 else 0}
+
+
 def _verify_info() -> dict:
     last, since = db.kv_get("verify_last"), db.kv_get("verify_since")
-    return {"state": library.verify_state, "done": library.verify_done, "total": library.verify_total,
-            "bytes_done": library.verify_bytes_done, "bytes_total": library.verify_bytes_total,
-            "bad": library.verify_bad if library.verify_state else int(db.kv_get("verify_last_bad") or 0),
-            "last": int(float(last)) if last else 0,
-            "since": int(float(since)) if since else 0, "paused": db.kv_get("verify_paused") == "1",
-            "next": int(float(last)) + VERIFY_EVERY if last else 0}
+    out = {"state": library.verify_state, "done": library.verify_done, "total": library.verify_total,
+           "bytes_done": library.verify_bytes_done, "bytes_total": library.verify_bytes_total,
+           "bad": library.verify_bad if library.verify_state else int(db.kv_get("verify_last_bad") or 0),
+           "last": int(float(last)) if last else 0,
+           "since": int(float(since)) if since else 0, "paused": db.kv_get("verify_paused") == "1",
+           "next": int(float(last)) + VERIFY_EVERY if last else 0, "pc": PC.up, "speed": 0, "eta": 0}
+    if library.verify_state == "running":
+        out.update(_speed_eta(library.verify_bytes_total - library.verify_bytes_done))
+    elif since and library.verify_state != "done":
+        # остановлена или прервана (в т.ч. перезапуском сервера): сколько уже сверено в этом цикле
+        out["done"], out["total"] = db.hashes_checked_count(float(since))
+    return out
 
 
 def _verify_tick() -> None:
@@ -1356,8 +1369,11 @@ def _verify_tick() -> None:
 
 
 def _hash_progress() -> dict:
-    return {"state": library.hash_state, "done": library.hash_done, "total": library.hash_total,
-            "bytes_done": library.hash_bytes_done, "bytes_total": library.hash_bytes_total}
+    out = {"state": library.hash_state, "done": library.hash_done, "total": library.hash_total,
+           "bytes_done": library.hash_bytes_done, "bytes_total": library.hash_bytes_total, "speed": 0, "eta": 0}
+    if library.hash_state == "running":
+        out.update(_speed_eta(library.hash_bytes_total - library.hash_bytes_done))
+    return out
 
 
 _last_stale_check = 0.0
