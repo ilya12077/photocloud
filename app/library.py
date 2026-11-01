@@ -27,6 +27,36 @@ log = logging.getLogger("photocloud.library")
 # фона 4 (storage.SMB_BACKGROUND): один оставляем датам и обходу папок при новом сканировании.
 HASH_THREADS = 3
 
+
+class Rate:
+    """Скорость чтения по последней минуте: счётчик байт и отметки (время, байт) раз в секунду."""
+
+    WINDOW = 60
+
+    def __init__(self):
+        self.mu = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self.mu:
+            self.total, self.pts = 0, [(time.monotonic(), 0)]
+
+    def add(self, n: int) -> None:
+        with self.mu:
+            self.total += n
+            now = time.monotonic()
+            if now - self.pts[-1][0] >= 1:
+                self.pts.append((now, self.total))
+                while len(self.pts) > 2 and now - self.pts[1][0] >= self.WINDOW:
+                    self.pts.pop(0)
+
+    def speed(self) -> float:
+        """Байт/с; 0 — пока мало данных (первые секунды)."""
+        with self.mu:
+            t0, b0 = self.pts[0]
+            dt = time.monotonic() - t0
+            return (self.total - b0) / dt if dt >= 3 else 0.0
+
 F_VIDEO = 1
 F_TAKEN = 2   # дата из EXIF/метаданных
 F_NAME = 4    # дата из имени файла
@@ -202,6 +232,7 @@ class Library:
         self.hash_total = self.hash_done = 0
         self.hash_bytes_total = self.hash_bytes_done = 0
         self.hash_state = ""          # "" | running | stopped | done
+        self.io = Rate()              # скорость чтения файлов для хешей (и проверки хешей); считает main
         self._hash_stop = threading.Event()
         self._hlock = threading.Lock()
         self._hthread: threading.Thread | None = None
@@ -515,16 +546,22 @@ class Library:
             return
         try:
             stored = db.hashes_unchecked(since)
+            hashed = set(db.hashes_load())
         except Exception as e:  # noqa: BLE001
             log.warning("проверка хешей: база недоступна (%s)", e)
             return
         todo = [p for p in photos if p.cache_key() in stored]
+        # прерванную проверку продолжаем: уже сверенное в этом цикле — в счёт «N из M»
+        already = [p for p in photos if p.cache_key() in hashed and p.cache_key() not in stored]
+        base, base_b = len(already), sum(p.size for p in already)
         self._hash_stop.clear()
-        self.verify_total, self.verify_done, self.verify_bad = len(todo), 0, 0
-        self.verify_bytes_total, self.verify_bytes_done = sum(p.size for p in todo), 0
+        self.verify_total, self.verify_done, self.verify_bad = base + len(todo), base, 0
+        self.verify_bytes_total, self.verify_bytes_done = base_b + sum(p.size for p in todo), base_b
         self.verify_state = "running"
+        self.io.reset()
         t0, failures, batch, aborted = time.time(), 0, [], False
-        log.info("проверка хешей: %d файлов (%.1f ГБ)", len(todo), self.verify_bytes_total / 2**30)
+        log.info("проверка хешей: %d файлов (%.1f ГБ)%s", len(todo), (self.verify_bytes_total - base_b) / 2**30,
+                 f", уже сверено в этом цикле {base}" if base else "")
 
         def one(p: Photo):
             if self._hash_stop.is_set():
@@ -563,14 +600,14 @@ class Library:
                     else:
                         batch.append((sha, time.time(), p.cache_key()))
                     self.verify_bytes_done += p.size
-                self.verify_done = i
+                self.verify_done = base + i
                 if len(batch) >= 100:
                     db.hashes_checked_many(batch)
                     batch = []
         db.hashes_checked_many(batch)
         stopped = self._hash_stop.is_set()
         self.verify_state = "stopped" if stopped else "error" if aborted else "done"
-        log.info("проверка хешей: %d из %d за %.0fс, не совпало %d%s", self.verify_done, self.verify_total,
+        log.info("проверка хешей: %d из %d за %.0fс, не совпало %d%s", self.verify_done - base, self.verify_total - base,
                  time.time() - t0, self.verify_bad, " — остановлено" if stopped else "")
 
     def _collect_hashes(self, storage, photos: list[Photo]) -> None:
@@ -595,6 +632,7 @@ class Library:
         self._hash_stop.clear()
         self.hash_total, self.hash_done, self.hash_state = len(todo), 0, "running"
         self.hash_bytes_total, self.hash_bytes_done = sum(p.size for p in todo), 0
+        self.io.reset()
         t0, failures, batch, aborted = time.time(), 0, [], False
 
         def one(p: Photo):

@@ -175,6 +175,11 @@ class DB:
             self.many("INSERT OR REPLACE INTO hashes(key, sha, checked) VALUES(?, ?, ?)",
                       [(k, h, now) for k, h in items])
 
+    def hashes_checked_count(self, since: float) -> tuple[int, int]:
+        """(сверено с момента since, всего хешей) — ход прерванной проверки."""
+        n, total = self.run("SELECT coalesce(sum(checked >= ?), 0), count(*) FROM hashes", (since,))[0]
+        return int(n), int(total)
+
     def hashes_unchecked(self, since: float) -> dict[str, str]:
         """Хеши, которые не сверяли с файлом с момента since (начало текущей проверки)."""
         return dict(self.run("SELECT key, sha FROM hashes WHERE checked < ?", (since,)))

@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.2"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.3"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -1185,6 +1185,7 @@ class Engine(threading.Thread):
         top = lp(self.root / ARCHIVE)
         out: dict[str, int] = {}
         stack = [(top, "")]
+        t0 = shown = time.monotonic()
         while stack:
             d, prefix = stack.pop()
             try:
@@ -1204,6 +1205,11 @@ class Engine(threading.Thread):
                             out[rel] = (st.st_size, int(st.st_mtime))
                     except OSError:
                         continue
+                    now = time.monotonic()
+                    if now - shown >= 0.5:                # ход обхода: на медленном диске это минуты
+                        shown, dt = now, now - t0
+                        self._set(detail=f"Сверяю папку бэкапа: просмотрено {num(len(out))} файлов · "
+                                         f"{num(int(len(out) / dt))} файлов/с · идёт {took(dt)}")
         return out
 
     def _verify_local(self, local: dict, files: dict) -> tuple[dict, list[str]]:
@@ -1226,7 +1232,7 @@ class Engine(threading.Thread):
         if gone:
             self._note(f"в папке бэкапа пропали или изменились {len(gone)} файлов — скопирую заново", "warn",
                        gone[0] if len(gone) == 1 else "")
-        extras, adopted = [], 0
+        extras, adopted, check = [], 0, []
         for p, (size, _mtime) in have.items():
             if p in local:
                 continue
@@ -1234,17 +1240,34 @@ class Engine(threading.Thread):
             if f is not None and not f[4]:
                 continue                                  # на сервере ещё нет хеша — решим в следующий раз
             if f is not None and f[1] == size:
-                try:
-                    if self._sha(self._arch(p)) == f[4]:
-                        self.db.put(p, f[1], f[2], f[4])
-                        self._set_mtime(self._arch(p), f[2])
-                        out[p] = (f[1], f[2], f[4])
-                        adopted += 1
-                        continue
-                except (OSError, ValueError):
-                    continue
-            if f is None:
+                check.append(p)                           # такой же размер — сверим по хешу
+            elif f is None:
                 extras.append(p)       # на ПК такого нет; если есть, но другой — его заменит скачивание (старый — в «Версии»)
+        total_b, done_b, t0, shown = sum(files[p][1] for p in check), 0, time.monotonic(), 0.0
+
+        def show(cur: int) -> None:
+            nonlocal shown
+            now = time.monotonic()
+            if now - shown < 0.5:
+                return
+            shown, dt = now, now - t0
+            sp = (done_b + cur) / dt if dt >= 1 else 0
+            tail = f" · {human(sp)}/с · осталось ≈ {eta((total_b - done_b - cur) / sp)}" if sp else ""
+            self._set(detail=f"Сверяю папку бэкапа: хеши файлов не из базы — {num(i)} из {num(len(check))}, "
+                             f"{human(done_b + cur)} из {human(total_b)}{tail}")
+
+        for i, p in enumerate(check, 1):
+            f = files[p]
+            try:
+                ok = self._sha(self._arch(p), show) == f[4]
+            except (OSError, ValueError):
+                ok = False
+            done_b += f[1]
+            if ok:
+                self.db.put(p, f[1], f[2], f[4])
+                self._set_mtime(self._arch(p), f[2])
+                out[p] = (f[1], f[2], f[4])
+                adopted += 1
         if adopted:
             self._note(f"в Архиве нашлись уже скопированные файлы: {adopted} — взял без скачивания")
         if extras:
@@ -1828,6 +1851,16 @@ def num(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
+def took(sec: float) -> str:
+    """Сколько уже идёт: «12 с», «3 мин 5 с», «1 ч 4 мин»."""
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec} с"
+    if sec < 3600:
+        return f"{sec // 60} мин {sec % 60} с"
+    return f"{sec // 3600} ч {sec % 3600 // 60} мин"
+
+
 def eta(sec: float) -> str:
     sec = int(sec)
     if sec < 90:
@@ -1852,6 +1885,7 @@ class App:
         self.log_path = log_path
         self.q: queue.Queue = queue.Queue()
         self._last_state, self._last_paused, self._log_top = None, None, None
+        self._vsamples: collections.deque = collections.deque()   # (время, байт) — скорость проверки хешей
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -2507,9 +2541,22 @@ class App:
                 if s["verify_cur_size"] > 50 * 2**20:          # большой файл — видно, что идёт
                     cur += f" {100 * s['verify_cur_done'] // max(1, s['verify_cur_size'])}%"
             paused = " · на паузе" if s["paused"] else ""
+            # скорость — по последним 30 с (отметки раз в тик окна), и сколько осталось
+            now = time.monotonic()
+            vs = self._vsamples
+            if vs and done_b < vs[-1][1]:
+                vs.clear()                                  # новая проверка — счёт с нуля
+            vs.append((now, done_b))
+            while len(vs) > 2 and now - vs[0][0] > 30:
+                vs.popleft()
+            pace = ""
+            if not s["paused"] and now - vs[0][0] >= 3 and done_b > vs[0][1]:
+                sp = (done_b - vs[0][1]) / (now - vs[0][0])
+                pace = f" · {human(sp)}/с · осталось ≈ {eta((s['verify_bytes_total'] - done_b) / sp)}"
             self.v_verify.set(f"Проверка хешей: {num(s['verify_done'])} из {num(s['verify_total'])} файлов, "
-                              f"{human(done_b)} из {human(s['verify_bytes_total'])}{cur}{paused}{bad}")
+                              f"{human(done_b)} из {human(s['verify_bytes_total'])}{cur}{pace}{paused}{bad}")
         elif s["verify_last"]:
+            self._vsamples.clear()
             self.v_verify.set(f"Проверка хешей: последняя {day(s['verify_last'])}, следующая {day(s['verify_next'])}{bad}")
         else:
             self.v_verify.set("")
