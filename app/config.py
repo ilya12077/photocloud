@@ -18,10 +18,10 @@ class ConfigError(RuntimeError):
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def app_version() -> str:
-    """Версия сборки — из файла VERSION (в образе он лежит в /app). Переменную окружения
-    не используем: Portainer переносит старые переменные в новый контейнер."""
+    """Версия сервера — файл app/VERSION. Переменную окружения не используем:
+    Portainer переносит старые переменные в новый контейнер."""
     try:
-        return (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip() or "dev"
+        return (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip() or "dev"
     except OSError:
         return "dev"
 
@@ -105,7 +105,13 @@ _SERVICE_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 _NOTIFY_RE = re.compile(r"^(notify|input_text|input_select|sensor|text|select)\.[a-z0-9_]+$")
 
 ALL_NOTIFY_EVENTS = {"login", "login_new_ip", "login_failed", "lockout", "wake", "wake_timeout", "index_error",
-                     "backup_stale", "hash_mismatch"}
+                     "backup_stale", "damaged"}
+# упразднённые события -> чем заменены (в старых settings.json и .env они ещё встречаются)
+RENAMED_NOTIFY_EVENTS = {"hash_mismatch": "damaged"}
+
+
+def _notify_events(names) -> set:
+    return {RENAMED_NOTIFY_EVENTS.get(e, e) for e in names}
 
 
 @dataclass
@@ -119,6 +125,9 @@ class Settings:
     smb_subdir: str = ""
     smb_user: str = ""
     smb_password: str = ""
+    smb_restore_user: str = ""           # запись восстановленных копий в Restored (только туда)
+    smb_restore_password: str = ""
+    smb_restore_share: str = ""          # отдельная шара на папку Restored (пусто — Restored в основной шаре)
     smb_encrypt: bool = True
 
     # пробуждение (только через Home Assistant)
@@ -191,6 +200,9 @@ def load() -> Settings:
     s.smb_subdir = (_get("SMB_SUBDIR", "") or "").strip("\\/")
     s.smb_user = _get("SMB_USER", "")
     s.smb_password = _secret("SMB_PASSWORD", "") or ""
+    s.smb_restore_user = _get("SMB_RESTORE_USER", "") or ""
+    s.smb_restore_password = _secret("SMB_RESTORE_PASSWORD", "") or ""
+    s.smb_restore_share = _get("SMB_RESTORE_SHARE", "") or ""
     s.smb_encrypt = _bool("SMB_ENCRYPT", True)
     if s.storage == "smb":
         if not (s.smb_host and s.smb_share and s.smb_user and s.smb_password):
@@ -228,8 +240,8 @@ def load() -> Settings:
             raise ConfigError("HA_WAKE_DATA: должен быть JSON-объект")
     if s.storage == "smb" and not (s.ha_token and s.ha_wake_service):
         raise ConfigError("нужны HA_TOKEN и HA_WAKE_SERVICE (пробуждение ПК идёт через Home Assistant)")
-    ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale,hash_mismatch") or ""
-    s.notify_events = {e.strip() for e in ev.split(",") if e.strip()}
+    ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale,damaged") or ""
+    s.notify_events = _notify_events(e.strip() for e in ev.split(",") if e.strip())
     bad = s.notify_events - ALL_NOTIFY_EVENTS
     if bad:
         raise ConfigError(f"NOTIFY_EVENTS: неизвестные события {sorted(bad)}")
@@ -312,9 +324,10 @@ def validate_override(s: Settings, key: str, val):
             raise ConfigError("название: 1–40 символов")
         return val.strip()
     if key == "notify_events":
-        if not isinstance(val, list) or not all(isinstance(e, str) for e in val) or set(val) - ALL_NOTIFY_EVENTS:
+        if not isinstance(val, list) or not all(isinstance(e, str) for e in val) \
+                or _notify_events(val) - ALL_NOTIFY_EVENTS:
             raise ConfigError("неизвестные события уведомлений")
-        return set(val)
+        return _notify_events(val)
     if key in ("ha_notify_service", "ha_wake_service"):
         if not isinstance(val, str) or (val and not _SERVICE_RE.match(val)):
             raise ConfigError("сервис HA: формат domain.service")

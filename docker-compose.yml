@@ -17,6 +17,10 @@ services:
       SMB_USER: ${SMB_USER}
       SMB_PASSWORD: ${SMB_PASSWORD}
       SMB_ENCRYPT: ${SMB_ENCRYPT:-true}
+      # восстановление испорченных файлов: пользователь с записью только в папку Restored
+      SMB_RESTORE_USER: ${SMB_RESTORE_USER:-}
+      SMB_RESTORE_PASSWORD: ${SMB_RESTORE_PASSWORD:-}
+      SMB_RESTORE_SHARE: ${SMB_RESTORE_SHARE:-}
       PUBLIC_URL: ${PUBLIC_URL:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.32.0/23,127.0.0.1/32}
@@ -25,7 +29,7 @@ services:
       HA_TOKEN: ${HA_TOKEN}
       HA_WAKE_SERVICE: ${HA_WAKE_SERVICE}
       HA_NOTIFY_SERVICE: ${HA_NOTIFY_SERVICE:-}
-      NOTIFY_EVENTS: ${NOTIFY_EVENTS:-login_new_ip,login_failed,lockout,wake_timeout,index_error}
+      NOTIFY_EVENTS: ${NOTIFY_EVENTS:-login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale,damaged}
       WAKE_TIMEOUT: ${WAKE_TIMEOUT:-180}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}

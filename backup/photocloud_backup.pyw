@@ -75,7 +75,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.12"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.0"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -385,6 +385,11 @@ def stamp(ts: float | None = None) -> str:
     return datetime.datetime.fromtimestamp(ts or time.time()).strftime("%Y-%m-%d %H-%M-%S")
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    m10, m100 = n % 10, n % 100
+    return one if m10 == 1 and m100 != 11 else few if 2 <= m10 <= 4 and not 12 <= m100 <= 14 else many
+
+
 def human(n: float) -> str:
     for unit, k in (("ГБ", 2**30), ("МБ", 2**20), ("КБ", 2**10)):
         if n >= k:
@@ -515,13 +520,31 @@ class Api:
         h = {"accept-encoding": "gzip"}
         if etag:
             h["if-none-match"] = etag
-        r = self.c.get(self.base + "/api/backup/manifest", headers=h)
+        r = self.c.get(self.base + "/api/backup/manifest", params={"damaged": 1}, headers=h)
         if r.status_code == 304:
             return None, etag
         self._check(r)
         return r.json(), r.headers.get("etag")
 
     _report_warned = 0.0
+
+    # восстановление испорченных на ПК файлов (сервер 1.7+)
+    def restore_list(self) -> dict:
+        return self._check(self.c.get(self.base + "/api/backup/restore")).json()
+
+    def restore_put(self, rel: str, offset: int, data: bytes) -> tuple[int, dict]:
+        r = self.c.put(f"{self.base}/api/backup/restore?path={quote(rel, safe='')}&offset={offset}", content=data,
+                       headers={"content-type": "application/octet-stream"}, timeout=httpx.Timeout(300, connect=15))
+        if r.status_code in (401, 429):
+            self._check(r)
+        try:
+            body = r.json()
+        except ValueError:
+            body = {}
+        return r.status_code, body
+
+    def restore_nosource(self, rel: str) -> None:
+        self._check(self.c.post(f"{self.base}/api/backup/restore/nosource?path={quote(rel, safe='')}"))
 
     def report(self, rep: dict) -> None:
         """Отчёт серверу. Неудача не мешает копированию, но пишется в журнал (не чаще раза в минуту)."""
@@ -588,6 +611,8 @@ class Engine(threading.Thread):
                        verify_bytes=0, verify_bytes_total=0, verify_cur="", verify_cur_done=0, verify_cur_size=0,
                        verify_next=0.0)
         self.api: Api | None = None
+        self._restore_n = 0
+        self._restore_failed: dict[str, float] = {}   # путь -> когда не получилось (повтор не чаще раза в 10 мин)
         self._rep_mu = threading.Lock()         # отчёт шлют и цикл копирования, и «пульс»
         self._fmu = threading.Lock()            # перенос/замена файла в Архиве — копирование и проверка копий
         self._vmu = threading.Lock()            # проверка копий идёт в одном месте за раз
@@ -793,6 +818,7 @@ class Engine(threading.Thread):
             self.db.kv_set("rebuild_pending", None)
         st = self.api.status()
         self._set(server=st.get("server", ""))
+        self._restore_n = int(st.get("restore") or 0)          # файлы на ПК, которые просят восстановить
         if st["pc"] != "up" and ((self.cfg.wake_on_start and not self._woke) or self._want_wake):
             self._wake(st)
             return
@@ -840,7 +866,8 @@ class Engine(threading.Thread):
         do_local = self._force_local or self._force_list
         # короткий путь «ничего не поменялось» — только если и состояние уже итоговое: после паузы,
         # выключения ПК или ошибки проходим полностью, иначе в окне так и висело бы «Пауза»
-        if m is None and self._idle and not do_local and self.st["state"] in ("done", "waiting", "confirm"):
+        if m is None and self._idle and not do_local and not self._restore_n \
+                and self.st["state"] in ("done", "waiting", "confirm"):
             # на сервере ничего не поменялось, у нас всё скопировано — проверять нечего
             self._set(detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
             self._report(self.st["state"])
@@ -849,7 +876,9 @@ class Engine(threading.Thread):
             self._manifest, self._etag = m, etag
         m = self._manifest
         self._idle = False
-        files = {f[0]: f for f in m["files"]}            # путь -> [путь, размер, mtime, дата, sha]
+        bad = set(m.get("damaged") or ())                # испорчены на сервере — их не качаем
+        # путь -> [путь, размер, mtime, дата, sha, испорчен]
+        files = {f[0]: [*f[:5], int(f[0] in bad)] for f in m["files"]}
         if do_local:
             self._force_local = self._force_list = False
             self._set(detail="Сверяю папку бэкапа…")
@@ -863,8 +892,10 @@ class Engine(threading.Thread):
         left_bytes = sum(files[p][1] for p in downloads)
         self._set(files=len(files), bytes=total_bytes, waiting_hash=waiting,
                   left_files=len(downloads) + waiting, left_bytes=left_bytes + sum(f[1] for f in files.values() if not f[4]),
-                  have_files=len(files) - len(downloads) - waiting,     # переносы/копии рядом — секунды
-                  have_bytes=total_bytes - left_bytes - sum(f[1] for f in files.values() if not f[4]))
+                  # переносы/копии рядом — секунды; испорченных на сервере у нас нет и скачать их нельзя
+                  have_files=len(files) - len(downloads) - waiting - len(self._damaged_skip),
+                  have_bytes=total_bytes - left_bytes - sum(f[1] for f in files.values() if not f[4])
+                  - sum(files[p][1] for p in self._damaged_skip))
 
         for src, dst in moves:
             if self._halted():
@@ -925,6 +956,10 @@ class Engine(threading.Thread):
             if time.monotonic() - t0 > PASS_MAX:
                 return False                       # свежий список: могли досчитаться новые хеши
         self._set(current="", speed=0.0, last_ok=time.time())
+        if self._restore_n:
+            self._restore()
+        if self._damaged_skip:
+            log.info("испорчены на сервере, не скачиваю: %d", len(self._damaged_skip))
         if waiting:
             self._set(state="waiting", text="Жду хеши с сервера",
                       detail=f"Сервер ещё считает контрольные суммы: {waiting} файлов")
@@ -932,11 +967,77 @@ class Engine(threading.Thread):
             self._set(state="confirm", text=self._confirm_text(self.st["pending_delete"]),
                       detail=f"Нажмите «Подтвердить», чтобы убрать их в «{DELETED}»")
         else:
+            skip = len(self._damaged_skip)
             self._set(state="done", text="Всё скопировано",
-                      detail=f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
+                      detail=(f"Не скопировано {skip} {plural(skip, 'файл', 'файла', 'файлов')}: испорчены на сервере, "
+                              f"скопирую после восстановления. " if skip else "")
+                      + f"Проверено в {time.strftime('%H:%M:%S')}. Новое проверяется каждые {IDLE_EVERY} с.")
         self._report(self.st["state"])
         self._idle = not waiting and not self.st.get("pending_delete")
         return True                              # подождать IDLE_EVERY (и когда ждём хеши — тоже)
+
+    # ------------------------------------------------------------ восстановление файлов на ПК
+
+    def _restore(self) -> None:
+        """Сервер нашёл на ПК испорченные файлы. Если у нас правильная копия (хеш совпадает —
+        проверяем прямо перед отправкой), отправляем её кусками; сервер положит её в Restored.
+        Своих файлов клиент при этом не меняет."""
+        try:
+            lst = self.api.restore_list()
+        except (httpx.HTTPError, PcOff):
+            return
+        chunk = int(lst.get("chunk") or 8 * 2**20)
+        for it in lst.get("items", []):
+            rel, sha, size = it["path"], it["sha"], int(it["size"])
+            if time.time() - self._restore_failed.get(rel, 0) < 600:
+                continue
+            if self._halted() or self._want_sync:
+                raise Stop()
+            cur = self.db.get(rel)
+            a = self._arch(rel)
+            ok = cur is not None and cur[2] == sha and os.path.exists(lp(a)) and os.path.getsize(lp(a)) == size
+            if ok:
+                self._set(state="restoring", text="Восстанавливаю файл на сервере", current=rel, cur_done=0, cur_size=size,
+                          detail="На сервере файл испорчен — отправляю правильную копию из бэкапа")
+                ok = self._sha(a) == sha                 # своя копия тоже должна быть целой
+            if not ok:
+                self._note("испорчен на сервере, но правильной копии здесь нет — сообщил серверу", "warn", rel)
+                try:
+                    self.api.restore_nosource(rel)
+                except httpx.HTTPError:
+                    pass
+                continue
+            self._upload(rel, a, size, int(it.get("received") or 0), chunk)
+
+    def _upload(self, rel: str, a: Path, size: int, offset: int, chunk: int) -> None:
+        thr = Throttle(lambda: int(max(0.0, float(self.cfg.limit_mbps or 0)) * 125_000))
+        with open(lp(a), "rb") as f:
+            while True:
+                if self._halted():
+                    raise Stop()
+                f.seek(offset)
+                data = f.read(min(chunk, size - offset))
+                code, body = self.api.restore_put(rel, offset, data)
+                if code == 409 and "received" in body:          # сервер ждёт другой кусок
+                    offset = int(body["received"])
+                    continue
+                if code == 422:
+                    self._restore_failed[rel] = time.time()
+                    self._error(rel, "сервер не принял копию: хеш не совпал")
+                    return
+                if code >= 400:
+                    self._restore_failed[rel] = time.time()
+                    self._note(f"восстановить на сервере не получилось ({body.get('error') or code}) — повторю позже",
+                               "warn", rel)
+                    return
+                offset = int(body.get("received", offset + len(data)))
+                self._set(cur_done=offset)
+                thr.wait(len(data), self.halt)
+                if body.get("done"):
+                    self._note("правильная копия передана серверу — он кладёт её в папку Restored",
+                               "update", rel)
+                    self.db.event("restore", rel, "передана серверу")
+                    return
 
     def _plan(self, files: dict, local: dict):
         missing = {p: v for p, v in local.items() if p not in files}
@@ -945,6 +1046,7 @@ class Engine(threading.Thread):
             by_sha_missing.setdefault(h, []).append(p)
         by_sha_have = {h: p for p, (_s, _m, h) in local.items() if p in files}
         moves, copies, downloads, waiting = [], [], [], 0
+        damaged = self._damaged_skip = []
         for p, f in files.items():
             sha = f[4]
             if not sha:
@@ -960,6 +1062,9 @@ class Engine(threading.Thread):
                 continue
             if not have and sha in by_sha_have:
                 copies.append((by_sha_have[sha], p))              # такой же файл уже есть рядом
+                continue
+            if len(f) > 5 and f[5]:
+                damaged.append(p)                                 # на ПК он испорчен — скачали бы порчу
                 continue
             downloads.append(p)
         used = {src for src, _ in moves}
@@ -1250,7 +1355,7 @@ class Engine(threading.Thread):
     # ------------------------------------------------------------ загрузка
 
     def _download(self, f) -> None:
-        rel, size, mtime, _date, sha = f
+        rel, size, mtime, _date, sha = f[:5]
         b = self._arch(rel)                         # проверка пути — до любых обращений к диску
         tmp = self.root / META / "tmp" / f"{sha}.part"
         have = os.path.getsize(lp(tmp)) if os.path.exists(lp(tmp)) else 0
@@ -1583,9 +1688,10 @@ updater = SimpleNamespace(local_version=local_version, default_branch=default_br
 # Окно (tkinter) и значок в трее (pystray). Движок работает в своём потоке;
 # сюда — только чтение его состояния раз в 0,7 с и кнопки.
 COLORS = {"copying": "#2f80ed", "done": "#27ae60", "paused": "#9aa0a6", "pc_off": "#f2994a", "waiting": "#2f80ed",
-          "error": "#eb5757", "confirm": "#eb5757", "disk_full": "#eb5757", "setup": "#9aa0a6", "scan": "#2f80ed"}
+          "error": "#eb5757", "confirm": "#eb5757", "disk_full": "#eb5757", "restoring": "#2f80ed", "setup": "#9aa0a6", "scan": "#2f80ed"}
 TITLES = {"copying": "копирует", "done": "всё скопировано", "paused": "пауза", "pc_off": "компьютер выключен",
-          "waiting": "ждёт хеши с сервера", "error": "ошибка", "disk_full": "мало места на диске", "confirm": "ждёт подтверждения", "setup": "не настроен",
+          "waiting": "ждёт хеши с сервера", "error": "ошибка", "disk_full": "мало места на диске",
+          "restoring": "восстанавливает файл на сервере", "confirm": "ждёт подтверждения", "setup": "не настроен",
           "scan": "проверяет папку бэкапа"}
 KIND = {"info": "", "warn": "⚠ ", "error": "✖ ", "move": "↪ ", "copy": "", "update": "✎ ", "delete": "🗑 "}
 

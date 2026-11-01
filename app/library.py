@@ -188,6 +188,7 @@ class Library:
         self.meta_done = 0
         # фаза 3: подробности (камера, размеры, GPS) для панели «Подробнее» -> в базу
         self.info_reader = None       # p -> dict; задаёт main (читает файл с ПК)
+        self.on_built = None          # () -> None; после каждого сканирования (main: повреждённые файлы)
         self.info_total = self.info_done = 0
         self.info_state = ""          # "" | running | stopped | done
         self._info_stop = threading.Event()
@@ -388,6 +389,11 @@ class Library:
         self._after(storage, photos)
 
     def _after(self, storage, photos: list[Photo]) -> None:
+        if self.on_built:
+            try:
+                self.on_built()
+            except Exception:  # noqa: BLE001
+                log.exception("после сканирования")
         self._collect_info(storage, photos)
         self.start_hashes(storage)
 
@@ -543,9 +549,11 @@ class Library:
                     p, sha = r
                     old = stored.get(p.cache_key())
                     if old != sha:
+                        # содержимое другое, а размер и дата те же — похоже на порчу на ПК: правильным
+                        # остаётся прежний хеш (клиенты не скачают испорченное), файл — в «повреждённые»
                         self.verify_bad += 1
                         log.warning("проверка хешей: %s изменился без смены размера и даты", p.rel)
-                        db.hashes_checked_many([(sha, time.time(), p.cache_key())])   # сразу: клиент увидит
+                        db.hashes_checked_many([(old, time.time(), p.cache_key())])
                         if self.on_mismatch:
                             self.on_mismatch(p, old, sha)
                     else:

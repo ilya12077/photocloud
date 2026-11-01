@@ -32,6 +32,17 @@ SCHEMA = [
          sha TEXT NOT NULL,             -- SHA-256 содержимого, hex
          checked REAL NOT NULL DEFAULT 0)   -- когда хеш последний раз сверяли с файлом
        WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS damaged (
+         path TEXT PRIMARY KEY,         -- файл на ПК, испорченный без смены размера и даты (или не читается)
+         key TEXT NOT NULL,             -- путь \\0 размер \\0 mtime на момент обнаружения
+         size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+         sha_good TEXT NOT NULL,        -- правильный хеш (каким файл был)
+         sha_bad TEXT NOT NULL,         -- каким стал ('' — не читается)
+         found REAL NOT NULL, updated REAL NOT NULL,
+         state TEXT NOT NULL,           -- found | nosource | restored | lost | fixed | accepted | changed | gone
+         restored TEXT NOT NULL DEFAULT '',   -- путь копии внутри Restored
+         note TEXT NOT NULL DEFAULT '')
+       WITHOUT ROWID""",
     """CREATE TABLE IF NOT EXISTS kv (
          key TEXT PRIMARY KEY, value TEXT NOT NULL)   -- служебные отметки (даты проверок и т.п.)
        WITHOUT ROWID""",
@@ -149,6 +160,10 @@ class DB:
     def hashes_load(self) -> dict[str, str]:
         return dict(self.run("SELECT key, sha FROM hashes"))
 
+    def hash_get(self, key: str) -> str | None:
+        r = self.run("SELECT sha FROM hashes WHERE key = ?", (key,))
+        return r[0][0] if r else None
+
     def hashes_count(self) -> int:
         return self.run("SELECT count(*) FROM hashes")[0][0]
 
@@ -168,6 +183,28 @@ class DB:
         """rows: (sha, checked, key) — после сверки (sha мог поменяться)."""
         if rows:
             self.many("UPDATE hashes SET sha = ?, checked = ? WHERE key = ?", rows)
+
+    # ------------------------------------------------------------ повреждённые файлы на ПК
+
+    _DMG = "path, key, size, mtime, sha_good, sha_bad, found, updated, state, restored, note"
+    ACTIVE = ("found", "nosource", "restored", "lost")
+
+    def damaged_list(self, active_only: bool = False) -> list[dict]:
+        cols = [c.strip() for c in self._DMG.split(",")]
+        q = f"SELECT {self._DMG} FROM damaged"
+        if active_only:
+            q += " WHERE state IN ('found', 'nosource', 'restored', 'lost')"
+        return [dict(zip(cols, r)) for r in self.run(q + " ORDER BY found DESC")]
+
+    def damaged_get(self, path: str) -> dict | None:
+        cols = [c.strip() for c in self._DMG.split(",")]
+        r = self.run(f"SELECT {self._DMG} FROM damaged WHERE path = ?", (path,))
+        return dict(zip(cols, r[0])) if r else None
+
+    def damaged_put(self, d: dict) -> None:
+        cols = [c.strip() for c in self._DMG.split(",")]
+        self.run(f"INSERT OR REPLACE INTO damaged({self._DMG}) VALUES({', '.join('?' * len(cols))})",
+                 tuple(d[c] for c in cols))
 
     # ------------------------------------------------------------ служебные отметки
 

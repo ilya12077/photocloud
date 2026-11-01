@@ -8,7 +8,8 @@ const dt = (ts) => (ts ? fmtDT.format(new Date(ts * 1000)) : '—');
 const EVENTS = {
   login: 'каждый вход', login_new_ip: 'вход с нового IP', login_failed: 'неудачный вход', lockout: 'блокировка IP',
   wake: 'кто-то будит ПК', wake_timeout: 'ПК не проснулся', index_error: 'ошибка чтения папки',
-  backup_stale: 'бэкап давно не выходил на связь', hash_mismatch: 'файл изменился без смены даты (проверка хешей)',
+  backup_stale: 'бэкап давно не выходил на связь',
+  damaged: 'повреждённые файлы на сервере (найден, восстановлен, исправлен)',
 };
 const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
@@ -18,7 +19,10 @@ const AUDIT = {
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
   backup_token_add: 'создан токен бэкапа', backup_token_revoke: 'отозван токен бэкапа', backup_denied: 'бэкап: неверный токен',
   hash_stop: 'остановлен подсчёт хешей', hash_verify: 'запущена проверка хешей', hash_verify_done: 'проверка хешей завершена',
-  hash_mismatch: 'хеш не совпал',
+  hash_mismatch: 'хеш не совпал', damaged_found: 'повреждён файл на сервере', damaged_restored: 'восстановлена копия в Restored',
+  damaged_fixed: 'повреждённый файл исправлен', damaged_lost: 'копию из Restored удалили', damaged_gone: 'повреждённый файл удалён',
+  damaged_changed: 'повреждённый файл изменён', damaged_nosource: 'нет правильной копии', damaged_accept: 'принята новая версия файла',
+  damaged_retry: 'восстановить заново', restore_bad: 'присланная копия не совпала по хешу',
 };
 
 async function api(path, body) {
@@ -29,7 +33,9 @@ async function api(path, body) {
     init.headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
+  const sent = Date.now();
   const r = await fetch(path, init);
+  noteServerTime(r, sent);
   let j = {};
   try { j = await r.json(); } catch (_) {}
   if (!r.ok) throw new Error(j.error || j.detail || `HTTP ${r.status}`);
@@ -325,9 +331,20 @@ function plural(n, one, few, many) {
   const m10 = n % 10, m100 = n % 100;
   return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
 }
+// Часы браузера могут спешить или отставать: время «на связи» и отчёты — по часам сервера,
+// поэтому «сейчас» тоже берём серверное: сдвиг = время сервера − время браузера (середина запроса).
+let clockSkew = 0, skewRtt = Infinity, skewAt = 0;
+function noteServerTime(r, sent) {
+  const srv = +r.headers.get('x-server-time');
+  if (!srv) return;
+  const got = Date.now(), rtt = got - sent;
+  // точнее всего — самый быстрый ответ; раз в 10 минут берём заново (часы могли перевести)
+  if (rtt <= skewRtt || got - skewAt > 600000) { clockSkew = srv - (sent + got) / 2; skewRtt = rtt; skewAt = got; }
+}
+const serverNow = () => (Date.now() + clockSkew) / 1000;
 function ago(ts) {
   if (!ts) return 'ещё не было';
-  const s = Math.max(1, Math.round(Date.now() / 1000 - ts));
+  const s = Math.max(1, Math.round(serverNow() - ts));
   if (s < 60) return `${s} ${plural(s, 'секунду', 'секунды', 'секунд')} назад`;
   if (s < 3600) { const m = Math.floor(s / 60); return `${m} ${plural(m, 'минуту', 'минуты', 'минут')} назад`; }
   if (s < 172800) { const h = Math.floor(s / 3600); return `${h} ${plural(h, 'час', 'часа', 'часов')} назад`; }
@@ -335,10 +352,11 @@ function ago(ts) {
 }
 // «N секунд назад» идёт каждую секунду — без перезапроса и перерисовки таблицы
 setInterval(() => { for (const e of document.querySelectorAll('[data-ago]')) e.textContent = ago(+e.dataset.ago); }, 1000);
-const BK_STATE = { copying: 'копирует', disk_full: 'мало места на диске', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
+const BK_STATE = { copying: 'копирует', restoring: 'восстанавливает файл на сервере', disk_full: 'мало места на диске', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
 
 const mbs = (b) => (b >= 1048576 ? (b / 1048576).toFixed(1).replace('.', ',') + ' МБ/с' : Math.round(b / 1024) + ' КБ/с');
 async function loadBackup() {
+  loadDamaged();
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
     if (unchanged('backup', r)) return;
   const v = r.verify;
@@ -373,7 +391,7 @@ async function loadBackup() {
     const st = el('td');
     st.append(el('div', null, BK_STATE[rp.state] || rp.state || '—'));
     // давно не было отчёта — «копирует» уже не правда
-    const fresh = rp.at && Date.now() / 1000 - rp.at < 60;
+    const fresh = rp.at && serverNow() - rp.at < 60;
     if (rp.state === 'copying' && fresh) {
       const bits = [];
       if (rp.stall) bits.push(`ждёт данные с ПК ${rp.stall} с`);
@@ -398,6 +416,30 @@ async function loadBackup() {
     return tr;
   }));
 }
+async function loadDamaged() {
+  const r = await act(() => api('/api/admin/damaged')); if (!r) return;
+  if (unchanged('damaged', r)) return;
+  const tb = $('dmg').tBodies[0];
+  $('dmg-check').hidden = !r.items.some((d) => ['found', 'nosource', 'restored', 'lost'].includes(d.state));
+  if (!r.items.length) { const tr = el('tr'); const td = el('td', 'dim2', 'нет — всё в порядке'); td.colSpan = 4; tr.append(td); tb.replaceChildren(tr); return; }
+  tb.replaceChildren(...r.items.map((d) => {
+    const tr = el('tr'), ops = el('td', 'ops'), st = el('td');
+    const active = ['found', 'nosource', 'restored', 'lost'].includes(d.state);
+    st.append(el('div', active ? 'err' : null, (d.unreadable ? 'не читается · ' : '') + d.text));
+    if (d.state === 'restored' && d.restored) st.append(el('div', 'dim2 mono', `${r.folder}/${d.restored}`));
+    if (d.note) st.append(el('div', 'dim2', d.note));
+    if (active && !d.unreadable) ops.append(btn('это не порча', async () => {
+      if (!confirm(`Принять текущий «${d.path}» как правильный? Клиенты скачают его, а их копия уйдёт в «Версии».`)) return;
+      await act(() => api('/api/admin/damaged/accept', { path: d.path }), 'Принят как новая версия'); loadDamaged();
+    }));
+    if (['nosource', 'lost', 'restored'].includes(d.state)) ops.append(btn('восстановить заново', async () => {
+      await act(() => api('/api/admin/damaged/retry', { path: d.path }), 'Восстановление запрошено'); loadDamaged();
+    }));
+    tr.append(el('td', 'mono', d.path), el('td', null, dt(d.found)), st, ops);
+    return tr;
+  }));
+}
+$('dmg-check').onclick = () => act(() => api('/api/admin/damaged/check', {}), 'Проверено').then(loadDamaged);
 $('bk-add').addEventListener('submit', async (e) => {
   e.preventDefault();
   const r = await act(() => api('/api/admin/backup/tokens', { name: $('bk-name').value.trim(), user: $('bk-user').value }), 'Токен создан');
