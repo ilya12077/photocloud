@@ -40,7 +40,7 @@ from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
 from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
-from .storage import is_missing, make_storage
+from .storage import RESTORED, RestoreWriter, is_missing, is_read_error, make_storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("photocloud")
@@ -181,10 +181,14 @@ class Guard:
                 await send({"type": "http.response.body", "body": b"forbidden"})
                 return
 
+        admin_api = scope["path"].startswith("/api/admin/")
+
         async def _send(msg):
             if msg["type"] == "http.response.start":
                 names = {k.lower() for k, _ in msg.get("headers", [])}
                 msg["headers"] = list(msg.get("headers", [])) + [h for h in SEC_HEADERS if h[0] not in names]
+                if admin_api:   # «N секунд назад» админка считает по часам сервера, а не браузера
+                    msg["headers"].append((b"x-server-time", str(int(time.time() * 1000)).encode()))
             await send(msg)
 
         await self.app(scope, receive, _send)
@@ -1127,14 +1131,21 @@ def _hash_file(p, stop) -> str | None:
 
 def _hash_read(p, stop) -> str | None:
     h = hashlib.sha256()
-    with storage.open(p.rel) as f:
-        while True:
-            if stop.is_set():
-                return None
-            b = f.read(1024 * 1024)
-            if not b:
-                break
-            h.update(b)
+    try:
+        with storage.open(p.rel) as f:
+            while True:
+                if stop.is_set():
+                    return None
+                b = f.read(1024 * 1024)
+                if not b:
+                    break
+                h.update(b)
+    except Exception as e:  # noqa: BLE001
+        if is_read_error(e):
+            good = db.hash_get(p.cache_key())
+            if good:                                # был правильный хеш — значит, файл испортился на ПК
+                _damaged_found(p, good, "")
+        raise
     return h.hexdigest()
 
 
@@ -1145,15 +1156,165 @@ _verify_checked = 0.0
 
 
 def _hash_mismatch(p, old: str, new: str) -> None:
-    db.kv_set("hash_gen", int(db.kv_get("hash_gen") or 0) + 1)   # список для клиентов поменялся
-    audit("hash_mismatch", "", "", f"{p.rel}: {old[:12]}… → {new[:12]}…")
-    loop.call_soon_threadsafe(bg, ha.notify(
-        "hash_mismatch", f"Проверка хешей: «{clean(p.rel, 120)}» изменился без смены размера и даты "
-                         f"(порча диска на компьютере или программа, сохраняющая дату). Счётчик — в админке.",
-        dedupe_s=3600, key="hash_mismatch"))
+    _damaged_found(p, old, new)
 
 
 library.on_mismatch = _hash_mismatch
+
+
+# ---------------------------------------------------------------- повреждённые файлы на ПК
+# Хеш не совпал при тех же размере и дате (или файл не читается) — похоже на порчу диска.
+# Правильным остаётся прежний хеш: клиенты бэкапа испорченное не скачивают, а клиент с правильной
+# копией присылает её, и сервер кладёт её в Restored\<тот же путь> (оригинал не трогает).
+# Ты переносишь копию на место оригинала — сервер видит правильный хеш и закрывает запись.
+restorer = RestoreWriter(S, storage)
+DAMAGE_TEXT = {"found": "ждёт копию от клиента бэкапа", "nosource": "правильной копии нет ни у одного клиента (спросит и у новых)",
+               "restored": "копия лежит в Restored — перенеси её на место оригинала",
+               "lost": "копию из Restored удалили, а оригинал не исправлен",
+               "fixed": "исправлен", "accepted": "принят как новая версия", "changed": "файл изменён на сервере",
+               "gone": "файл удалён на ПК"}
+_dmg_mu = threading.Lock()
+
+
+def _bump_list() -> None:
+    db.kv_set("hash_gen", int(db.kv_get("hash_gen") or 0) + 1)       # клиентам — свежий список
+
+
+def _notify(event: str, text: str) -> None:
+    try:
+        loop.call_soon_threadsafe(bg, ha.notify(event, text, dedupe_s=0))
+    except RuntimeError:
+        pass
+
+
+def _damaged_found(p, good: str, bad: str) -> None:
+    with _dmg_mu:
+        cur = db.damaged_get(p.rel)
+        if cur and cur["state"] in db.ACTIVE and cur["key"] == p.cache_key():
+            return                                    # уже знаем
+        now = time.time()
+        _nosource_set(p.rel, None)
+        db.damaged_put({"path": p.rel, "key": p.cache_key(), "size": p.size, "mtime": int(p.mtime),
+                        "sha_good": good, "sha_bad": bad, "found": now, "updated": now,
+                        "state": "found", "restored": "", "note": "" if restorer.enabled else
+                        "запись на ПК не настроена (SMB_RESTORE_USER)"})
+        _bump_list()
+    what = "не читается" if not bad else "изменился без смены размера и даты"
+    log.warning("повреждённый файл на сервере: %s — %s", p.rel, what)
+    audit("damaged_found", "", "", f"{p.rel}: {what}")
+    _notify("damaged", f"Файл на сервере испорчен ({what}): «{clean(p.rel, 120)}». "
+                       f"Правильная копия будет восстановлена из бэкапа в папку {RESTORED}.")
+
+
+def _damaged_state(path: str, state: str, note: str = "", restored: str | None = None) -> dict | None:
+    with _dmg_mu:
+        d = db.damaged_get(path)
+        if d is None:
+            return None
+        d.update(state=state, note=note, updated=time.time())
+        if restored is not None:
+            d["restored"] = restored
+        db.damaged_put(d)
+        if state not in ("found", "nosource"):       # недокачанная копия больше не нужна
+            (RESTORE_TMP / (d["sha_good"] + ".part")).unlink(missing_ok=True)
+        _bump_list()
+        return d
+
+
+# Какие клиенты уже ответили «правильной копии нет»: {путь: [id токенов]} — у остальных
+# спрашиваем дальше (и у новых клиентов тоже). Сбрасывается, когда файл заново помечен испорченным
+# или админ нажал «восстановить заново».
+def _nosource_load() -> dict:
+    try:
+        v = json.loads(db.kv_get("restore_nosource") or "{}")
+        return v if isinstance(v, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _nosource_set(path: str, ids: list | None) -> None:
+    v = _nosource_load()
+    if ids:
+        v[path] = sorted(set(ids))
+    else:
+        v.pop(path, None)
+    db.kv_set("restore_nosource", json.dumps(v, ensure_ascii=False))
+
+
+def _damaged_paths() -> set[str]:
+    return {d["path"] for d in db.damaged_list(active_only=True)}
+
+
+_dmg_checked = 0.0
+
+
+def _damaged_check(force: bool = False) -> None:
+    """После каждого сканирования (и не чаще раза в час для пересчёта хешей): удалён ли файл,
+    изменён ли, перенесли ли восстановленную копию на место оригинала."""
+    global _dmg_checked
+    items = db.damaged_list(active_only=True)
+    if not items:
+        return
+    hash_now = force or time.time() - _dmg_checked > 3600
+    if hash_now:
+        _dmg_checked = time.time()
+    for d in items:
+        p = _by_rel(d["path"])
+        if p is None:
+            _damaged_state(d["path"], "gone", "файла больше нет на сервере")
+            audit("damaged_gone", "", "", d["path"])
+            continue
+        if p.cache_key() != d["key"]:
+            # размер или дата другие: либо на место оригинала перенесли восстановленную копию
+            # (дата могла не сохраниться), либо файл изменили — смотрим по хешу
+            try:
+                sha = _hash_read(p, threading.Event()) if p.size == d["size"] else None
+            except Exception:  # noqa: BLE001
+                continue
+            if sha == d["sha_good"]:
+                _damaged_state(d["path"], "fixed", "у оригинала снова правильный хеш")
+                audit("damaged_fixed", "", "", d["path"])
+                _notify("damaged", f"Файл на сервере исправлен: «{clean(d['path'], 120)}».")
+            else:
+                _damaged_state(d["path"], "changed", "файл изменён на сервере (другой размер или дата)")
+                audit("damaged_changed", "", "", d["path"])
+            continue
+        restored_left = True
+        if d["state"] == "restored" and d["restored"]:
+            try:
+                storage.open(RESTORED + "/" + d["restored"]).close()
+            except Exception as e:  # noqa: BLE001
+                restored_left = not is_missing(e)
+        if not (hash_now or not restored_left):
+            continue
+        try:
+            sha = _hash_read(p, threading.Event())
+        except Exception:  # noqa: BLE001
+            continue
+        if sha == d["sha_good"]:
+            _damaged_state(d["path"], "fixed", "у оригинала снова правильный хеш")
+            log.info("повреждённый файл исправлен: %s", d["path"])
+            audit("damaged_fixed", "", "", d["path"])
+            _notify("damaged", f"Файл на сервере исправлен: «{clean(d['path'], 120)}».")
+        elif d["state"] == "restored" and not restored_left:
+            _damaged_state(d["path"], "lost", "копию из Restored удалили, а оригинал всё ещё испорчен")
+            audit("damaged_lost", "", "", d["path"])
+            _notify("damaged", f"Копию «{clean(d['path'], 120)}» удалили из {RESTORED}, а оригинал испорчен. "
+                               f"Восстановить заново — в админке.")
+
+
+def _after_scan() -> None:
+    threading.Thread(target=lambda: _safe(_damaged_check), name="meta-damaged", daemon=True).start()
+
+
+def _safe(fn, *a) -> None:
+    try:
+        fn(*a)
+    except Exception:  # noqa: BLE001
+        log.exception("проверка повреждённых файлов")
+
+
+library.on_built = _after_scan
 
 
 def _verify_info() -> dict:
@@ -1265,6 +1426,7 @@ async def backup_status(t=Depends(require_backup)):
                   "complete": library.state == "ready" and not library.skipped and not library.error,
                   "skipped": library.skipped, "building": library.busy()},
         "hashes": _hash_progress(),
+        "restore": (len(await run_in_threadpool(_restore_requests, t)) if restorer.enabled else 0),
     }))
 
 
@@ -1274,25 +1436,43 @@ async def backup_wake(t=Depends(require_backup)):
 
 
 @app.get("/api/backup/manifest")
-async def backup_manifest(request: Request, t=Depends(require_backup)):
-    """Все видимые токену файлы: [путь, размер, mtime, дата снимка, sha256 | null]."""
+async def backup_manifest(request: Request, damaged: int = 0, t=Depends(require_backup)):
+    """Все видимые токену файлы: [путь, размер, mtime, дата снимка, sha256 | null].
+
+    Испорченные на сервере файлы качать нельзя. Клиент 1.4+ (?damaged=1) получает их пути
+    отдельным списком «damaged» и сам присылает правильную копию. Старым клиентам у таких файлов
+    вместо хеша — null («хеш ещё считается»): свою копию они не трогают и порчу не качают."""
     access = _token_access(t)
     # клиенты спрашивают раз в 10 с: «ничего не поменялось» отвечаем без чтения всех хешей
     n_hashes = await run_in_threadpool(db.hashes_count)
     gen = await run_in_threadpool(db.kv_get, "hash_gen")       # растёт, когда проверка нашла изменённый файл
     ver = library.version
-    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{gen}|{access!r}|{library.skipped}".encode(), digest_size=10).hexdigest()
+    modern = damaged == 1
+    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{gen}|{access!r}|{library.skipped}|{int(modern)}".encode(),
+                          digest_size=10).hexdigest()
     etag = f'"{tag}"'
     if ver and request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"etag": etag, "cache-control": "no-store"})
     hashes = await run_in_threadpool(db.hashes_load)
+    bad_all = await run_in_threadpool(_damaged_paths)
 
     def build() -> bytes:
-        files = [[p.rel, p.size, int(p.mtime), int(p.date), hashes.get(p.cache_key())]
-                 for p in library.by_id.values() if folder_ok(p.rel, access)]
-        return json.dumps({"v": tag, "index_version": ver,
-                           "complete": bool(ver) and library.state == "ready" and not library.skipped
-                           and not library.error, "files": files},
+        files, bad = [], []
+        for p in library.by_id.values():
+            if not folder_ok(p.rel, access):
+                continue
+            sha = hashes.get(p.cache_key())          # у испорченного — прежний, правильный хеш
+            if p.rel in bad_all:
+                bad.append(p.rel)
+                if not modern:
+                    sha = None
+            files.append([p.rel, p.size, int(p.mtime), int(p.date), sha])
+        out = {"v": tag, "index_version": ver,
+               "complete": bool(ver) and library.state == "ready" and not library.skipped and not library.error,
+               "files": files}
+        if modern:
+            out["damaged"] = sorted(bad)
+        return json.dumps(out,
                           ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass")
 
     body = await run_in_threadpool(build)
@@ -1374,6 +1554,8 @@ async def backup_file(request: Request, path: str = "", z: int = 0, start: int =
     p = _by_rel(path) if 0 < len(path) <= 2000 else None
     if p is None or not folder_ok(p.rel, _token_access(t)):
         raise HTTPException(404)
+    if await run_in_threadpool(lambda: p.rel in _damaged_paths()):
+        raise HTTPException(409, "damaged")          # испорчен на сервере: отдавать порчу незачем
     if z == 1:                                        # клиент 1.1+: сжатие блоками
         return await _framed(p, max(0, start))
     return await serve_file(request, p, {"cache-control": "no-store",
@@ -1396,6 +1578,196 @@ async def backup_report(request: Request, t=Depends(require_backup)):
             rep[k] = clean(d[k], 200)
     rep["at"] = int(time.time())
     await run_in_threadpool(tokens.set_report, t, rep)
+    return no_store(JSONResponse({"ok": True}))
+
+
+# ---- восстановление повреждённых файлов: клиент присылает правильную копию
+
+RESTORE_CHUNK = 8 * 1024 * 1024             # кусок загрузки (лимит NPM — не меньше 9 МБ)
+RESTORE_TMP = S.data_dir / "restore"
+
+
+def _restore_requests(t) -> list[dict]:
+    """Что просим у этого клиента: испорченные файлы из его папок, про которые он ещё не сказал
+    «копии нет» (пока ни у кого копии не нашлось — спрашиваем и новых клиентов)."""
+    access = _token_access(t)
+    asked = _nosource_load()
+    return [d for d in db.damaged_list(active_only=True)
+            if d["state"] in ("found", "nosource") and t.id not in asked.get(d["path"], ())
+            and d["path"] not in _writing and folder_ok(d["path"], access) and _by_rel(d["path"]) is not None]
+
+
+def _restore_item(t, path: str) -> dict:
+    if not restorer.enabled:
+        raise HTTPException(503, "restore off")
+    d = db.damaged_get(path) if 0 < len(path) <= 2000 else None
+    if d is None or d["state"] not in ("found", "nosource") or not folder_ok(path, _token_access(t)):
+        raise HTTPException(404)
+    p = _by_rel(path)
+    if p is None or p.cache_key() != d["key"]:
+        raise HTTPException(409, "changed")
+    return d
+
+
+def _part_path(d: dict) -> Path:
+    return RESTORE_TMP / (d["sha_good"] + ".part")
+
+
+@app.get("/api/backup/restore")
+async def backup_restore_list(t=Depends(require_backup)):
+    """Что нужно восстановить: файлы, испорченные на ПК, — с правильным хешем."""
+    items = await run_in_threadpool(_restore_requests, t) if restorer.enabled else []
+    out = []
+    for d in items:
+        part = _part_path(d)
+        out.append({"path": d["path"], "sha": d["sha_good"], "size": d["size"], "mtime": d["mtime"],
+                    "received": part.stat().st_size if part.exists() else 0})
+    return no_store(JSONResponse({"items": out, "chunk": RESTORE_CHUNK}))
+
+
+@app.put("/api/backup/restore")
+async def backup_restore_put(request: Request, path: str = "", offset: int = -1, t=Depends(require_backup)):
+    """Кусок правильной копии. Принимается только для файла, который сервер сам пометил
+    испорченным, только по порядку и не больше записанного размера; целиком — только если
+    хеш равен правильному. Путь записи на ПК берётся из базы, не от клиента."""
+    d = await run_in_threadpool(_restore_item, t, path)
+    part = _part_path(d)
+    have = part.stat().st_size if part.exists() else 0
+    if offset != have:
+        return no_store(JSONResponse({"received": have, "error": "offset"}, 409))
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > RESTORE_CHUNK or have + len(body) > d["size"]:
+            raise HTTPException(413)
+    if not body and have < d["size"]:
+        raise HTTPException(400)
+    RESTORE_TMP.mkdir(parents=True, exist_ok=True)
+
+    def append() -> int:
+        with open(part, "ab") as f:
+            f.write(body)
+        return part.stat().st_size
+
+    if body:
+        have = await run_in_threadpool(append)
+    if have < d["size"]:
+        return no_store(JSONResponse({"received": have, "done": False}))
+    # файл получен целиком (или был получен раньше, а запись на ПК тогда не удалась) — проверяем и пишем
+
+    def sha_part() -> str:
+        h = hashlib.sha256()
+        with open(part, "rb") as f:
+            for b in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(b)
+        return h.hexdigest()
+
+    if await run_in_threadpool(sha_part) != d["sha_good"]:
+        part.unlink(missing_ok=True)
+        audit("restore_bad", t.user, ip_of(request), f"{path}: хеш присланной копии не совпал")
+        return no_store(JSONResponse({"received": 0, "error": "hash"}, 422))
+    if not await PC.is_up():
+        return no_store(JSONResponse({"received": have, "error": "pc"}, 503))
+    # запись на ПК (и перечитывание для проверки) у большого видео — минуты: делаем в фоне,
+    # клиенту отвечаем сразу — иначе прокси оборвёт ожидание по тайм-ауту
+    if path not in _writing:
+        _writing.add(path)
+        bg(_restore_write(path, part, d, t.name, t.user, ip_of(request)))
+    return no_store(JSONResponse({"received": have, "done": True, "writing": True}))
+
+
+_writing: set[str] = set()
+
+
+async def _restore_write(path: str, part: Path, d: dict, client: str, user: str, ip: str) -> None:
+    try:
+        where = await on_pc(restorer.write, path, part, float(d["mtime"]), d["sha_good"],
+                            timeout=max(120, d["size"] / (5 * 1024 * 1024)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("восстановление %s: запись на ПК не удалась: %s", path, e)
+        await run_in_threadpool(_damaged_state, path, "found", f"запись в Restored не удалась: {type(e).__name__}")
+        return
+    finally:
+        _writing.discard(path)
+    part.unlink(missing_ok=True)
+    await run_in_threadpool(_damaged_state, path, "restored", "", where)
+    log.info("восстановлен %s → %s/%s (копия от «%s»)", path, RESTORED, where, client)
+    audit("damaged_restored", user, ip, f"{path} → {RESTORED}/{where}, копия от «{client}»")
+    _notify("damaged", f"Восстановлена правильная копия «{clean(path, 120)}» → {RESTORED}\\{clean(where, 120)}. "
+                       f"Перенеси её на место оригинала с заменой.")
+
+
+@app.post("/api/backup/restore/nosource")
+async def backup_restore_nosource(request: Request, path: str = "", t=Depends(require_backup)):
+    """У клиента нет правильной копии (или она не сходится по хешу)."""
+    d = await run_in_threadpool(_restore_item, t, path)
+
+    def mark() -> None:
+        with _dmg_mu:
+            ids = set(_nosource_load().get(d["path"], ())) | {t.id}
+            _nosource_set(d["path"], list(ids))
+            can = [x for x in tokens.all() if folder_ok(d["path"], _token_access(x))]
+            left = [x for x in can if x.id not in ids]
+            said = ", ".join(f"«{x.name}»" for x in can if x.id in ids)
+        if left:      # другие клиенты ещё могут прислать копию: ждём их, их недокачанное не трогаем
+            _damaged_state(d["path"], d["state"], f"нет правильной копии у {said}; ждёт остальных клиентов")
+        else:
+            _damaged_state(d["path"], "nosource", f"нет правильной копии у {said}")
+
+    await run_in_threadpool(mark)
+    audit("damaged_nosource", t.user, ip_of(request), f"{path}: у «{t.name}» нет правильной копии")
+    return no_store(JSONResponse({"ok": True}))
+
+
+# ---- админка: повреждённые файлы
+
+@app.get("/api/admin/damaged")
+async def admin_damaged(_: Session = Depends(require_admin)):
+    items = await run_in_threadpool(db.damaged_list)
+    for d in items:
+        d["text"] = DAMAGE_TEXT.get(d["state"], d["state"])
+        d["unreadable"] = not d["sha_bad"]
+    return no_store(JSONResponse({"items": items, "restore": restorer.enabled, "folder": RESTORED}))
+
+
+@app.post("/api/admin/damaged/accept", dependencies=[Depends(require_csrf)])
+async def admin_damaged_accept(request: Request, s: Session = Depends(require_admin)):
+    """«Это не порча»: файл изменили намеренно (программа сохранила дату) — новая версия
+    становится правильной, клиенты скачают её, а старую уберут в «Версии»."""
+    path = (await read_json(request)).get("path")
+    d = await run_in_threadpool(db.damaged_get, path) if isinstance(path, str) else None
+    if d is None or d["state"] not in db.ACTIVE:
+        raise HTTPException(404)
+    if not d["sha_bad"]:
+        return _bad("файл не читается — принять его нельзя")
+    await run_in_threadpool(db.hashes_checked_many, [(d["sha_bad"], time.time(), d["key"])])
+    await run_in_threadpool(_damaged_state, path, "accepted", f"принят как новая версия ({s.user})")
+    audit("damaged_accept", s.user, ip_of(request), path)
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/damaged/retry", dependencies=[Depends(require_csrf)])
+async def admin_damaged_retry(request: Request, s: Session = Depends(require_admin)):
+    """Восстановить заново (копию из Restored удалили или ни у кого её не было)."""
+    path = (await read_json(request)).get("path")
+    d = await run_in_threadpool(db.damaged_get, path) if isinstance(path, str) else None
+    if d is None or d["state"] not in db.ACTIVE:
+        raise HTTPException(404)
+    def retry() -> None:
+        _nosource_set(path, None)                    # спросить заново у всех клиентов
+        _damaged_state(path, "found", "", "")
+
+    await run_in_threadpool(retry)
+    audit("damaged_retry", s.user, ip_of(request), path)
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/damaged/check", dependencies=[Depends(require_csrf)])
+async def admin_damaged_check(_: Session = Depends(require_admin)):
+    """Проверить сейчас, исправлены ли файлы (перечитать оригиналы)."""
+    if not await PC.is_up():
+        raise HTTPException(409, "pc down")
+    await on_pc(_damaged_check, True, timeout=600)
     return no_store(JSONResponse({"ok": True}))
 
 
@@ -1467,6 +1839,11 @@ async def admin_backup_verify_start(request: Request, s: Session = Depends(requi
     if library.hash_busy():
         return _bad("сейчас уже считаются хеши — подожди окончания или останови")
     since = await run_in_threadpool(db.kv_get, "verify_since")
+    if since and library.verify_state == "done":
+        # прошлая проверка закончилась, но её ещё не закрыли (раз в минуту) — закрываем и начинаем новую
+        await run_in_threadpool(db.kv_set, "verify_last", time.time())
+        await run_in_threadpool(db.kv_set, "verify_last_bad", library.verify_bad)
+        since = None
     if not since:
         since = str(time.time())
         await run_in_threadpool(db.kv_set, "verify_since", since)

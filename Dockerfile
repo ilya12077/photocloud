@@ -11,17 +11,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+COPY app/requirements.txt ./requirements.txt
 # imageio-ffmpeg в контейнере не нужен — есть системный ffmpeg
 RUN grep -v '^imageio-ffmpeg' requirements.txt > /tmp/req.txt \
  && pip install -r /tmp/req.txt && rm /tmp/req.txt
 
 COPY app ./app
 
-# Версия сборки — файлом внутри образа (видна в «Обзоре» админки и в логе при старте).
-# Не переменной окружения: Portainer при «Pull and redeploy» сохраняет старые переменные
-# контейнера, и версия застревала на той, с которой контейнер создали.
-COPY VERSION ./VERSION
+# Версия сервера — файл app/VERSION (приезжает вместе с app; видна в «Обзоре» и в логе при старте).
 ARG VERSION=dev
 LABEL org.opencontainers.image.version=$VERSION
 

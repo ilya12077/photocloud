@@ -64,6 +64,18 @@ def _not_connection_error(e: BaseException) -> bool:
     return nt is not None and nt not in _RECONNECT_NT
 
 
+RESTORED = "Restored"     # папка в корне шары для восстановленных копий: не индексируется, пишет только сервер
+# NtStatus «файл не читается» — сбойный сектор, ошибка контрольной суммы диска и т.п.
+_READ_ERROR_NT = {0xC000009C, 0xC000003F, 0xC0000102, 0xC0000032, 0xC0000185, 0xC000016A, 0xC0000483}
+
+
+def is_read_error(e: BaseException) -> bool:
+    """Файл есть, но диск не может его прочитать (порча на ПК) — не путать с обрывом связи."""
+    if getattr(e, "errno", None) == errno.EIO:
+        return True
+    return _ntstatus(e) in _READ_ERROR_NT
+
+
 _MISSING_NT = {0xC0000034, 0xC000003A, 0xC000000F, 0xC0000056, 0xC0000033}   # нет файла/пути, удаляется, плохое имя
 
 
@@ -115,6 +127,8 @@ class LocalStorage:
                 for e in it:
                     if _skip(e.name) or e.is_symlink() or (hasattr(e, "is_junction") and e.is_junction()):
                         continue
+                    if not prefix and e.name.lower() == RESTORED.lower():
+                        continue                  # восстановленные копии — не в галерею и не в бэкап
                     rel = f"{prefix}/{e.name}" if prefix else e.name
                     try:
                         st = e.stat(follow_symlinks=False)
@@ -408,6 +422,8 @@ class SMBStorage:
                 for e in entries:
                     if _skip(e.name):
                         continue
+                    if not prefix and e.name.lower() == RESTORED.lower():
+                        continue                  # восстановленные копии — не в галерею и не в бэкап
                     info = e.smb_info
                     attrs = info.file_attributes
                     # точки повторной обработки (junction/symlink) пропускаем:
@@ -428,6 +444,139 @@ class SMBStorage:
         path = self.base + "\\" + "\\".join(_check_rel(rel))
         return _SMBFile(self._retry(
             lambda: _gated(self._smb.open_file, path, mode="rb", share_access="rw", **self._creds)))
+
+
+class RestoreWriter:
+    """Запись восстановленной копии в Restored\\<тот же путь>. Единственное место, где сервер
+    пишет на ПК. SMB — под отдельным пользователем (SMB_RESTORE_USER), которому на ПК разрешена
+    запись только в папку Restored; своё соединение, не общее с чтением.
+    Ничего не перезаписывает и не удаляет: занятое имя — «имя (2).ext»."""
+
+    CHUNK = 1024 * 1024
+
+    def __init__(self, s, storage):
+        self.storage = storage
+        self.local = s.storage == "local"
+        self.enabled = self.local or bool(s.smb_restore_user and s.smb_restore_password)
+        if not self.local:
+            import smbclient
+            self._smb = smbclient
+            self.host = s.smb_host
+            # отдельная шара, которая указывает прямо на папку Restored: у пользователя записи
+            # нет доступа к основной шаре вообще — выйти за Restored он не может по построению
+            self.root = (f"\\\\{s.smb_host}\\{s.smb_restore_share}" if s.smb_restore_share
+                         else storage.base + "\\" + RESTORED)
+            self._kw = dict(username=s.smb_restore_user, password=s.smb_restore_password, port=s.smb_port,
+                            encrypt=s.smb_encrypt, connection_timeout=10, connection_cache={})
+        self._mu = threading.Lock()
+
+    # пути
+    def _parts(self, rel: str) -> list[str]:
+        return _check_rel(rel)
+
+    def _final_names(self, rel: str):
+        parts = self._parts(rel)
+        stem, dot, ext = parts[-1].rpartition(".")
+        if not dot:
+            stem, ext = parts[-1], ""
+        yield parts
+        for n in range(2, 100):
+            yield parts[:-1] + [f"{stem} ({n}){dot}{ext}"]
+
+    def write(self, rel: str, src: Path, mtime: float, sha: str) -> str:
+        """Записать файл src (уже проверенный по хешу) в Restored. Возвращает путь копии
+        внутри Restored (через '/'). После записи перечитывает её с ПК и сверяет хеш."""
+        with self._mu:
+            return self._write_local(rel, src, mtime, sha) if self.local else self._write_smb(rel, src, mtime, sha)
+
+    def _write_local(self, rel, src, mtime, sha) -> str:
+        root = self.storage.root / RESTORED
+        for parts in self._final_names(rel):
+            dst = root.joinpath(*parts)
+            if root not in dst.resolve().parents:
+                raise PermissionError("outside Restored")
+            if dst.exists():
+                if _sha_local(dst) == sha:
+                    return "/".join(parts)              # уже восстановлен
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".photocloud-part")
+            with open(src, "rb") as a, open(tmp, "xb") as b:
+                for chunk in iter(lambda: a.read(self.CHUNK), b""):
+                    b.write(chunk)
+            os.rename(tmp, dst)
+            os.utime(dst, (mtime, mtime))
+            if _sha_local(dst) != sha:
+                raise OSError("восстановленная копия не совпала по хешу после записи")
+            return "/".join(parts)
+        raise OSError("слишком много копий с таким именем в Restored")
+
+    def _write_smb(self, rel, src, mtime, sha) -> str:
+        smb, kw = self._smb, self._kw
+        smb.register_session(self.host, **{k: v for k, v in kw.items()})
+        root = self.root
+        for parts in self._final_names(rel):
+            dst = root + "\\" + "\\".join(parts)
+            try:
+                smb.stat(dst, **kw)
+                exists = True
+            except OSError as e:
+                if not is_missing(e):
+                    raise
+                exists = False
+            if exists:
+                if self._sha_smb(dst) == sha:
+                    return "/".join(parts)
+                continue
+            self._mkdirs(root, parts[:-1])
+            # пишем сразу под итоговым именем («xb» — только новый файл, существующий не затрёт);
+            # не получилось или после записи хеш не тот — свою недописанную копию убираем
+            done = False
+            try:
+                with open(src, "rb") as a, smb.open_file(dst, mode="xb", **kw) as b:
+                    for chunk in iter(lambda: a.read(self.CHUNK), b""):
+                        b.write(chunk)
+                smb.utime(dst, times=(mtime, mtime), **kw)
+                if self._sha_smb(dst) != sha:
+                    raise OSError("восстановленная копия не совпала по хешу после записи")
+                done = True
+            finally:
+                if not done:
+                    try:
+                        smb.remove(dst, **kw)
+                    except Exception:  # noqa: BLE001
+                        pass
+            return "/".join(parts)
+        raise OSError("слишком много копий с таким именем в Restored")
+
+    def _mkdirs(self, root: str, parts: list[str]) -> None:
+        """Папки по одной: Restored, затем путь внутри. (makedirs у некоторых серверов SMB
+        не создаёт промежуточные папки, получив «нет доступа» вместо «нет пути».)"""
+        smb, kw = self._smb, self._kw
+        path = root
+        for name in [None] + parts:
+            if name is not None:
+                path += "\\" + name
+            try:
+                smb.mkdir(path, **kw)
+            except OSError:
+                smb.stat(path, **kw)               # уже есть — дальше; нет и не создаётся — ошибка
+    def _sha_smb(self, path: str) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        with self._smb.open_file(path, mode="rb", share_access="rw", **self._kw) as f:
+            for chunk in iter(lambda: f.read(self.CHUNK), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+
+def _sha_local(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def make_storage(s):

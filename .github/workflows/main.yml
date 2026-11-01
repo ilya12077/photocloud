@@ -12,11 +12,11 @@ name: Publish Docker image
 on:
   release:
     types: [published]
-  # сборка и при изменении файла VERSION — новая версия без релиза в интерфейсе.
+  # сборка и при изменении app/VERSION (версия сервера) — новая версия без релиза в интерфейсе.
   # master -> теги <версия> и latest; ветка backup-cluster -> только тег backup-cluster
   push:
     branches: [master, backup-cluster]
-    paths: [VERSION]
+    paths: [app/VERSION]
 
 jobs:
   push_to_registry:
@@ -34,7 +34,7 @@ jobs:
       
       - name: Read version
         id: ver
-        run: echo "version=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(tr -d ' \r\n' < app/VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
