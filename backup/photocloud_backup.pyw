@@ -43,6 +43,7 @@ _boot_log(f"BOOT процесс запущен: {' '.join(sys.argv)} (python {sy
 
 import base64
 import collections
+import concurrent.futures
 import datetime
 import hashlib
 import importlib
@@ -75,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.0"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.1"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -149,8 +150,8 @@ else:                                      # для проверки на Linux:
 
 
 class Config:
-    FIELDS = ("server", "root", "limit_mbps", "paused", "wake_on_start", "autostart", "min_free_gb", "hide_on_autostart",
-              "check_updates", "update_branch")
+    FIELDS = ("server", "root", "limit_mbps", "parallel", "paused", "wake_on_start", "autostart", "min_free_gb",
+              "hide_on_autostart", "check_updates", "update_branch")
 
     def __init__(self, path: Path | None = None):
         self.path = path or app_dir() / "config.json"
@@ -158,6 +159,7 @@ class Config:
         self.token = ""
         self.root = ""
         self.limit_mbps = 0.0
+        self.parallel = PARALLEL_DEFAULT  # одновременных загрузок
         self.min_free_gb = 10.0           # меньше стольких ГБ свободно на диске — новые файлы не скачиваем
         self.paused = False
         self.wake_on_start = True
@@ -335,6 +337,7 @@ DISK_EVERY = 10             # с: мало места — так часто см
 VERIFY_EVERY = 30 * 86400   # с: проверка копий (пересчёт хешей скопированного) — раз в 30 дней
 VERIFY_SLICE = 20           # с: проверять кусками, между ними — обычный опрос сервера
 REPORT_EVERY = 5 * 60       # с: отчёт серверу, если состояние не меняется
+PARALLEL_DEFAULT, PARALLEL_MAX = 3, 6   # одновременных загрузок: по умолчанию и максимум
 STALL_LIMIT = 30            # с: данные файла не приходят столько — рвём соединение и докачиваем заново
 REPORT_COPYING = 5          # с: а во время копирования — так часто (админка видит ход в реальном времени)
 DELETE_SUSPICIOUS = (100, 0.05)   # больше стольких И больше такой доли — ждём подтверждения
@@ -383,6 +386,14 @@ def safe_rel(rel: str) -> list[str]:
 
 def stamp(ts: float | None = None) -> str:
     return datetime.datetime.fromtimestamp(ts or time.time()).strftime("%Y-%m-%d %H-%M-%S")
+
+
+def parallel_of(cfg) -> int:
+    """Одновременных загрузок из настроек: 1…PARALLEL_MAX (что-то не то в config.json — по умолчанию)."""
+    try:
+        return max(1, min(PARALLEL_MAX, int(getattr(cfg, "parallel", PARALLEL_DEFAULT))))
+    except (TypeError, ValueError):
+        return PARALLEL_DEFAULT
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -570,22 +581,25 @@ class Api:
 
 
 class Throttle:
-    """Ограничение скорости: limit() -> байт/с (0 — без ограничения)."""
+    """Ограничение скорости: limit() -> байт/с (0 — без ограничения). Один на все параллельные
+    загрузки: лимит — на всех вместе. Каждый кусок получает своё «окно» во времени сразу за
+    предыдущим (чей бы он ни был); новый лимит действует со следующего куска."""
+
+    BURST = 0.5                                # с: после простоя — не больше полсекунды «вперёд»
 
     def __init__(self, limit):
         self.limit = limit
-        self.t0, self.sent = time.monotonic(), 0
+        self.next = 0.0
+        self.mu = threading.Lock()
 
     def wait(self, n: int, stop: threading.Event) -> None:
         rate = self.limit()
-        now = time.monotonic()
         if not rate:
-            self.t0, self.sent = now, 0
             return
-        if now - self.t0 > 2:                 # окно 2 с: лимит меняется на лету
-            self.t0, self.sent = now, 0
-        self.sent += n
-        delay = self.sent / rate - (now - self.t0)
+        with self.mu:
+            now = time.monotonic()
+            self.next = max(self.next, now - self.BURST) + n / rate
+            delay = self.next - now
         while delay > 0 and not stop.is_set():
             time.sleep(min(delay, 0.2))
             delay -= 0.2
@@ -604,7 +618,8 @@ class Engine(threading.Thread):
         self.log = collections.deque(maxlen=300)
         self.st = dict(state="setup", text="Укажите сервер, токен и папку в настройках", detail="",
                        files=0, bytes=0, have_files=0, have_bytes=0, left_files=0, left_bytes=0,
-                       waiting_hash=0, current="", cur_done=0, cur_size=0, speed=0.0, errors=0,
+                       waiting_hash=0, current="", cur_done=0, cur_size=0, active=0, active_done=0,
+                       speed=0.0, errors=0,
                        pending_delete=0, copied=0, copied_bytes=0, last_ok=0.0, server="",
                        wire_bytes=0, raw_bytes=0, stall=0,
                        verifying=False, verify_done=0, verify_total=0, verify_bad=0, verify_last=0.0,
@@ -618,6 +633,9 @@ class Engine(threading.Thread):
         self._vmu = threading.Lock()            # проверка копий идёт в одном месте за раз
         self._vthread: threading.Thread | None = None
         self._last_data = time.monotonic()      # когда последний раз пришли данные файла
+        self._active: dict[str, list[int]] = {}  # качается сейчас: путь -> [скачано, размер]
+        self._dl_abort = threading.Event()      # прервать параллельные загрузки (остальные упёрлись в диск, токен…)
+        self._thr = Throttle(lambda: int(max(0.0, float(self.cfg.limit_mbps or 0)) * 125_000))
         self.db: State | None = None
         self.root: Path | None = None
         self._woke = False
@@ -707,6 +725,23 @@ class Engine(threading.Thread):
     def _set(self, **kw) -> None:
         with self.mu:
             self.st.update(kw)
+
+    def _inc(self, **kw) -> None:
+        """Счётчики: их увеличивают и параллельные загрузки — под замком."""
+        with self.mu:
+            for k, v in kw.items():
+                self.st[k] += v
+
+    def _publish_active(self) -> None:
+        """В окне и в админке — самый большой из качающихся файлов (его ход интереснее всего),
+        число параллельных загрузок и сколько скачано у всех вместе. Под self.mu."""
+        a = self._active
+        if not a:
+            self.st.update(current="", cur_done=0, cur_size=0, active=0, active_done=0)
+            return
+        rel = max(a, key=lambda k: a[k][1])
+        self.st.update(current=rel, cur_done=a[rel][0], cur_size=a[rel][1], active=len(a),
+                       active_done=sum(v[0] for v in a.values()))
 
     def _note(self, text: str, kind: str = "info", path: str = "") -> None:
         log.info("%s %s", text, path)
@@ -912,49 +947,8 @@ class Engine(threading.Thread):
         t0 = time.monotonic()
         downloads.sort(key=lambda p: files[p][3], reverse=True)      # сначала новые снимки
         left_files, left_b = len(downloads) + waiting, left_bytes + sum(f[1] for f in files.values() if not f[4])
-        gone = 0
-        for p in downloads:
-            if self.cfg.paused or self._reload or self.quit:
-                raise Stop()
-            if self._want_sync:
-                return False                       # «Получить список файлов»: новый проход со свежим списком
-            f = files[p]
-            pend = self.st.get("pending_delete")
-            # копирование не отменяет ожидание подтверждения — пишем и то и другое
-            self._set(state="copying", text="Копирую", left_files=left_files, left_bytes=left_b,
-                      detail=f"{self._confirm_text(pend)} — ждёт «Подтвердить»" if pend else "")
-            try:
-                self._download(f)
-                left_files -= 1
-                left_b -= f[1]
-            except PcOff:
-                self._note("компьютер выключился — продолжу, когда включится", "warn")
-                self._set(state="pc_off", text="Компьютер выключен", current="", speed=0.0)
-                self._report("pc_off")
-                return False
-            except (Stop, AuthError, DiskFull):
-                raise
-            except Gone:
-                gone += 1
-                self._note("удалён на компьютере — уберу в «Удалённые», когда сервер обновит список", "info", p)
-                if gone >= 20:
-                    return True                    # много подряд — сервер пересканирует папки, ждём список
-                continue
-            except httpx.TimeoutException:
-                self._note(f"компьютер не отдаёт данные {STALL_LIMIT} с — переподключаюсь и докачиваю", "warn", p)
-                self._set(stall=0)
-                return False                       # сразу новый проход: статус ПК, докачка с того же места
-            except httpx.HTTPError as e:
-                code = f"HTTP {e.response.status_code}" if isinstance(e, httpx.HTTPStatusError) else type(e).__name__
-                self._error(p, f"сеть: {code}")
-                return False
-            except Exception as e:  # noqa: BLE001
-                self._error(p, f"{type(e).__name__}: {e}")
-            self._set(have_files=self.st["have_files"] + 1, have_bytes=self.st["have_bytes"] + f[1],
-                      left_files=left_files, left_bytes=left_b)
-            self._report("copying")
-            if time.monotonic() - t0 > PASS_MAX:
-                return False                       # свежий список: могли досчитаться новые хеши
+        if downloads and not self._download_all(downloads, files, t0, left_files, left_b):
+            return False
         self._set(current="", speed=0.0, last_ok=time.time())
         if self._restore_n:
             self._restore()
@@ -975,6 +969,116 @@ class Engine(threading.Thread):
         self._report(self.st["state"])
         self._idle = not waiting and not self.st.get("pending_delete")
         return True                              # подождать IDLE_EVERY (и когда ждём хеши — тоже)
+
+    def _download_all(self, downloads: list[str], files: dict, t0: float, left_files: int, left_b: int) -> bool:
+        """Скачать файлы, по нескольку одновременно (настройка «Одновременных загрузок»). Узкое место —
+        не канал, а задержки на каждый файл (запрос, чтение с ПК по сети, хеш), поэтому параллельно
+        выходит быстрее, особенно на фото по несколько мегабайт. Лимит скорости — на всех вместе.
+        True — список пройден; False — нужен новый проход (ПК выключился, обрыв, «Получить список»…)."""
+        queue_ = collections.deque(downloads)               # уже по порядку: сначала новые снимки
+        running: dict = {}                                  # future -> путь
+        busy_sha: set[str] = set()                          # одинаковые файлы — не одновременно (общий .part)
+        fatal: BaseException | None = None                  # Stop / AuthError / DiskFull — наверх после всех
+        again = False                                       # закончить текущие и начать новый проход
+        hold = False                                        # места мало: новые — только когда текущие докачаются
+        gone = 0
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_MAX, thread_name_prefix="dl")
+        self._dl_abort.clear()
+        try:
+            while queue_ or running:
+                if fatal is None and (self.cfg.paused or self._reload or self.quit):
+                    fatal = Stop()
+                if self._want_sync:
+                    again = True                            # «Получить список файлов»: после текущих файлов
+                if time.monotonic() - t0 > PASS_MAX:
+                    again = True                            # свежий список: могли досчитаться новые хеши
+                n = parallel_of(self.cfg)
+                if hold and not running:
+                    hold = False                            # соседи докачались — пробуем ещё раз, уже одну
+                    n = 1
+                while fatal is None and not again and not hold and queue_ and len(running) < n:
+                    p = next((x for x in queue_ if files[x][4] not in busy_sha), None)
+                    if p is None:
+                        break                               # остались только копии того, что качается
+                    queue_.remove(p)
+                    busy_sha.add(files[p][4])
+                    pend = self.st.get("pending_delete")
+                    # копирование не отменяет ожидание подтверждения — пишем и то и другое
+                    self._set(state="copying", text="Копирую", left_files=left_files, left_bytes=left_b,
+                              detail=f"{self._confirm_text(pend)} — ждёт «Подтвердить»" if pend else "")
+                    try:
+                        running[pool.submit(self._download, files[p])] = p
+                    except RuntimeError:                    # программа завершается
+                        fatal = Stop()
+                        break
+                if not running:
+                    break
+                done, _ = concurrent.futures.wait(running, timeout=1,
+                                                  return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    p = running.pop(fut)
+                    f = files[p]
+                    busy_sha.discard(f[4])
+                    try:
+                        fut.result()
+                        left_files -= 1
+                        left_b -= f[1]
+                    except PcOff:
+                        if not again:
+                            self._note("компьютер выключился — продолжу, когда включится", "warn")
+                        again = True
+                        self._set(state="pc_off", text="Компьютер выключен", speed=0.0)
+                        continue
+                    except DiskFull as e:
+                        if running and fatal is None:
+                            queue_.appendleft(p)            # место займут соседние загрузки: подождать их
+                            hold = True
+                            continue
+                        fatal = e if fatal is None or isinstance(fatal, Stop) else fatal
+                        self._dl_abort.set()
+                        continue
+                    except (Stop, AuthError) as e:
+                        if fatal is None or isinstance(fatal, Stop):
+                            fatal = e                       # важнее причина остановки, чем «Stop» соседей
+                        self._dl_abort.set()                # остальные загрузки — тоже прервать
+                        continue
+                    except Gone:
+                        gone += 1
+                        self._note("удалён на компьютере — уберу в «Удалённые», когда сервер обновит список", "info", p)
+                        if gone >= 20:
+                            queue_.clear()                  # много подряд — сервер пересканирует папки, ждём список
+                        continue
+                    except httpx.TimeoutException:
+                        self._note(f"компьютер не отдаёт данные {STALL_LIMIT} с — переподключаюсь и докачиваю", "warn", p)
+                        self._set(stall=0)
+                        again = True                        # новый проход: статус ПК, докачка с того же места
+                        continue
+                    except httpx.HTTPError as e:
+                        code = f"HTTP {e.response.status_code}" if isinstance(e, httpx.HTTPStatusError) else type(e).__name__
+                        self._error(p, f"сеть: {code}")
+                        again = True
+                        continue
+                    except Exception as e:  # noqa: BLE001
+                        self._error(p, f"{type(e).__name__}: {e}")
+                    self._inc(have_files=1, have_bytes=f[1])
+                    self._set(left_files=left_files, left_bytes=left_b)
+                    self._report("copying")
+        except BaseException:
+            self._dl_abort.set()                            # не ждать докачки при неожиданной ошибке
+            raise
+        finally:
+            pool.shutdown(wait=True)
+            self._dl_abort.clear()
+            with self.mu:
+                self._active.clear()
+                self._publish_active()
+        if fatal is not None:
+            raise fatal
+        if again:
+            if self.st["state"] == "pc_off":
+                self._report("pc_off")
+            return False
+        return True
 
     # ------------------------------------------------------------ восстановление файлов на ПК
 
@@ -1010,7 +1114,7 @@ class Engine(threading.Thread):
             self._upload(rel, a, size, int(it.get("received") or 0), chunk)
 
     def _upload(self, rel: str, a: Path, size: int, offset: int, chunk: int) -> None:
-        thr = Throttle(lambda: int(max(0.0, float(self.cfg.limit_mbps or 0)) * 125_000))
+        thr = self._thr
         with open(lp(a), "rb") as f:
             while True:
                 if self._halted():
@@ -1284,12 +1388,15 @@ class Engine(threading.Thread):
         self._note("перенесён", "move", f"{src} → {rel}")
         self._prune_dirs(a.parent)
 
-    def _space(self, need: int) -> None:
-        """Перед записью нового файла: после него на диске должно остаться не меньше порога."""
+    def _space(self, need: int, rel: str = "") -> None:
+        """Перед записью нового файла: после него на диске должно остаться не меньше порога
+        (с учётом того, что ещё докачают параллельные загрузки)."""
         keep = int(max(0.0, float(self.cfg.min_free_gb or 0)) * 2**30)
+        with self.mu:
+            others = sum(sz - done for k, (done, sz) in self._active.items() if k != rel)
         free = shutil.disk_usage(str(self.root)).free
-        if free - need < keep:
-            raise DiskFull(free, keep, need)
+        if free - need - others < keep:
+            raise DiskFull(free, keep, need + others)
 
     def _copy_local(self, src: str, f) -> None:
         rel = f[0]
@@ -1348,7 +1455,7 @@ class Engine(threading.Thread):
             d = d.parent
 
     def _error(self, rel: str, msg: str) -> None:
-        self._set(errors=self.st["errors"] + 1)
+        self._inc(errors=1)
         self.db.event("error", rel, msg)
         self._note(f"ошибка: {msg}", "error", rel)
 
@@ -1362,12 +1469,22 @@ class Engine(threading.Thread):
         if have > size:
             os.remove(lp(tmp))
             have = 0
-        self._space(size - have)
+        self._space(size - have, rel)
         self._last_data = time.monotonic()
-        self._set(current=rel, cur_done=have, cur_size=size, stall=0)
-        if have < size:
-            self._fetch(rel, tmp, have, size)
-        got = self._sha(tmp)
+        with self.mu:
+            self._active[rel] = [have, size]
+            self._publish_active()
+        try:
+            if have < size:
+                self._fetch(rel, tmp, have, size)
+            got = self._sha(tmp)
+        finally:
+            with self.mu:
+                self._active.pop(rel, None)
+                self._publish_active()
+        self._finish(rel, b, tmp, size, mtime, sha, got)
+
+    def _finish(self, rel: str, b: Path, tmp: Path, size: int, mtime: int, sha: str, got: str) -> None:
         if got != sha:
             os.remove(lp(tmp))
             raise ValueError("контрольная сумма не совпала (файл менялся во время копирования?) — повторю позже")
@@ -1381,12 +1498,12 @@ class Engine(threading.Thread):
             self._set_mtime(b, mtime)
             self.db.put(rel, size, mtime, sha)
         self.db.event("update" if replaced else "copy", rel, str(size))
-        self._set(copied=self.st["copied"] + 1, copied_bytes=self.st["copied_bytes"] + size)
+        self._inc(copied=1, copied_bytes=size)
         if replaced:
             self._note(f"изменился — старый вариант в «{VERSIONS}»", "update", rel)
 
     def _fetch(self, rel: str, tmp: Path, have: int, size: int) -> None:
-        thr = Throttle(lambda: int(max(0.0, float(self.cfg.limit_mbps or 0)) * 125_000))
+        thr = self._thr
         with self.api.stream(rel, have) as r:
             if r.status_code == 503:
                 raise PcOff()
@@ -1401,16 +1518,18 @@ class Engine(threading.Thread):
             if r.headers.get("x-pc-frames") == "1":
                 if int(r.headers.get("x-start", "-1")) != have:
                     raise ValueError("сервер начал не с того места")
-                done = self._frames(r, tmp, have, thr)
+                done = self._frames(r, tmp, have, thr, rel)
             else:
-                done = self._plain(r, tmp, have, thr)
+                done = self._plain(r, tmp, have, thr, rel)
         if done < size:
             raise PcOff()
 
     def _halted(self) -> bool:
+        if self._dl_abort.is_set() and threading.current_thread().name.startswith("dl"):
+            return True                          # потоки загрузок (пул «dl»): соседняя загрузка всё остановила
         return self.halt.is_set() or self.cfg.paused or self.quit
 
-    def _plain(self, r, tmp: Path, have: int, thr) -> int:
+    def _plain(self, r, tmp: Path, have: int, thr, rel: str) -> int:
         if r.status_code == 200:
             have = 0                              # сервер отдал целиком — пишем с начала
         done = have
@@ -1422,13 +1541,13 @@ class Engine(threading.Thread):
                     out.write(chunk)
                     done += len(chunk)
                     self._wire(len(chunk), len(chunk))
-                    self._progress(len(chunk), done)
+                    self._progress(len(chunk), done, rel)
                     thr.wait(len(chunk), self.halt)
             except (httpx.RemoteProtocolError, httpx.ReadError):
                 raise PcOff() from None             # ПК пропал посреди файла
         return done
 
-    def _frames(self, r, tmp: Path, have: int, thr) -> int:
+    def _frames(self, r, tmp: Path, have: int, thr, rel: str) -> int:
         """Кадры [тип][длина][данные]: тип 0 — как есть, 1 — zlib. В файл пишутся только целые
         кадры, поэтому после обрыва файл ровно на границе блока и докачка идёт с этого места."""
         done, buf = have, bytearray()
@@ -1451,7 +1570,7 @@ class Engine(threading.Thread):
                         out.write(data)
                         done += len(data)
                         self._wire(5 + n, len(data))
-                        self._progress(len(data), done)
+                        self._progress(len(data), done, rel)
             except (httpx.RemoteProtocolError, httpx.ReadError):
                 raise PcOff() from None
         return done
@@ -1462,17 +1581,19 @@ class Engine(threading.Thread):
             self.st["wire_bytes"] += wire
             self.st["raw_bytes"] += raw
 
-    def _progress(self, n: int, done: int) -> None:
+    def _progress(self, n: int, done: int, rel: str) -> None:
         now = time.monotonic()
-        self._speed_b += n
-        dt = now - self._speed_t
-        if dt >= 1:
-            sp = self.st["speed"]
-            cur = self._speed_b / dt
-            self._set(speed=cur if not sp else sp * 0.6 + cur * 0.4)
-            self._speed_t, self._speed_b = now, 0
-        with self.mu:
-            self.st["cur_done"] = done
+        with self.mu:                            # скорость — общая для всех параллельных загрузок
+            self._speed_b += n
+            dt = now - self._speed_t
+            if dt >= 1:
+                sp = self.st["speed"]
+                cur = self._speed_b / dt
+                self.st["speed"] = cur if not sp else sp * 0.6 + cur * 0.4
+                self._speed_t, self._speed_b = now, 0
+            if rel in self._active:
+                self._active[rel][0] = done
+                self._publish_active()
         if time.monotonic() - self._last_report > REPORT_COPYING:
             self._report("copying")              # большой файл — ход виден в админке и посреди него
 
@@ -1829,6 +1950,15 @@ class App:
         sp.pack(side="left", padx=6)
         sp.bind("<Return>", lambda _e: self.apply_limit())
         sp.bind("<FocusOut>", lambda _e: self.apply_limit())
+        par = ttk.Frame(t)
+        par.pack(fill="x", padx=12, pady=4, side="bottom")
+        ttk.Label(par, text=f"Одновременных загрузок (1–{PARALLEL_MAX}):").pack(side="left")
+        self.v_par = tk.StringVar(value=str(self._par()))
+        sp2 = ttk.Spinbox(par, from_=1, to=PARALLEL_MAX, increment=1, width=4, textvariable=self.v_par,
+                          command=self.apply_parallel)
+        sp2.pack(side="left", padx=6)
+        sp2.bind("<Return>", lambda _e: self.apply_parallel())
+        sp2.bind("<FocusOut>", lambda _e: self.apply_parallel())
 
         # --- журнал
         lg = ttk.Frame(self.nb)
@@ -1949,6 +2079,23 @@ class App:
         if v != self.cfg.limit_mbps:
             self.cfg.limit_mbps = v
             self.cfg.save()
+
+    def _par(self) -> int:
+        return parallel_of(self.cfg)
+
+    def apply_parallel(self) -> None:
+        """Меняется на лету: больше — новые загрузки начнутся сразу, меньше — по мере окончания текущих."""
+        try:
+            v = int(self.v_par.get().strip())
+        except ValueError:
+            v = 0
+        if not 1 <= v <= PARALLEL_MAX:
+            self.v_par.set(str(self._par()))
+            return
+        if v != self.cfg.parallel:
+            self.cfg.parallel = v
+            self.cfg.save()
+            self.engine.ev.set()
 
     def pick_root(self) -> None:
         d = filedialog.askdirectory(title="Папка для бэкапа", initialdir=self.v_root.get() or str(Path.home()))
@@ -2177,6 +2324,11 @@ class App:
             self._no_pystray = True
             self.root.after(800, self._offer_pystray)
             return
+        except Exception:  # noqa: BLE001 — библиотека есть, но не работает (нет системной части): без значка
+            import logging
+            logging.getLogger("pcbackup").exception("pystray не запустился — значка в трее не будет")
+            self._no_pystray = True
+            return
         self._no_pystray = False
         call = lambda fn: (lambda *_a: self.q.put(fn))        # noqa: E731 — из потока трея в поток окна
         self._tray_status = "Photocloud — бэкап"
@@ -2310,7 +2462,7 @@ class App:
         self.v_state.set(s["text"] if not s["paused"] else "Пауза")
         self.v_detail.set(s["detail"] if not s["paused"] else "Копирование остановлено, интернет не используется")
         if s["bytes"]:
-            part = s["cur_done"] if state == "copying" and s["current"] else 0     # большой файл — видно, что идёт
+            part = s["active_done"] if state == "copying" and s["current"] else 0  # большой файл — видно, что идёт
             self.bar["value"] = 1000 * min(s["bytes"], s["have_bytes"] + part) / s["bytes"]
             self.v_counts.set(f"Скопировано: {num(s['have_files'])} из {num(s['files'])} файлов · "
                               f"{human(s['have_bytes'])} из {human(s['bytes'])}")
@@ -2320,7 +2472,9 @@ class App:
         if s["current"] and state == "copying":
             pct = f" — {100 * s['cur_done'] // max(1, s['cur_size'])}% из {human(s['cur_size'])}" if s["cur_size"] else ""
             wait = f" · ждёт данные с ПК {s['stall']} с" if s.get("stall") else ""
-            self.v_current.set(f"Файл: {s['current']}{pct}{wait}")
+            more = s["active"] - 1
+            more = f" · и ещё {more} {plural(more, 'файл', 'файла', 'файлов')} параллельно" if more > 0 else ""
+            self.v_current.set(f"Файл: {s['current']}{pct}{wait}{more}")
         else:
             self.v_current.set("")
         if state == "copying" and s["speed"] > 0:
