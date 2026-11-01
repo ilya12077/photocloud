@@ -1120,9 +1120,12 @@ def _backup_copying() -> bool:
     return any(t.report.get("state") == "copying" and now - t.report.get("at", 0) < 30 for t in tokens.all())
 
 
+HASH_READ = 4 * 1024 * 1024      # кусок чтения для хеша: меньше запросов «вопрос — ответ» по сети
+
+
 def _hash_file(p, stop) -> str | None:
-    """Хеш файла. Пока клиент бэкапа качает, хеши считаются по одному файлу, а не в два потока:
-    диск ПК отдаёт и то и другое, и при двух потоках чтения отдача клиенту подвисала."""
+    """Хеш файла. Пока клиент бэкапа качает, хеши считаются по одному файлу, а не в несколько
+    потоков: диск ПК отдаёт и то и другое, и при нескольких потоках чтения отдача клиенту подвисала."""
     if _backup_copying():
         with _hash_one:
             return _hash_read(p, stop)
@@ -1136,7 +1139,7 @@ def _hash_read(p, stop) -> str | None:
             while True:
                 if stop.is_set():
                     return None
-                b = f.read(1024 * 1024)
+                b = f.read(HASH_READ)
                 if not b:
                     break
                 h.update(b)
@@ -1839,8 +1842,10 @@ async def admin_backup_verify_start(request: Request, s: Session = Depends(requi
     if library.hash_busy():
         return _bad("сейчас уже считаются хеши — подожди окончания или останови")
     since = await run_in_threadpool(db.kv_get, "verify_since")
-    if since and library.verify_state == "done":
-        # прошлая проверка закончилась, но её ещё не закрыли (раз в минуту) — закрываем и начинаем новую
+    if since and (library.verify_state == "done"
+                  or not await run_in_threadpool(db.hashes_unchecked, float(since))):
+        # прошлая проверка закончилась, но её ещё не закрыли (раз в минуту, или сервер перезапустили
+        # раньше) — закрываем и начинаем новую
         await run_in_threadpool(db.kv_set, "verify_last", time.time())
         await run_in_threadpool(db.kv_set, "verify_last_bad", library.verify_bad)
         since = None

@@ -22,6 +22,10 @@ from . import meta
 from .storage import PLAYABLE_EXT, VIDEO_EXT
 
 log = logging.getLogger("photocloud.library")
+# Хеши (бэкап): файлы читаются целиком с ПК по SMB. Узкое место — не процессор, а ожидание
+# каждого ответа (сеть + диск ПК), поэтому несколько файлов сразу. Фоновых слотов SMB у всего
+# фона 4 (storage.SMB_BACKGROUND): один оставляем датам и обходу папок при новом сканировании.
+HASH_THREADS = 3
 
 F_VIDEO = 1
 F_TAKEN = 2   # дата из EXIF/метаданных
@@ -527,7 +531,7 @@ class Library:
                 return None
             return p, reader(p, self._hash_stop)
 
-        with ThreadPoolExecutor(2, thread_name_prefix="meta-verify") as ex:
+        with ThreadPoolExecutor(HASH_THREADS, thread_name_prefix="meta-verify") as ex:
             futs = [ex.submit(one, p) for p in todo]
             for i, fut in enumerate(as_completed(futs), 1):
                 if self._hash_stop.is_set():
@@ -598,7 +602,7 @@ class Library:
                 return None
             return p, reader(p, self._hash_stop)
 
-        with ThreadPoolExecutor(2, thread_name_prefix="meta-hash") as ex:
+        with ThreadPoolExecutor(HASH_THREADS, thread_name_prefix="meta-hash") as ex:
             futs = [ex.submit(one, p) for p in todo]
             for i, fut in enumerate(as_completed(futs), 1):
                 if self._hash_stop.is_set():
