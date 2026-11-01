@@ -107,7 +107,7 @@ function showSetup(token) {
 
 // ================================================================== вкладки
 
-const POLL_MS = { overview: 3000, users: 10000, security: 5000, backup: 2000, perf: 5000, logs: 5000 };   // settings — нет: там форма
+const POLL_MS = { overview: 3000, users: 5000, backup: 2000, perf: 5000, logs: 5000 };   // settings — нет: там форма
 let curTab = 'overview', polledAt = 0, polling = false;
 setInterval(async () => {
   const ms = POLL_MS[curTab];
@@ -117,7 +117,9 @@ setInterval(async () => {
 }, 500);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) polledAt = 0; });   // вернулся во вкладку — сразу свежее
 
-const loaders = { overview: loadOverview, users: loadUsers, security: loadSecurity, backup: loadBackup, settings: loadSettings, perf: loadPerf, logs: loadLogs };
+// «Пользователи» — вместе с сессиями и заблокированными IP
+const loaders = { overview: loadOverview, users: () => Promise.all([loadUsers(), loadSecurity()]), backup: loadBackup,
+  settings: loadSettings, perf: loadPerf, logs: loadLogs };
 function showTab(name) {
   curTab = name; polledAt = Date.now();
   for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.tab === name);

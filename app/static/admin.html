@@ -39,10 +39,9 @@
       <nav class="tabs" id="tabs">
         <button data-tab="overview" class="on">Обзор</button>
         <button data-tab="users">Пользователи</button>
-        <button data-tab="security">Сессии</button>
         <button data-tab="backup">Бэкап</button>
-        <button data-tab="settings">Настройки</button>
         <button data-tab="perf">Скорость</button>
+        <button data-tab="settings">Настройки</button>
         <button data-tab="logs">Журнал</button>
       </nav>
     </div>
@@ -71,9 +70,6 @@
         <select id="nr"><option value="user">пользователь</option><option value="admin">администратор</option></select>
         <button class="btn primary">Добавить</button>
       </form>
-    </div>
-
-    <div data-pane="security" hidden>
       <h3>Активные сессии</h3>
       <table class="list" id="sessions"><thead><tr><th>Пользователь</th><th>IP</th><th>Вход</th><th>Активность</th><th></th></tr></thead><tbody></tbody></table>
       <h3>Заблокированные IP</h3>
@@ -107,6 +103,16 @@
       </div>
     </div>
 
+    <div data-pane="perf" hidden>
+      <p class="dim2">Как быстро делаются эскизы, по последним запросам (медианы, мс). «Очередь» — ожидание свободного потока, «чтение» — диск/сеть, «декод» — распаковка исходника, «сжатие» — WebP.</p>
+      <div class="inline"><button class="btn" id="perf-refresh">Обновить</button><button class="btn primary" id="bench-run">Запустить тест</button><span id="perf-meta" class="dim2"></span></div>
+      <h3>Последние запросы</h3>
+      <table class="list" id="perf"><thead><tr><th>Размер</th><th>Тип</th><th>Шт.</th><th>Очередь</th><th>Чтение</th><th>Декод</th><th>Уменьш.</th><th>Сжатие</th><th>Итого</th><th>p90</th><th>КБ</th></tr></thead><tbody></tbody></table>
+      <h3>Тест</h3>
+      <p id="bench-verdict"></p>
+      <table class="list" id="bench"><thead><tr><th>Тип</th><th>Файл</th><th>МБ</th><th>Чтение</th><th>Декод</th><th>Уменьш.</th><th>Сжатие</th><th>Итого</th><th>КБ</th></tr></thead><tbody></tbody></table>
+    </div>
+
     <div data-pane="settings" hidden>
       <form id="settings" class="form">
         <label>Название<input id="s-name" maxlength="40" required></label>
@@ -122,16 +128,6 @@
         </div>
         <button class="btn primary">Сохранить</button>
       </form>
-    </div>
-
-    <div data-pane="perf" hidden>
-      <p class="dim2">Как быстро делаются эскизы, по последним запросам (медианы, мс). «Очередь» — ожидание свободного потока, «чтение» — диск/сеть, «декод» — распаковка исходника, «сжатие» — WebP.</p>
-      <div class="inline"><button class="btn" id="perf-refresh">Обновить</button><button class="btn primary" id="bench-run">Запустить тест</button><span id="perf-meta" class="dim2"></span></div>
-      <h3>Последние запросы</h3>
-      <table class="list" id="perf"><thead><tr><th>Размер</th><th>Тип</th><th>Шт.</th><th>Очередь</th><th>Чтение</th><th>Декод</th><th>Уменьш.</th><th>Сжатие</th><th>Итого</th><th>p90</th><th>КБ</th></tr></thead><tbody></tbody></table>
-      <h3>Тест</h3>
-      <p id="bench-verdict"></p>
-      <table class="list" id="bench"><thead><tr><th>Тип</th><th>Файл</th><th>МБ</th><th>Чтение</th><th>Декод</th><th>Уменьш.</th><th>Сжатие</th><th>Итого</th><th>КБ</th></tr></thead><tbody></tbody></table>
     </div>
 
     <div data-pane="logs" hidden>
