@@ -1740,8 +1740,12 @@ async def backup_restore_nosource(request: Request, path: str = "", t=Depends(re
 
 # ---- админка: повреждённые файлы
 
+DAMAGED_KEEP = 86400       # с: закрытые записи (исправлен, принят…) видны в админке сутки — история есть в журнале
+
+
 @app.get("/api/admin/damaged")
 async def admin_damaged(_: Session = Depends(require_admin)):
+    await run_in_threadpool(db.damaged_prune, time.time() - DAMAGED_KEEP)
     items = await run_in_threadpool(db.damaged_list)
     for d in items:
         d["text"] = DAMAGE_TEXT.get(d["state"], d["state"])
@@ -1778,6 +1782,26 @@ async def admin_damaged_retry(request: Request, s: Session = Depends(require_adm
 
     await run_in_threadpool(retry)
     audit("damaged_retry", s.user, ip_of(request), path)
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/damaged/dismiss", dependencies=[Depends(require_csrf)])
+async def admin_damaged_dismiss(request: Request, s: Session = Depends(require_admin)):
+    """Убрать закрытую запись (исправлен, принят…) из списка, не дожидаясь суток."""
+    path = (await read_json(request)).get("path")
+    d = await run_in_threadpool(db.damaged_get, path) if isinstance(path, str) else None
+    if d is None:
+        raise HTTPException(404)
+    if d["state"] in db.ACTIVE:
+        return _bad("файл ещё не исправлен")
+
+    def drop() -> None:
+        with _dmg_mu:
+            db.damaged_delete(path)
+            _nosource_set(path, None)
+
+    await run_in_threadpool(drop)
+    audit("damaged_dismiss", s.user, ip_of(request), path)
     return no_store(JSONResponse({"ok": True}))
 
 

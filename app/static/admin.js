@@ -22,7 +22,7 @@ const AUDIT = {
   hash_mismatch: 'хеш не совпал', damaged_found: 'повреждён файл на сервере', damaged_restored: 'восстановлена копия в Restored',
   damaged_fixed: 'повреждённый файл исправлен', damaged_lost: 'копию из Restored удалили', damaged_gone: 'повреждённый файл удалён',
   damaged_changed: 'повреждённый файл изменён', damaged_nosource: 'нет правильной копии', damaged_accept: 'принята новая версия файла',
-  damaged_retry: 'восстановить заново', restore_bad: 'присланная копия не совпала по хешу',
+  damaged_retry: 'восстановить заново', damaged_dismiss: 'запись о повреждённом файле убрана', restore_bad: 'присланная копия не совпала по хешу',
 };
 
 async function api(path, body) {
@@ -450,6 +450,9 @@ async function loadDamaged() {
     }));
     if (['nosource', 'lost', 'restored'].includes(d.state)) ops.append(btn('восстановить заново', async () => {
       await act(() => api('/api/admin/damaged/retry', { path: d.path }), 'Восстановление запрошено'); loadDamaged();
+    }));
+    if (!active) ops.append(btn('убрать', async () => {
+      await act(() => api('/api/admin/damaged/dismiss', { path: d.path }), 'Убрано из списка'); loadDamaged();
     }));
     tr.append(el('td', 'mono', d.path), el('td', null, dt(d.found)), st, ops);
     return tr;

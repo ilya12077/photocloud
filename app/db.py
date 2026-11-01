@@ -211,6 +211,17 @@ class DB:
         self.run(f"INSERT OR REPLACE INTO damaged({self._DMG}) VALUES({', '.join('?' * len(cols))})",
                  tuple(d[c] for c in cols))
 
+    def damaged_delete(self, path: str) -> None:
+        self.run("DELETE FROM damaged WHERE path = ?", (path,))
+
+    def damaged_prune(self, before: float) -> int:
+        """Закрытые записи (исправлен, принят, удалён, изменён), закрытые раньше before."""
+        q = ("FROM damaged WHERE state NOT IN ('found', 'nosource', 'restored', 'lost') AND updated < ?")
+        n = self.run("SELECT count(*) " + q, (before,))[0][0]
+        if n:
+            self.run("DELETE " + q, (before,))
+        return n
+
     # ------------------------------------------------------------ служебные отметки
 
     def kv_get(self, key: str) -> str | None:
