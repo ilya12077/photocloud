@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.1"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.2"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -758,13 +758,17 @@ class Engine(threading.Thread):
         файла не приходят (ПК подвис) — тогда в отчёте видно, сколько секунд ждём."""
         while not self.quit:
             time.sleep(1)
-            if self.st["state"] != "copying" or self.cfg.paused:
+            copying = self.st["state"] == "copying"
+            if not (copying or self.st["verifying"]) or self.cfg.paused:
                 continue
-            stall = int(time.monotonic() - self._last_data) if self.st["current"] else 0
-            self._set(stall=stall if stall >= 5 else 0)
+            if copying:
+                stall = int(time.monotonic() - self._last_data) if self.st["current"] else 0
+                self._set(stall=stall if stall >= 5 else 0)
+            # и во время проверки копий: большой файл считается дольше минуты, а админка
+            # показывает ход проверки только по свежему отчёту
             if time.monotonic() - self._last_report > REPORT_COPYING:
                 try:
-                    self._report("copying")
+                    self._report(self.st["state"])
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1292,6 +1296,7 @@ class Engine(threading.Thread):
             self._set(verifying=True, verify_total=left + self.st["verify_done"],
                       verify_bytes_total=left_b + self.st["verify_bytes"])
             self._note(f"проверяю хеши копий: {left} файлов, {human(left_b)}")
+            self._report(self.st["state"], force=True)
         t0 = time.monotonic()
         while time.monotonic() - t0 < VERIFY_SLICE:
             rows = self.db.unverified(since, 50)
@@ -1305,7 +1310,8 @@ class Engine(threading.Thread):
                 self._set(verifying=False, verify_done=0, verify_total=0, verify_bytes=0, verify_bytes_total=0,
                           verify_cur="", verify_last=now,
                           verify_next=now + VERIFY_EVERY)
-                self._report(self.st["state"], f"повреждённых копий: {bad}" if bad else "")
+                # сразу, а не через 5 минут: иначе админка до того показывает «проверка копий: N из M»
+                self._report(self.st["state"], f"повреждённых копий: {bad}" if bad else "", force=True)
                 return False
             for rel, size, sha in rows:
                 if self._reload or self.quit or self.cfg.paused or (self._want_sync and not bg):
@@ -1664,12 +1670,13 @@ class Engine(threading.Thread):
 
     # ------------------------------------------------------------ отчёт серверу
 
-    def _report(self, state: str, error: str = "") -> None:
-        """Отчёт серверу — при смене состояния или раз в 5 минут, а не на каждый опрос."""
+    def _report(self, state: str, error: str = "", force: bool = False) -> None:
+        """Отчёт серверу — при смене состояния или раз в 5 минут, а не на каждый опрос
+        (force — сразу: например, проверка копий началась или закончилась)."""
         if not self.api:
             return
         every = REPORT_COPYING if state == "copying" or self.st["verifying"] else REPORT_EVERY
-        if state == self._reported and not error and time.monotonic() - self._last_report < every:
+        if state == self._reported and not error and not force and time.monotonic() - self._last_report < every:
             return
         if not self._rep_mu.acquire(blocking=False):
             return                                 # отчёт уже отправляется из другого потока

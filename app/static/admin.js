@@ -405,7 +405,9 @@ async function loadBackup() {
       }
     } else if (rp.state === 'copying') st.firstChild.textContent = 'копировал, давно нет связи';
     if (rp.pending_delete && rp.state !== 'confirm') st.append(el('div', 'err', `ждёт подтверждения: с ПК пропало ${rp.pending_delete.toLocaleString('ru')} файлов`));
-    if (rp.verify_total) st.append(el('div', 'dim2', `проверка копий: ${rp.verify_done.toLocaleString('ru')} из ${rp.verify_total.toLocaleString('ru')}`));
+    // пока идёт проверка, отчёт приходит раз в 5 с; старый отчёт с ходом проверки — уже не правда
+    // (клиенты до 1.4.2 сообщали об окончании проверки только через 5 минут)
+    if (rp.verify_total && (fresh || rp.state === 'paused')) st.append(el('div', 'dim2', `проверка копий: ${rp.verify_done.toLocaleString('ru')} из ${rp.verify_total.toLocaleString('ru')}`));
     else if (rp.verify_last) st.append(el('div', 'dim2', `копии проверены ${dday(rp.verify_last)}`));
     if (rp.verify_bad) st.append(el('div', 'err', `повреждённых копий: ${rp.verify_bad} (скачиваются заново)`));
     if (rp.errors) st.append(el('div', 'dim2', `ошибок: ${rp.errors}`));
