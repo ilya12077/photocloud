@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.3"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.4"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -1960,13 +1960,13 @@ class App:
         self.v_speed = tk.StringVar()
         self.v_verify = tk.StringVar()
         ttk.Label(t, textvariable=self.v_state, font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=12, pady=(12, 0))
-        ttk.Label(t, textvariable=self.v_detail, foreground="#666", wraplength=640).pack(anchor="w", **pad)
+        self._fluid(ttk.Label(t, textvariable=self.v_detail, foreground="#666", wraplength=640)).pack(anchor="w", **pad)
         self.bar = ttk.Progressbar(t, maximum=1000)
         self.bar.pack(fill="x", padx=12, pady=(8, 4))
         ttk.Label(t, textvariable=self.v_counts).pack(anchor="w", **pad)
-        ttk.Label(t, textvariable=self.v_current, foreground="#666", wraplength=640).pack(anchor="w", **pad)
+        self._fluid(ttk.Label(t, textvariable=self.v_current, foreground="#666", wraplength=640)).pack(anchor="w", **pad)
         ttk.Label(t, textvariable=self.v_speed).pack(anchor="w", **pad)
-        ttk.Label(t, textvariable=self.v_verify, foreground="#666", wraplength=600).pack(anchor="w", **pad)
+        self._fluid(ttk.Label(t, textvariable=self.v_verify, foreground="#666", wraplength=600)).pack(anchor="w", **pad)
 
         self.confirm = ttk.Frame(t)
         ttk.Label(self.confirm, text="Файлы уберутся в папку «Удалённые» внутри бэкапа — ничего не стирается.",
@@ -2039,7 +2039,7 @@ class App:
         ttk.Label(s, text="Токен:").grid(row=r, column=0, sticky="w", padx=12, pady=4)
         ttk.Entry(s, textvariable=self.v_token, show="•").grid(row=r, column=1, columnspan=2, sticky="ew", padx=12, pady=4)
         r += 1
-        self.l_token = ttk.Label(s, foreground="#666", wraplength=420)
+        self.l_token = self._fluid(ttk.Label(s, foreground="#666", wraplength=420))
         self.l_token.grid(row=r, column=1, columnspan=2, sticky="w", padx=12)
         r += 1
         ttk.Label(s, text="Папка бэкапа:").grid(row=r, column=0, sticky="w", padx=12, pady=4)
@@ -2074,7 +2074,7 @@ class App:
         ttk.Label(ub, text=f"пусто — {updater.default_branch()}", foreground="#666").pack(side="left", padx=6)
         ttk.Button(ub, text="Проверить обновления", command=lambda: self.check_update(manual=True)).pack(side="left")
         r += 1
-        ttk.Label(s, textvariable=self.v_updmsg, foreground="#666", wraplength=560).grid(
+        self._fluid(ttk.Label(s, textvariable=self.v_updmsg, foreground="#666", wraplength=560)).grid(
             row=r, column=1, columnspan=2, sticky="w", padx=12)
         r += 1
         b = ttk.Frame(s)
@@ -2082,14 +2082,15 @@ class App:
         ttk.Button(b, text="Сохранить", command=self.save_settings).pack(side="left")
         ttk.Button(b, text="Проверить связь", command=self.test_conn).pack(side="left", padx=6)
         r += 1
-        ttk.Label(s, textvariable=self.v_test, wraplength=440).grid(row=r, column=1, columnspan=2, sticky="w", padx=12)
+        self._fluid(ttk.Label(s, textvariable=self.v_test, wraplength=440)).grid(row=r, column=1, columnspan=2, sticky="w", padx=12)
         r += 1
-        ttk.Label(s, text="Закрытие окна оставляет программу в трее (значок у часов; в Windows 11 он может "
+        note = ttk.Label(s, text="Закрытие окна оставляет программу в трее (значок у часов; в Windows 11 он может "
                           "быть спрятан под стрелкой ^ — его можно перетащить на панель). Выход — правой кнопкой "
-                          "по значку → «Выход».", foreground="#666", wraplength=640).grid(
+                          "по значку → «Выход».", foreground="#666", wraplength=640)
+        self._fluid(note).grid(
             row=r, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 0))
         r += 1
-        ttk.Label(s, text=f"Настройки: {self.cfg.path}", foreground="#999", wraplength=640).grid(
+        self._fluid(ttk.Label(s, text=f"Настройки: {self.cfg.path}", foreground="#999", wraplength=640)).grid(
             row=r, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 0))
         r += 1
         ttk.Label(s, text=f"photocloud-backup {VERSION}", foreground="#999").grid(
@@ -2103,6 +2104,24 @@ class App:
     def _token_hint(self) -> None:
         self.l_token.configure(text="Токен сохранён (зашифрован). Оставьте поле пустым, чтобы не менять."
                                if self.cfg.token else "Токен выдаёт администратор: Админка → Бэкап → Новый клиент.")
+
+    @staticmethod
+    def _fluid(lbl):
+        """Перенос строк по ширине окна: растянули окно — текст стал шире, сузили — переносится."""
+        parent = lbl.master
+
+        def fit(_e=None):
+            w = parent.winfo_width() - lbl.winfo_x() - 16
+            try:
+                cur = int(float(str(lbl.cget("wraplength")) or 0))
+            except ValueError:
+                cur = 0
+            if w > 150 and abs(w - cur) > 4:          # без лишних перерисовок (и без зацикливания)
+                lbl.configure(wraplength=w)
+
+        parent.bind("<Configure>", fit, add="+")
+        lbl.bind("<Map>", fit, add="+")
+        return lbl
 
     @staticmethod
     def _fmt_limit(v) -> str:

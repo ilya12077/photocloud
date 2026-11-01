@@ -144,7 +144,7 @@ async function loadOverview() {
     ['Год по папке', ix.files ? `${(ix.with_folder_year ?? 0).toLocaleString('ru')} (${Math.round((ix.with_folder_year ?? 0) / ix.files * 100)}%)` : '—'],
     ['Индекс', ix.state + (ix.error ? ` (${ix.error})` : '') + (ix.meta[1] && ix.meta[0] < ix.meta[1] ? `, даты ${ix.meta[0]}/${ix.meta[1]}` : '')],
     ['Обновлён', dt(ix.built_at)],
-    ...(o.hashes ? [['Хеши для бэкапа', hashText(o.hashes)]] : []),
+    ...(o.hashes ? [['Хеши файлов', hashText(o.hashes, o.hashes.unhashed, o.hashes.files)]] : []),
     ['Эскизы в памяти сервера', `${mb(o.cache.thumb[0])} из ${mb(o.cache.thumb[1])}`],
     ['Превью в памяти сервера', `${mb(o.cache.preview[0])} из ${mb(o.cache.preview[1])}`],
     ['Сессий', String(o.sessions)],
@@ -326,12 +326,12 @@ function leftTime(sec) {
 }
 // «· 320 Мбит/с · осталось ≈ 2 ч 10 мин» — пока скорость не набралась (первые секунды), ничего
 const pace = (x) => (x.speed ? ` · ${mbit(x.speed)}` + (x.eta ? ` · осталось ≈ ${leftTime(x.eta)}` : '') : '');
-function hashText(h) {
+// «Хеши файлов»: есть ли хеш у всех файлов, а если нет — как идёт подсчёт недостающих
+function hashText(h, unhashed, files) {
   if (h.state === 'running') return `считаются: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')} (${gb(h.bytes_done)} из ${gb(h.bytes_total)})${pace(h)}`;
-  if (h.state === 'stopped') return `остановлено: ${h.done.toLocaleString('ru')} из ${h.total.toLocaleString('ru')}`;
-  if (h.state === 'error') return 'прервано из-за ошибок чтения — продолжится при следующем сканировании';
-  if (h.state === 'done') return 'все посчитаны';
-  return 'ждут сканирования папок';
+  if (!unhashed) return `есть у всех: ${files.toLocaleString('ru')}`;
+  return `без хеша ${unhashed.toLocaleString('ru')} из ${files.toLocaleString('ru')} — `
+    + (h.state === 'stopped' ? 'подсчёт остановлен' : h.state === 'error' ? 'подсчёт прервался из-за ошибок чтения' : 'посчитаются после сканирования');
 }
 const dday = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString('ru') : '—');
 function verifyText(v) {
@@ -376,11 +376,8 @@ async function loadBackup() {
     if (unchanged('backup', r)) return;
   const v = r.verify;
   const hRun = r.hashes.state === 'running', vRun = v.state === 'running';
-  const hText = !r.tokens.length ? 'не считаются — нет клиентов' : hRun ? hashText(r.hashes)
-    : !r.unhashed ? 'все посчитаны'
-    : `без хеша ${r.unhashed.toLocaleString('ru')}` + (r.hashes.state === 'stopped' ? ' — подсчёт остановлен' : r.hashes.state === 'error' ? ' — подсчёт прервался' : ' — посчитаются после сканирования');
-  const cards = [['Хеши новых файлов', hText],
-    ['Файлов с хешем', `${(r.files - r.unhashed).toLocaleString('ru')} из ${r.files.toLocaleString('ru')}`],
+  const hText = !r.tokens.length ? 'не считаются — нет клиентов' : hashText(r.hashes, r.unhashed, r.files);
+  const cards = [['Хеши файлов', hText],
     ['Проверка хешей', !r.tokens.length ? 'не нужна — нет клиентов' : verifyText(v)], ['Клиентов', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, val]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', val)); return c; }));
   $('bk-hash-start').hidden = hRun || vRun || !r.unhashed || !r.tokens.length;

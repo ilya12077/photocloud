@@ -2065,6 +2065,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
     # считаем только то, что видно в ленте: ролики живых фото — часть снимка, а не отдельный файл
     photos = [p for p in library.by_id.values() if not (p.video and p.live)]
     videos = sum(1 for p in photos if p.video)
+    unhashed = await run_in_threadpool(_unhashed) if tokens.any() else 0
     return no_store(JSONResponse({
         "version": config.app_version(),
         "uptime": int(time.time() - STARTED),
@@ -2074,7 +2075,8 @@ async def admin_overview(_: Session = Depends(require_admin)):
                   "with_folder_year": sum(1 for p in photos if p.folder_only()),
                   "built_at": int(library.built_at),
                   "meta": [library.meta_done, library.meta_total]},
-        "hashes": _hash_progress() if tokens.any() else None,
+        # хеши — у всех файлов индекса (и роликов живых фото), поэтому своё «из скольких»
+        "hashes": {**_hash_progress(), "unhashed": unhashed, "files": len(library.by_id)} if tokens.any() else None,
         "cache": {"thumb": [thumb_cache.size, thumb_cache.max], "preview": [preview_cache.size, preview_cache.max]},
         "sessions": len(sessions.list()),
         "config": {   # только для чтения; секреты не отдаём, лишь факт их наличия
