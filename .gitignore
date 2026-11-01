@@ -6,7 +6,7 @@ data/
 .venv/
 __pycache__/
 *.pyc
-
+.idea/
 # журнал клиента бэкапа
 backup/backup.log*
 backup/*.new
