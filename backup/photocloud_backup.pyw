@@ -75,7 +75,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.3.10"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.3.11"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -600,6 +600,7 @@ class Engine(threading.Thread):
         self._last_report = 0.0
         self._reported = ""                    # состояние из последнего отчёта
         self._force_local = False              # обойти папку бэкапа (вместе с проверкой хешей)
+        self._force_list = False               # обойти папку без хешей («Получить список файлов»)
         self._idle = False                     # прошлый проход всё сделал — ждём новое
         self._manifest = None
         self._etag = None
@@ -630,7 +631,8 @@ class Engine(threading.Thread):
     def sync_now(self) -> None:
         """Свежий список с сервера — сразу, а если идёт копирование — после текущего файла (папку не обходит)."""
         self._want_sync = True
-        self._note("«Получить список файлов»: беру свежий список с сервера")
+        self._force_list = True                # и обойти папку бэкапа — без пересчёта хешей
+        self._note("«Получить список файлов»: беру свежий список с сервера и сверяю папку бэкапа")
         self.ev.set()
 
     def wake_now(self) -> None:
@@ -834,7 +836,8 @@ class Engine(threading.Thread):
         (прервали по времени, выключился ПК, обрыв связи)."""
         m, etag = self.api.manifest(self._etag)
         # обход папки бэкапа долгий: только вместе с проверкой хешей (раз в месяц и по кнопке «Проверить хеши»)
-        do_local = self._force_local
+        # «Получить список файлов» — тоже обход, но без хешей
+        do_local = self._force_local or self._force_list
         # короткий путь «ничего не поменялось» — только если и состояние уже итоговое: после паузы,
         # выключения ПК или ошибки проходим полностью, иначе в окне так и висело бы «Пауза»
         if m is None and self._idle and not do_local and self.st["state"] in ("done", "waiting", "confirm"):
@@ -848,9 +851,10 @@ class Engine(threading.Thread):
         self._idle = False
         files = {f[0]: f for f in m["files"]}            # путь -> [путь, размер, mtime, дата, sha]
         if do_local:
-            self._force_local = False
+            with_hash = self._force_local
+            self._force_local = self._force_list = False
             self._set(detail="Сверяю папку бэкапа…")
-            local, extras = self._verify_local(self.db.files(), files)
+            local, extras = self._verify_local(self.db.files(), files, with_hash)
         else:
             local, extras = self.db.files(), []          # в остальное время — по своей базе, без обхода папки
         plan = self._plan(files, local)
@@ -963,7 +967,7 @@ class Engine(threading.Thread):
         deletes = [p for p in missing if p not in used]
         return moves, copies, downloads, deletes, waiting
 
-    def _scan_archive(self) -> dict[str, int]:
+    def _scan_archive(self) -> dict[str, tuple[int, int]]:
         """Что реально лежит в Архиве: путь -> размер. Обход папок (os.scandir) — в Windows размер
         приходит вместе со списком файла, без открытия каждого: 40 тысяч файлов — доли секунды."""
         top = lp(self.root / ARCHIVE)
@@ -984,12 +988,13 @@ class Engine(threading.Thread):
                         if e.is_dir(follow_symlinks=False):
                             stack.append((e.path, rel))
                         elif e.is_file(follow_symlinks=False):
-                            out[rel] = e.stat(follow_symlinks=False).st_size
+                            st = e.stat(follow_symlinks=False)
+                            out[rel] = (st.st_size, int(st.st_mtime))
                     except OSError:
                         continue
         return out
 
-    def _verify_local(self, local: dict, files: dict) -> tuple[dict, list[str]]:
+    def _verify_local(self, local: dict, files: dict, with_hash: bool = True) -> tuple[dict, list[str]]:
         """Сверка Архива с базой клиента.
         Файлы из базы, которые пропали из Архива или изменились руками, считаем отсутствующими —
         их скачаем заново (изменённый сначала уйдёт в Версии).
@@ -1000,7 +1005,7 @@ class Engine(threading.Thread):
         have = self._scan_archive()
         out, gone = {}, []
         for p, v in local.items():
-            if have.get(p) != v[0]:
+            if (have.get(p) or (None,))[0] != v[0]:
                 gone.append(p)
             else:
                 out[p] = v
@@ -1010,12 +1015,19 @@ class Engine(threading.Thread):
             self._note(f"в папке бэкапа пропали или изменились {len(gone)} файлов — скопирую заново", "warn",
                        gone[0] if len(gone) == 1 else "")
         extras, adopted = [], 0
-        for p, size in have.items():
+        for p, (size, mtime) in have.items():
             if p in local:
                 continue
             f = files.get(p)
             if f is not None and not f[4]:
                 continue                                  # на сервере ещё нет хеша — решим в следующий раз
+            if f is not None and f[1] == size and not with_hash:
+                # без хешей: тот же размер и та же дата изменения — считаем тем же файлом
+                if abs(mtime - f[2]) <= 2:
+                    self.db.put(p, f[1], f[2], f[4])
+                    out[p] = (f[1], f[2], f[4])
+                    adopted += 1
+                continue                                  # иначе его заменит скачивание (старый — в «Версии»)
             if f is not None and f[1] == size:
                 try:
                     if self._sha(self._arch(p)) == f[4]:
