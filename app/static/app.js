@@ -997,13 +997,26 @@ function preloadOrigClip(ph, tok) {
 }
 
 // Касание живого фото (без сдвига; и в увеличении тоже) — проиграть ролик заново, со звуком.
-// Двойного тапа нет: масштаб — щипком и колёсиком, поэтому касание срабатывает сразу.
-let tapAt = null;
-$('v-stage').addEventListener('pointerdown', (e) => { tapAt = [e.clientX, e.clientY]; });
+// На телефоне двойное касание — увеличить в этой точке или вернуть как было, поэтому одиночное
+// касание срабатывает с задержкой DOUBLE_TAP (только оно и ждёт; мышь — сразу).
+const DOUBLE_TAP = 300, DOUBLE_TAP_ZOOM = 2.5;
+let tapAt = null, lastTap = null, tapTimer = 0;
+$('v-stage').addEventListener('pointerdown', (e) => { tapAt = e.isPrimary ? [e.clientX, e.clientY] : null; });
 $('v-stage').addEventListener('pointerup', (e) => {
   if (!tapAt || Math.hypot(e.clientX - tapAt[0], e.clientY - tapAt[1]) > 10) return;
   tapAt = null;
-  replayLive();
+  if (e.pointerType !== 'touch' || e.target.tagName === 'VIDEO' || !zoomActive()) { replayLive(); return; }
+  const now = Date.now();
+  if (now - (VZ.multiAt || 0) < 400) { lastTap = null; return; }   // это конец щипка, а не касание
+  if (lastTap && now - lastTap.t < DOUBLE_TAP && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) {
+    clearTimeout(tapTimer); lastTap = null;
+    if (DR.busy) return;
+    if (VZ.s > 1.02) resetZoom(true);
+    else { const [fx, fy] = stagePoint(e.clientX, e.clientY); zoomAt(DOUBLE_TAP_ZOOM, fx, fy, true); }
+    return;
+  }
+  lastTap = { t: now, x: e.clientX, y: e.clientY };
+  clearTimeout(tapTimer); tapTimer = setTimeout(() => { lastTap = null; replayLive(); }, DOUBLE_TAP);
 });
 function replayLive() {
   const ph = st.list[V.i], vid = ph && (ph[6] & F_LIVE) && st.lib.live[ph[0]];
@@ -1289,7 +1302,7 @@ $('v-close').addEventListener('click', () => closeViewer());
 $('v-prev').addEventListener('click', () => show(V.i - 1));
 $('v-next').addEventListener('click', () => show(V.i + 1));
 // ================================================================== масштаб в просмотре
-// Щипок / растяжение, колесо мыши, Ctrl+колесо (жест трекпада), перетаскивание. Двойного тапа нет.
+// Щипок / растяжение, двойное касание (телефон), колесо мыши, Ctrl+колесо (жест трекпада), перетаскивание.
 // Свайпы влево/вправо/вниз работают только при обычном масштабе.
 
 const VZ = { s: 1, tx: 0, ty: 0, pinch: null, pan: null, moved: false, shown: 0, want: '' };
@@ -1364,6 +1377,7 @@ const tmid = (t) => stagePoint((t[0].clientX + t[1].clientX) / 2, (t[0].clientY 
 stage.addEventListener('touchstart', (e) => {
   VZ.lastTouch = Date.now();
   if (e.target.tagName === 'VIDEO') return;
+  if (e.touches.length >= 2) VZ.multiAt = Date.now();          // щипок — не касание (двойное касание)
   if (e.touches.length === 2 && zoomActive()) {
     const [mx, my] = tmid(e.touches);
     VZ.pinch = { d0: tdist(e.touches) || 1, s0: VZ.s, mx, my, tx0: VZ.tx, ty0: VZ.ty };
