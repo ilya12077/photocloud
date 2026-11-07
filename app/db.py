@@ -55,6 +55,10 @@ SCHEMA = [
     # скрытые из галереи файлы (сами файлы на ПК остаются): путь, кто скрыл, когда
     """CREATE TABLE IF NOT EXISTS hidden (
         path TEXT PRIMARY KEY, by TEXT NOT NULL, at REAL NOT NULL)""",
+    # избранное: у каждого пользователя своё
+    """CREATE TABLE IF NOT EXISTS starred (
+        user TEXT NOT NULL, path TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (user, path))
+       WITHOUT ROWID""",
     """CREATE TABLE IF NOT EXISTS geo (
          key TEXT PRIMARY KEY,          -- «широта,долгота» с точностью ~10 м
          addr TEXT NOT NULL,            -- адрес по-русски; '' — не нашёлся
@@ -236,6 +240,24 @@ class DB:
 
     def hidden_delete(self, paths: list[str]) -> None:
         self.many("DELETE FROM hidden WHERE path = ?", [(p,) for p in paths])
+
+    # ------------------------------------------------------------ избранное
+
+    def starred_load(self) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for u, p in self.run("SELECT user, path FROM starred"):
+            out.setdefault(u, set()).add(p)
+        return out
+
+    def starred_put(self, user: str, paths: list[str]) -> None:
+        now = __import__("time").time()
+        self.many("INSERT OR IGNORE INTO starred (user, path, at) VALUES (?, ?, ?)", [(user, p, now) for p in paths])
+
+    def starred_delete(self, user: str, paths: list[str]) -> None:
+        self.many("DELETE FROM starred WHERE user = ? AND path = ?", [(user, p) for p in paths])
+
+    def starred_delete_user(self, user: str) -> None:
+        self.run("DELETE FROM starred WHERE user = ?", (user,))
 
     # ------------------------------------------------------------ служебные отметки
 

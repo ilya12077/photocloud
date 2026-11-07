@@ -326,16 +326,17 @@ class Library:
         q = self.by_id.get(p.live) if p.live else None
         return q is not None and q.rel in h
 
-    def view(self, folders, hidden: bool = False) -> View:
+    def view(self, folders, hidden: bool = False, only=None, only_key=None) -> View:
         """Список только из разрешённых папок (folders=None — всё). Папки-предки разрешённых
         попадают в дерево только именами — чтобы до них можно было дойти; соседние — нет.
-        hidden=False — без скрытых файлов; True — только скрытые (страница /hidden)."""
+        hidden=False — без скрытых файлов; True — только скрытые (страница /hidden).
+        only — только эти пути (избранное пользователя), only_key — их версия для кэша."""
         views, feed, flist, hid = self._views, self._feed, self._folders, self.hidden   # один снимок
         if not self.version:
             return self._empty                  # список ещё не собран — пусто для всех
         acc = None if folders is None else (None if folders[0] is None else tuple(sorted(folders[0])),
                                             tuple(sorted(folders[1])))
-        key = (hidden, acc)
+        key = (hidden, acc, only_key)
         v = views.get(key)
         if v is not None:
             return v
@@ -349,7 +350,8 @@ class Library:
             keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, acc)]
         fmap = {old: new for new, old in enumerate(keep)}
         # в ленте нет роликов живых фото, поэтому достаточно пути самого фото
-        v = _encode([p for p in feed if (p.rel in hid) == hidden and (acc is None or folder_ok(p.rel, acc))],
+        v = _encode([p for p in feed if (p.rel in hid) == hidden and (acc is None or folder_ok(p.rel, acc))
+                     and (only is None or p.rel in only)],
                     [flist[i] for i in keep], None if acc is None else fmap)
         if len(views) > 64:
             views.clear()
