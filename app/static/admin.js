@@ -15,7 +15,7 @@ const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
-  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
+  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', user_hide: 'право скрывать фото', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
   backup_token_add: 'создан токен бэкапа', backup_token_revoke: 'отозван токен бэкапа', backup_denied: 'бэкап: неверный токен',
   hash_stop: 'остановлен подсчёт хешей', hash_verify: 'запущена проверка хешей', hash_verify_done: 'проверка хешей завершена',
@@ -147,12 +147,17 @@ async function loadOverview() {
     ['Индекс', ix.state + (ix.error ? ` (${ix.error})` : '') + (ix.meta[1] && ix.meta[0] < ix.meta[1] ? `, даты ${ix.meta[0]}/${ix.meta[1]}` : '')],
     ['Обновлён', dt(ix.built_at)],
     ...(o.hashes ? [['Хеши файлов', hashText(o.hashes, o.hashes.unhashed, o.hashes.files)]] : []),
+    ['Скрытые фото', (() => { const a = el('a', null, `${(o.hidden || 0).toLocaleString('ru')} — открыть`); a.href = '/hidden'; return a; })()],
     ['Эскизы в памяти сервера', `${mb(o.cache.thumb[0])} из ${mb(o.cache.thumb[1])}`],
     ['Превью в памяти сервера', `${mb(o.cache.preview[0])} из ${mb(o.cache.preview[1])}`],
     ['Сессий', String(o.sessions)],
     ['Работает', dur(o.uptime)],
   ];
-  $('ov-cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', v)); return c; }));
+  $('ov-cards').replaceChildren(...cards.map(([k, v]) => {
+    const c = el('div', 'card'), vv = el('div', 'v');
+    if (v instanceof Node) vv.append(v); else vv.textContent = v;
+    c.append(el('div', 'k', k), vv); return c;
+  }));
   const labels = {
     storage: 'Режим', source: 'Источник', smb_encrypt: 'Шифрование SMB', bind: 'Адрес', public_url: 'Внешний адрес',
     cookie_secure: 'Secure cookie', trusted_proxies: 'Доверенные прокси', require_proxy: 'Только через прокси',
@@ -222,7 +227,18 @@ async function loadUsers() {
         c.checked ? 'Может включать ПК' : 'Не может включать ПК').then((x) => { if (!x) c.checked = !c.checked; show(); });
       show(); lab.append(c, txt); wk.append(lab);
     }
-    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, el('td', null, dt(u.created)), ops);
+    // может ли скрывать фото из галереи и смотреть скрытые — в своих папках (админ — всегда)
+    const hd = el('td');
+    if (u.role === 'admin') hd.append(el('span', 'dim2', 'да (админ)'));
+    else {
+      const lab = el('label', 'wake-chk'), c = el('input'), txt = el('span');
+      c.type = 'checkbox'; c.checked = !!u.hide;
+      const show = () => { txt.textContent = c.checked ? 'может' : 'нельзя'; };
+      c.onchange = () => act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/hide`, { allow: c.checked }),
+        c.checked ? 'Может скрывать фото' : 'Не может скрывать фото').then((x) => { if (!x) c.checked = !c.checked; show(); });
+      show(); lab.append(c, txt); hd.append(lab);
+    }
+    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, hd, g, el('td', null, dt(u.created)), ops);
     return tr;
   }));
 }

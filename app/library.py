@@ -248,7 +248,9 @@ class Library:
         self.payload_gz = gzip.compress(b"{}")
         self._feed: list = []
         self._folders: list[str] = [""]
-        self._views: dict = {None: View(b"{}", gzip.compress(b"{}"), "", 0)}
+        self._empty = View(b"{}", gzip.compress(b"{}"), "", 0)
+        self._views: dict = {}
+        self.hidden: frozenset[str] = frozenset()     # пути скрытых из галереи файлов (задаёт main)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -308,27 +310,47 @@ class Library:
         # атомарная подмена: читатели видят либо старую, либо новую версию целиком
         self.by_id = {p.id: p for p in everything}
         self._feed, self._folders = photos, folder_list
-        self._views = {None: full}
+        self._views = {}
         self.payload, self.payload_gz, self.version = full.payload, full.gz, full.version
 
-    def view(self, folders) -> View:
+    def set_hidden(self, paths) -> None:
+        """Новый набор скрытых: списки собираются заново (по запросу, для каждого набора папок)."""
+        self.hidden = frozenset(paths)
+        self._views = {}
+
+    def is_hidden(self, p: Photo) -> bool:
+        """Скрыт сам файл или (у ролика живого фото) его фото — и наоборот."""
+        h = self.hidden
+        if p.rel in h:
+            return True
+        q = self.by_id.get(p.live) if p.live else None
+        return q is not None and q.rel in h
+
+    def view(self, folders, hidden: bool = False) -> View:
         """Список только из разрешённых папок (folders=None — всё). Папки-предки разрешённых
-        попадают в дерево только именами — чтобы до них можно было дойти; соседние — нет."""
-        views, feed, flist = self._views, self._feed, self._folders     # один снимок версии
+        попадают в дерево только именами — чтобы до них можно было дойти; соседние — нет.
+        hidden=False — без скрытых файлов; True — только скрытые (страница /hidden)."""
+        views, feed, flist, hid = self._views, self._feed, self._folders, self.hidden   # один снимок
         if not self.version:
-            return views[None]                  # список ещё не собран — пусто для всех
-        key = None if folders is None else (None if folders[0] is None else tuple(sorted(folders[0])),
+            return self._empty                  # список ещё не собран — пусто для всех
+        acc = None if folders is None else (None if folders[0] is None else tuple(sorted(folders[0])),
                                             tuple(sorted(folders[1])))
+        key = (hidden, acc)
         v = views.get(key)
         if v is not None:
             return v
-        need = {""}
-        for f in (key[0] or ()):
-            parts = f.split("/")
-            need.update("/".join(parts[:i]) for i in range(1, len(parts)))
-        keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, key)]
+        if acc is None:
+            keep = list(range(len(flist)))
+        else:
+            need = {""}
+            for f in (acc[0] or ()):
+                parts = f.split("/")
+                need.update("/".join(parts[:i]) for i in range(1, len(parts)))
+            keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, acc)]
         fmap = {old: new for new, old in enumerate(keep)}
-        v = _encode([p for p in feed if folder_ok(p.rel, key)], [flist[i] for i in keep], fmap)
+        # в ленте нет роликов живых фото, поэтому достаточно пути самого фото
+        v = _encode([p for p in feed if (p.rel in hid) == hidden and (acc is None or folder_ok(p.rel, acc))],
+                    [flist[i] for i in keep], None if acc is None else fmap)
         if len(views) > 64:
             views.clear()
         views[key] = v

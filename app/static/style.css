@@ -80,6 +80,20 @@ a { color: inherit; text-decoration: none; }
 .tile img.ok { opacity: 1; }
 .tile.broken::after { content: "⚠"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); }
 .tile:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; }
+/* --- выбор фото --- */
+.tile { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+.tile img { -webkit-user-drag: none; }
+.selmode .tile::before { content: ""; position: absolute; left: 6px; top: 6px; z-index: 2; width: 20px; height: 20px;
+  border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 3px #0008; background: #0002; box-sizing: border-box; }
+.selmode .tile.sel::before { content: "✓"; display: grid; place-items: center; background: var(--accent); border-color: var(--accent);
+  color: var(--accent-fg); font-size: 13px; font-weight: 700; line-height: 1; }
+.tile.sel { background: color-mix(in srgb, var(--accent) 22%, var(--tile)); }
+.tile.sel img { transform: scale(.86); border-radius: 6px; }
+.tile img { transition: opacity .15s, transform .12s; }
+.selbar { gap: 12px; }
+.sel-n { font-weight: 650; font-size: 16px; }
+.sel-act { margin-left: auto; }
+.sel-act:disabled { opacity: .4; cursor: default; }
 .vbadge { position: absolute; left: 6px; bottom: 5px; color: #fff; font-size: 13px; text-shadow: 0 1px 3px #000a; pointer-events: none; }
 .empty { text-align: center; color: var(--dim); padding: 60px 16px; }
 .pill { position: fixed; top: calc(var(--header-h, 57px) + 10px); left: 50%; transform: translateX(-50%); z-index: 9;

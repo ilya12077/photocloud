@@ -8,6 +8,10 @@ const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','и�
 const HEAD_H = 46;          // высота заголовка месяца, px
 const BUFFER = 1.2;         // сколько экранов рендерим сверху/снизу
 const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16, F_FOLDER = 32;
+// /hidden — та же галерея, но только скрытые фото (тем, кто может скрывать; сервер отдаёт их
+// только из папок пользователя)
+const HID = location.pathname === '/hidden';
+const HQ = HID ? '?hidden=1' : '';
 
 const st = {
   me: null,
@@ -81,13 +85,18 @@ async function enter() {
   if (m) { err = LOGIN_ERRORS[m[1]] || 'Ошибка входа'; history.replaceState(null, '', location.pathname); }
   // список файлов запрашиваем сразу, параллельно с проверкой входа — на медленном канале
   // это экономит пару «туда-обратно» до первых эскизов
-  st.libPromise = fetch('/api/library', { credentials: 'same-origin', cache: 'no-cache' }).catch(() => null);
+  st.libPromise = fetch('/api/library' + HQ, { credentials: 'same-origin', cache: 'no-cache' }).catch(() => null);
   const r = await api('/api/me', { allow401: true });
   if (r.status === 401) { st.libPromise = null; showLogin(err); return; }
   const me = await r.json(); st.me = me;
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
+  $('menu-select').hidden = !me.can_hide;
+  $('menu-hidden').hidden = !me.can_hide || HID;
+  $('menu-all').hidden = !HID;
+  $('sel-hide').hidden = HID; $('sel-show').hidden = !HID;
+  if (HID) document.title = 'Скрытые фото — ' + (me.name || 'Фотоархив');
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();
@@ -128,7 +137,7 @@ async function poll(delay) {
   stopPoll();
   if (delay) { st.pollTimer = setTimeout(() => poll(), delay); return; }
   let s;
-  try { s = await (await api('/api/status', { timeout: 15000 })).json(); }
+  try { s = await (await api('/api/status' + HQ, { timeout: 15000 })).json(); }
   catch (e) {
     if (e.message !== 'auth') { banner('Сервер недоступен, пробую снова…', null, null, true); st.pollTimer = setTimeout(() => poll(), 5000); }
     return;
@@ -205,7 +214,8 @@ async function loadLibrary(pre) {
 async function loadLibraryInner(pre) {
   if (!st.lib) banner('Загружаю список файлов…');
   // cache:'no-cache' — браузер хранит копию и спрашивает сервер по ETag (304 = 0 байт)
-  const r = pre || await api('/api/library', { cache: 'no-cache' });
+  const r = pre || await api('/api/library' + HQ, { cache: 'no-cache' });
+  if (r.status === 403 && HID) { banner('Смотреть скрытые фото может только тот, кому разрешено их скрывать', 'Ко всем фото', () => { location.href = '/'; }, true); return; }
   if (!r.ok) return;
   const j = await r.json();
   if (!j.v) return;
@@ -274,7 +284,7 @@ function render() {
   const lib = st.lib; if (!lib) return;
   const fi = st.folderIdx.get(st.folder) ?? 0;
 
-  const crumbs = [el('a', null, 'Все фото')]; crumbs[0].href = '#/';
+  const crumbs = [el('a', null, HID ? 'Скрытые фото' : 'Все фото')]; crumbs[0].href = '#/';
   if (st.folder) {
     let acc = '';
     for (const part of st.folder.split('/')) {
@@ -312,7 +322,7 @@ function render() {
   const videos = list.reduce((n, p) => n + (p[6] & F_VIDEO ? 1 : 0), 0);
   $('summary').textContent = list.length ? count(list.length) + (videos ? `, из них видео: ${videos.toLocaleString('ru')}` : '') + (st.rec && st.children[fi].length ? ' — с подпапками' : '') : '';
   $('empty').hidden = list.length > 0 || st.children[fi].length > 0;
-  $('empty').textContent = 'Здесь пусто';
+  $('empty').textContent = HID ? 'Скрытых фото здесь нет' : 'Здесь пусто';
 
   relayout(false);
 }
@@ -437,7 +447,8 @@ function buildRow(r) {
   for (let i = r.start; i < r.end; i++) {
     const ph = st.list[i];
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
-    const img = el('img'); img.alt = ''; img.decoding = 'async'; img.dataset.src = imgUrl(kind, ph);
+    if (SEL.set.has(ph[0])) b.classList.add('sel');
+    const img = el('img'); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.dataset.src = imgUrl(kind, ph);
     img.onload = () => { img.classList.add('ok'); img.dataset.loaded = '1'; b.classList.remove('broken'); };
     img.onerror = () => { if (img.getAttribute('src')) thumbFailed(img); };
     b.append(img);
@@ -565,7 +576,148 @@ async function gridPrefetch() {
   if (GP.ctl === ctl) GP.ctl = null;
 }
 
-$('grid').addEventListener('click', (e) => { const t = e.target.closest('.tile'); if (t) openViewer(+t.dataset.i); });
+$('grid').addEventListener('click', (e) => {
+  const t = e.target.closest('.tile'); if (!t) return;
+  if (Date.now() < SEL.ignoreClick) return;                 // клик после долгого нажатия
+  if (SEL.on) { selClick(+t.dataset.i, e.shiftKey); return; }
+  openViewer(+t.dataset.i);
+});
+
+// ================================================================== выбор фото (скрыть / вернуть)
+// Телефон: долгое нажатие на фото — режим выбора и само фото; не отпуская палец, ведём —
+// выбираются фото, через которые прошёл палец (по диагонали соседние не задеваем: считается
+// только середина плитки); у края экрана лента прокручивается сама. Касание — выбрать/снять.
+// Компьютер: меню ⋯ → «Выбрать фото», клик — выбрать/снять, Shift+клик — все между этим и
+// предыдущим по порядку строк. Сверху — «✕ Выбрано N» и действие.
+const SEL = { on: false, set: new Set(), anchor: -1, drag: null, press: null, ignoreClick: 0, raf: 0 };
+const LONG_PRESS = 450;
+
+function selUpdate() {
+  $('selbar').hidden = !SEL.on;
+  document.querySelector('.top > .row').hidden = SEL.on;
+  $('grid').classList.toggle('selmode', SEL.on);
+  $('sel-n').textContent = `Выбрано: ${SEL.set.size.toLocaleString('ru')}`;
+  $('sel-hide').disabled = $('sel-show').disabled = !SEL.set.size;
+}
+function selStart() { if (!st.me || !st.me.can_hide) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
+function selEnd() {
+  SEL.on = false; SEL.set.clear(); SEL.anchor = -1; SEL.drag = null;
+  for (const t of $('grid').querySelectorAll('.tile.sel')) t.classList.remove('sel');
+  selUpdate();
+}
+function selMark(i, on) {
+  const ph = st.list[i]; if (!ph) return;
+  if (on) SEL.set.add(ph[0]); else SEL.set.delete(ph[0]);
+  const t = $('grid').querySelector(`.tile[data-i="${i}"]`);
+  if (t) t.classList.toggle('sel', on);
+}
+function selClick(i, shift) {
+  const ph = st.list[i]; if (!ph) return;
+  if (shift && SEL.anchor >= 0 && SEL.anchor !== i) {
+    // все между предыдущим и этим — по порядку в ленте, то есть по строкам
+    const [a, b] = SEL.anchor < i ? [SEL.anchor, i] : [i, SEL.anchor];
+    for (let k = a; k <= b; k++) selMark(k, true);
+  } else selMark(i, !SEL.set.has(ph[0]));
+  SEL.anchor = i;
+  selUpdate();
+}
+$('menu-select').addEventListener('click', () => selStart());
+$('sel-x').addEventListener('click', () => selEnd());
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && SEL.on && gridActive()) selEnd(); });
+
+async function selApply(hide) {
+  const ids = [...SEL.set]; if (!ids.length) return;
+  const n = ids.length.toLocaleString('ru');
+  if (hide && !confirm(`Скрыть ${n} фото? Они пропадут из галереи у всех, файлы на компьютере останутся. Вернуть можно в меню ⋯ → «Скрытые фото».`)) return;
+  const btn = hide ? $('sel-hide') : $('sel-show'); btn.disabled = true;
+  try {
+    const r = await api(hide ? '/api/hide' : '/api/unhide', { method: 'POST', body: { ids } });
+    if (!r.ok) { banner(`Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
+    selEnd();
+    await loadLibrary();
+    banner(hide ? `Скрыто: ${n}` : `Возвращено в галерею: ${n}`);
+    setTimeout(() => { if (/^(Скрыто|Возвращено)/.test($('banner-text').textContent)) banner(null); }, 3000);
+  } catch (_) { btn.disabled = false; }
+}
+$('sel-hide').addEventListener('click', () => selApply(true));
+$('sel-show').addEventListener('click', () => selApply(false));
+
+// --- палец: долгое нажатие и протягивание
+function tileAt(cx, cy) {
+  // плитка под точкой, только если точка в её середине (без 20 % у краёв): идя по диагонали
+  // через угол, соседние плитки не цепляем
+  const t = document.elementFromPoint(cx, cy); const tile = t && t.closest && t.closest('.tile');
+  if (!tile || !$('grid').contains(tile)) return -1;
+  const r = tile.getBoundingClientRect(), m = Math.min(r.width, r.height) * 0.2;
+  return cx > r.left + m && cx < r.right - m && cy > r.top + m && cy < r.bottom - m ? +tile.dataset.i : -1;
+}
+function dragTo(cx, cy) {
+  // путь пальца — в координатах страницы (с учётом прокрутки), шагами по 1/6 плитки
+  const d = SEL.drag, px = cx, py = cy + window.scrollY;
+  const dx = px - d.px, dy = py - d.py, len = Math.hypot(dx, dy);
+  const steps = Math.max(1, Math.ceil(len / Math.max(4, L.tileH / 6)));
+  for (let k = 1; k <= steps; k++) {
+    const i = tileAt(d.px + dx * k / steps, d.py + dy * k / steps - window.scrollY);
+    if (i >= 0 && i !== d.last) { selMark(i, d.add); d.last = i; }
+  }
+  d.px = px; d.py = py; d.cx = cx; d.cy = cy;
+  selUpdate();
+}
+function autoScroll() {
+  SEL.raf = 0;
+  const d = SEL.drag; if (!d) return;
+  const top = $('banner').getBoundingClientRect().bottom || 60, zone = 70;
+  let v = 0;
+  if (d.cy < top + zone) v = -Math.ceil((top + zone - d.cy) / 4);
+  else if (d.cy > innerHeight - zone) v = Math.ceil((d.cy - innerHeight + zone) / 4);
+  if (!v) return;
+  window.scrollBy(0, clamp(v, -24, 24));
+  dragTo(d.cx, d.cy);
+  SEL.raf = requestAnimationFrame(autoScroll);
+}
+$('grid').addEventListener('touchstart', (e) => {
+  if (e.touches.length !== 1 || !st.me || !st.me.can_hide) {
+    clearTimeout(SEL.press && SEL.press.t); SEL.press = null;
+    if (SEL.drag) { SEL.drag = null; cancelAnimationFrame(SEL.raf); SEL.raf = 0; }   // второй палец — щипок
+    return;
+  }
+  const t0 = e.touches[0], tile = e.target.closest('.tile'); if (!tile) return;
+  const i = +tile.dataset.i, x = t0.clientX, y = t0.clientY;
+  clearTimeout(SEL.press && SEL.press.t);
+  SEL.press = { x, y, t: setTimeout(() => {
+    SEL.press = null;
+    if (!gridActive() || Z.pinch) return;
+    if (!SEL.on) selStart();
+    const ph = st.list[i]; if (!ph) return;
+    const add = !SEL.set.has(ph[0]);
+    selMark(i, add); SEL.anchor = i;
+    SEL.drag = { add, last: i, px: x, py: y + window.scrollY, cx: x, cy: y };
+    if (navigator.vibrate) navigator.vibrate(20);
+    selUpdate();
+  }, LONG_PRESS) };
+}, { passive: true });
+$('grid').addEventListener('touchmove', (e) => {
+  const t0 = e.touches[0];
+  if (SEL.press && (e.touches.length > 1 || Math.hypot(t0.clientX - SEL.press.x, t0.clientY - SEL.press.y) > 10)) {
+    clearTimeout(SEL.press.t); SEL.press = null;           // начали листать — это не долгое нажатие
+  }
+  if (!SEL.drag || e.touches.length !== 1) return;
+  e.preventDefault();                                     // пока выбираем, лента сама не листается
+  dragTo(t0.clientX, t0.clientY);
+  if (!SEL.raf) SEL.raf = requestAnimationFrame(autoScroll);
+}, { passive: false });
+function touchDone(e) {
+  if (SEL.press) { clearTimeout(SEL.press.t); SEL.press = null; }
+  if (SEL.drag) {
+    SEL.drag = null; cancelAnimationFrame(SEL.raf); SEL.raf = 0;
+    // палец отпустили — это не касание (клик браузер шлёт сразу после touchend, если вообще шлёт)
+    SEL.ignoreClick = Date.now() + 250;
+    if (e.cancelable) e.preventDefault();
+  }
+}
+$('grid').addEventListener('touchend', touchDone, { passive: false });
+$('grid').addEventListener('touchcancel', touchDone, { passive: false });
+$('grid').addEventListener('contextmenu', (e) => { if (e.target.closest('.tile') && (SEL.on || SEL.press)) e.preventDefault(); });
 
 // плашка с текущим месяцем при прокрутке
 let pillT = 0;
@@ -1221,6 +1373,7 @@ async function fillInfo() {
   extra.replaceChildren();
   const mp = info.width && info.height ? `${info.width} × ${info.height} (${(info.width * info.height / 1e6).toFixed(1)} Мп)` : '';
   if (mp || info.camera) extra.append(infoRows([['Разрешение', mp], ['Камера', info.camera]]));
+  if (info.hidden_by) extra.append(infoRows([['Скрыто', `${info.hidden_by}, ${fmt.format(new Date(info.hidden_at * 1000))}`]]));
   if (info.lat == null) {
     extra.append(el('h3', null, 'Местоположение'), el('div', 'dim', 'В файле нет координат.'));
     return;

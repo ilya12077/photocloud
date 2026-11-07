@@ -52,6 +52,9 @@ SCHEMA = [
          name TEXT NOT NULL, user TEXT NOT NULL,
          created REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
          report TEXT NOT NULL DEFAULT '{}', stale_sent INTEGER NOT NULL DEFAULT 0)""",
+    # скрытые из галереи файлы (сами файлы на ПК остаются): путь, кто скрыл, когда
+    """CREATE TABLE IF NOT EXISTS hidden (
+        path TEXT PRIMARY KEY, by TEXT NOT NULL, at REAL NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS geo (
          key TEXT PRIMARY KEY,          -- «широта,долгота» с точностью ~10 м
          addr TEXT NOT NULL,            -- адрес по-русски; '' — не нашёлся
@@ -221,6 +224,18 @@ class DB:
         if n:
             self.run("DELETE " + q, (before,))
         return n
+
+    # ------------------------------------------------------------ скрытые файлы
+
+    def hidden_load(self) -> dict[str, tuple[str, float]]:
+        return {p: (by, at) for p, by, at in self.run("SELECT path, by, at FROM hidden")}
+
+    def hidden_put(self, paths: list[str], by: str) -> None:
+        now = __import__("time").time()
+        self.many("INSERT OR IGNORE INTO hidden (path, by, at) VALUES (?, ?, ?)", [(p, by, now) for p in paths])
+
+    def hidden_delete(self, paths: list[str]) -> None:
+        self.many("DELETE FROM hidden WHERE path = ?", [(p,) for p in paths])
 
     # ------------------------------------------------------------ служебные отметки
 
