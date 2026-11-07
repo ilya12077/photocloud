@@ -555,10 +555,27 @@ function buildRow(r) {
   return row;
 }
 
-function loadVisible(withBuffer) {
+function screenPending() {
+  // на экране есть эскизы, которые запрошены и ещё не пришли
+  const vh = window.innerHeight;
+  for (const [, node] of L.rendered) {
+    const r = node.getBoundingClientRect();
+    if (r.bottom <= 0 || r.top >= vh) continue;
+    for (const img of node.querySelectorAll('img')) if (img.getAttribute('src') && !img.dataset.loaded) return true;
+  }
+  return false;
+}
+
+function loadVisible(withBuffer, wait = 0) {
   if (L.fast) return;
   // во время прокрутки запрашиваем только то, что на экране; запас сверху/снизу — когда
-  // прокрутка замрёт на 200 мс. Иначе сервер тратит время на то, мимо чего уже пролистали.
+  // прокрутка замрёт на 200 мс И эскизы на экране догрузятся. Сервер отдаёт сетку «сначала
+  // самые свежие запросы», и запас, запрошенный раньше времени, обгонял бы видимые плитки.
+  if (withBuffer && wait < 40 && screenPending()) {
+    loadVisible(false);
+    clearTimeout(L.bufT); L.bufT = setTimeout(() => loadVisible(true, wait + 1), 150);
+    return;
+  }
   const vh = window.innerHeight, margin = withBuffer ? vh * BUFFER : vh * 0.25;
   for (const [, node] of L.rendered) {
     const r = node.getBoundingClientRect();
