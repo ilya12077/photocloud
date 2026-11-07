@@ -15,7 +15,7 @@ const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
-  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', group: 'фото сгруппированы', ungroup: 'группа разобрана', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', delete_mark: 'помечены на удаление', delete_unmark: 'снята пометка на удаление', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
+  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', group: 'фото сгруппированы', vthumbs: 'подсчёт эскизов видео', ungroup: 'группа разобрана', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', delete_mark: 'помечены на удаление', delete_unmark: 'снята пометка на удаление', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
   unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
   backup_token_add: 'создан токен бэкапа', backup_token_revoke: 'отозван токен бэкапа', backup_denied: 'бэкап: неверный токен',
   hash_stop: 'остановлен подсчёт хешей', hash_verify: 'запущена проверка хешей', hash_verify_done: 'проверка хешей завершена',
@@ -150,6 +150,14 @@ async function loadOverview() {
     ['Обновлён', dt(ix.built_at)],
     ...(o.hashes ? [['Хеши файлов', hashText(o.hashes, o.hashes.unhashed, o.hashes.files)]] : []),
     // число — ссылка на свои скрытые (/hidden)
+    ['Эскизы видео в базе', (() => {
+      const v = o.vthumbs || {}; vtRunning = v.state === 'running';
+      $('act-vthumbs').textContent = vtRunning ? 'Остановить эскизы видео' : 'Посчитать эскизы видео';
+      const base = `${(v.stored || 0).toLocaleString('ru')} из ${(v.videos || 0).toLocaleString('ru')} (${mb(v.bytes || 0)})`;
+      if (vtRunning) return `${base} · считаются: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}`;
+      return base + ({ stopped: ' · подсчёт остановлен', pc: ' · ПК выключился — продолжится по кнопке' }[v.state] || '')
+        + (v.failed ? ` · не вышло: ${v.failed}` : '');
+    })()],
     ['Скрыто (у всех пользователей)', (() => { const a = el('a', null, (o.hidden || 0).toLocaleString('ru')); a.href = '/hidden'; a.title = 'Мои скрытые фото'; return a; })()],
     ['На удаление', `${(o.delete_marks || 0).toLocaleString('ru')} (удалит клиент на ПК — пока его нет)`],
     ['Эскизы в памяти сервера', `${mb(o.cache.thumb[0])} из ${mb(o.cache.thumb[1])}`],
@@ -179,6 +187,11 @@ async function loadOverview() {
 }
 
 $('act-reindex').onclick = () => act(() => api('/api/reindex', {}), 'Сканирование запущено');
+// эскизы видео в базе: идёт подсчёт — кнопка останавливает
+$('act-vthumbs').onclick = () => (vtRunning
+  ? act(() => api('/api/admin/vthumbs/stop', {}), 'Подсчёт остановлен')
+  : act(() => api('/api/admin/vthumbs/start', {}), 'Считаю эскизы видео'));
+let vtRunning = false;
 $('act-wake').onclick = () => act(() => api('/api/wake', {}), 'Команда отправлена');
 $('act-notify').onclick = () => act(() => api('/api/admin/notify-test', {}), 'Уведомление отправлено');
 $('act-cache').onclick = () => act(() => api('/api/admin/cache/clear', {}), 'Кэш очищен').then(loadOverview);

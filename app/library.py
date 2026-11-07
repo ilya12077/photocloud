@@ -468,6 +468,9 @@ class Library:
             gone = db.info_prune(keep)
             if gone:
                 log.info("подробности: убрано %d записей об отсутствующих файлах", gone)
+            gone = db.vthumbs_prune(keep)
+            if gone:
+                log.info("эскизы видео: убрано %d об отсутствующих файлах", gone)
             have = db.info_keys()
         except Exception as e:  # noqa: BLE001
             log.warning("подробности: база недоступна (%s)", e)

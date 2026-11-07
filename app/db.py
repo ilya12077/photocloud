@@ -65,6 +65,9 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS user_groups (
         user TEXT NOT NULL, path TEXT NOT NULL, gid TEXT NOT NULL, cover INTEGER NOT NULL DEFAULT 0, at REAL NOT NULL,
         PRIMARY KEY (user, path)) WITHOUT ROWID""",
+    # самые маленькие эскизы видео (ffmpeg долгий): ключ файла (путь+размер+mtime), формат, байты
+    """CREATE TABLE IF NOT EXISTS vthumbs (
+        key TEXT PRIMARY KEY, fmt TEXT NOT NULL, data BLOB NOT NULL) WITHOUT ROWID""",
     # избранное: у каждого пользователя своё
     """CREATE TABLE IF NOT EXISTS starred (
         user TEXT NOT NULL, path TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (user, path))
@@ -311,6 +314,29 @@ class DB:
         """Пользователя удалили: его скрытые, группы и избранное больше не нужны."""
         for t in ("user_hidden", "user_groups", "starred"):
             self.run(f"DELETE FROM {t} WHERE user = ?", (user,))
+
+    # ------------------------------------------------------------ эскизы видео
+
+    def vthumb_get(self, key: str, fmt: str) -> bytes | None:
+        r = self.run("SELECT data FROM vthumbs WHERE key = ? AND fmt = ?", (key, fmt))
+        return r[0][0] if r else None
+
+    def vthumb_put(self, key: str, fmt: str, data: bytes) -> None:
+        self.run("INSERT OR REPLACE INTO vthumbs (key, fmt, data) VALUES (?, ?, ?)", (key, fmt, data))
+
+    def vthumb_keys(self, fmt: str) -> set[str]:
+        return {k for (k,) in self.run("SELECT key FROM vthumbs WHERE fmt = ?", (fmt,))}
+
+    def vthumb_stats(self) -> tuple[int, int]:
+        n, b = self.run("SELECT count(*), coalesce(sum(length(data)), 0) FROM vthumbs")[0]
+        return int(n), int(b)
+
+    def vthumbs_prune(self, keep: set[str]) -> int:
+        """Эскизы файлов, которых больше нет (переименованы, удалены, изменены)."""
+        gone = [(k,) for (k,) in self.run("SELECT key FROM vthumbs") if k not in keep]
+        if gone:
+            self.many("DELETE FROM vthumbs WHERE key = ?", gone)
+        return len(gone)
 
     # ------------------------------------------------------------ избранное
 

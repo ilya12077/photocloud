@@ -1119,6 +1119,12 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
         raise HTTPException(415)
     data = None
     timing = ""
+    # самый маленький эскиз видео хранится в базе: посчитали раз — дальше сразу (и без ПК)
+    vkeep = p.video and kind == "s"
+    if vkeep and cache.get(key) is None:
+        stored = await run_in_threadpool(db.vthumb_get, p.cache_key(), S.image_format)
+        if stored is not None:
+            cache.put(key, stored)
     try:
         for _ in range(3):
             data = cache.get(key)
@@ -1180,6 +1186,8 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
                 timing = ", ".join(f"{k};dur={v:.1f}" for k, v in tm.items() if k != "src") + \
                     (", src;desc=embedded" if tm.get("src") else "")
                 cache.put(key, data)
+                if vkeep:
+                    await run_in_threadpool(db.vthumb_put, p.cache_key(), S.image_format, data)
                 fut.set_result(data)
                 break
             except BaseException as e:
@@ -1305,6 +1313,69 @@ def _info_from_file(p) -> dict:
 
 
 library.info_reader = _info_from_file      # фоновый сбор подробностей после сканирования
+
+
+# ---- эскизы видео в базе: «Посчитать эскизы видео» — все, которых ещё нет (по одному, в фоне)
+
+class VT:
+    state = ""          # "" | running | stopped | done | pc
+    done = total = made = failed = 0
+    stop = threading.Event()
+    thread: threading.Thread | None = None
+
+
+def _vthumbs_run() -> None:
+    fmt, box = S.image_format, S.thumb_small_size
+    try:
+        have = db.vthumb_keys(fmt)
+    except Exception as e:  # noqa: BLE001
+        log.warning("эскизы видео: база недоступна (%s)", e)
+        VT.state = ""
+        return
+    todo = [p for p in library.by_id.values() if p.video and not p.live and p.cache_key() not in have]
+    VT.done, VT.total, VT.made, VT.failed, VT.state = 0, len(todo), 0, 0, "running"
+    log.info("эскизы видео: считаю %d", len(todo))
+    t0 = time.time()
+    for p in todo:
+        if VT.stop.is_set():
+            VT.state = "stopped"
+            break
+        try:
+            data = _produce(p, box, S.thumb_quality, {})
+            db.vthumb_put(p.cache_key(), fmt, data)
+            thumb_cache.put(("s", p.id, p.mtime, p.size), data)
+            VT.made += 1
+        except (ConnectionError, TimeoutError):
+            VT.state = "pc"                           # ПК выключился — продолжим по кнопке
+            break
+        except Exception:  # noqa: BLE001 — битое видео: пропускаем
+            VT.failed += 1
+        VT.done += 1
+    else:
+        VT.state = "done"
+    log.info("эскизы видео: готово %d из %d за %.0fс, не вышло %d", VT.made, VT.total, time.time() - t0, VT.failed)
+
+
+@app.post("/api/admin/vthumbs/start", dependencies=[Depends(require_csrf)])
+async def admin_vthumbs_start(request: Request, s: Session = Depends(require_admin)):
+    if VT.thread is not None and VT.thread.is_alive():
+        return no_store(JSONResponse({"ok": True, "running": True}))
+    if not FFMPEG:
+        return _bad("нет ffmpeg")
+    if not await PC.is_up():
+        raise HTTPException(409, "pc down")
+    VT.stop.clear()
+    # «meta…» — фоновый поток: чтение с ПК уступает эскизам и просмотру
+    VT.thread = threading.Thread(target=_vthumbs_run, name="meta-vthumbs", daemon=True)
+    VT.thread.start()
+    audit("vthumbs", s.user, ip_of(request), "запущен подсчёт эскизов видео")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/vthumbs/stop", dependencies=[Depends(require_csrf)])
+async def admin_vthumbs_stop(_: Session = Depends(require_admin)):
+    VT.stop.set()
+    return no_store(JSONResponse({"ok": True}))
 
 
 @app.post("/api/admin/info/stop", dependencies=[Depends(require_csrf)])
@@ -2368,8 +2439,11 @@ async def admin_overview(_: Session = Depends(require_admin)):
     videos = sum(1 for p in photos if p.video)
     unhashed = await run_in_threadpool(_unhashed) if tokens.any() else 0
     n_hidden = await run_in_threadpool(db.hidden_count)                     # у всех пользователей
+    vt_n, vt_b = await run_in_threadpool(db.vthumb_stats)
     return no_store(JSONResponse({
         "hidden": n_hidden,
+        "vthumbs": {"stored": vt_n, "bytes": vt_b, "videos": videos, "state": VT.state, "done": VT.done,
+                    "total": VT.total, "failed": VT.failed},
         "delete_marks": sum(1 for rel in list(_marks) if (q := _by_rel(rel)) is not None and not (q.video and q.live)),
         "version": config.app_version(),
         "uptime": int(time.time() - STARTED),
