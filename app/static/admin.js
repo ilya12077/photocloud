@@ -147,7 +147,7 @@ async function loadOverview() {
     ['Дата из имени файла', ix.files ? `${ix.with_name_date.toLocaleString('ru')} (${Math.round(ix.with_name_date / ix.files * 100)}%)` : '—'],
     ['Год по папке', ix.files ? `${(ix.with_folder_year ?? 0).toLocaleString('ru')} (${Math.round((ix.with_folder_year ?? 0) / ix.files * 100)}%)` : '—'],
     ['Индекс', ix.state + (ix.error ? ` (${ix.error})` : '') + (ix.meta[1] && ix.meta[0] < ix.meta[1] ? `, даты ${ix.meta[0]}/${ix.meta[1]}` : '')],
-    ['Обновлён', dt(ix.built_at)],
+    ['Список файлов обновлён', dt(ix.built_at)],
     ...(o.hashes ? [['Хеши файлов', hashText(o.hashes, o.hashes.unhashed, o.hashes.files)]] : []),
     // число — ссылка на свои скрытые (/hidden)
     ['Эскизы видео в базе', (() => {
