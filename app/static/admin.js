@@ -156,7 +156,7 @@ async function loadOverview() {
       const base = `${(v.stored || 0).toLocaleString('ru')} из ${(v.videos || 0).toLocaleString('ru')} (${mb(v.bytes || 0)})`;
       if (vtRunning) return `${base} · считаются: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}`;
       return base + ({ stopped: ' · подсчёт остановлен', pc: ' · ПК выключился — продолжится по кнопке' }[v.state] || '')
-        + (v.failed ? ` · не вышло: ${v.failed}` : '');
+        + (v.failed ? ` · не вышло: ${v.failed}` : '') + (v.audio ? ` · только звук (не показываются): ${v.audio}` : '');
     })()],
     ['Скрыто (у всех пользователей)', (() => { const a = el('a', null, (o.hidden || 0).toLocaleString('ru')); a.href = '/hidden'; a.title = 'Мои скрытые фото'; return a; })()],
     ['На удаление', `${(o.delete_marks || 0).toLocaleString('ru')} (удалит клиент на ПК — пока его нет)`],

@@ -253,6 +253,13 @@ class Library:
         self._folders: list[str] = [""]
         self._empty = View(b"{}", gzip.compress(b"{}"), "", 0)
         self._views: dict = {}
+        # видео без видеодорожки (только звук) — в ленте их нет; ключи файлов, хранятся в базе
+        self.audio: set[str] = set()
+        if db is not None:
+            try:
+                self.audio = db.vthumb_keys("audio")
+            except Exception:  # noqa: BLE001
+                pass
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -319,6 +326,20 @@ class Library:
         """Скрытые, группы или избранное пользователя изменились — списки соберутся заново."""
         self._views = {}
 
+    def is_audio(self, p) -> bool:
+        return p.video and p.cache_key() in self.audio
+
+    def mark_audio(self, p) -> bool:
+        """Файл оказался только звуком: убрать из ленты. True — если это новость."""
+        k = p.cache_key()
+        if k in self.audio:
+            return False
+        self.audio = self.audio | {k}
+        if self.cache.db is not None:
+            self.cache.db.vthumb_put(k, "audio", b"")
+        self._views = {}
+        return True
+
     def view(self, folders, hide=frozenset(), only=None, groups=None, key=None) -> View:
         """Список только из разрешённых папок (folders=None — всё). Папки-предки разрешённых
         попадают в дерево только именами — чтобы до них можно было дойти; соседние — нет.
@@ -344,7 +365,9 @@ class Library:
             keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, acc)]
         fmap = {old: new for new, old in enumerate(keep)}
         # в ленте нет роликов живых фото, поэтому достаточно пути самого фото
+        audio = self.audio
         v = _encode([p for p in feed if p.rel not in hide and (only is None or p.rel in only)
+                     and not (p.video and audio and p.cache_key() in audio)
                      and (acc is None or folder_ok(p.rel, acc))],
                     [flist[i] for i in keep], None if acc is None else fmap, groups)
         if len(views) > 64:
@@ -470,6 +493,7 @@ class Library:
                 log.info("подробности: убрано %d записей об отсутствующих файлах", gone)
             gone = db.vthumbs_prune(keep)
             if gone:
+                self.audio = self.audio & keep
                 log.info("эскизы видео: убрано %d об отсутствующих файлах", gone)
             have = db.info_keys()
         except Exception as e:  # noqa: BLE001

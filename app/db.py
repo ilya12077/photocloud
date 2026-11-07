@@ -328,7 +328,7 @@ class DB:
         return {k for (k,) in self.run("SELECT key FROM vthumbs WHERE fmt = ?", (fmt,))}
 
     def vthumb_stats(self) -> tuple[int, int]:
-        n, b = self.run("SELECT count(*), coalesce(sum(length(data)), 0) FROM vthumbs")[0]
+        n, b = self.run("SELECT count(*), coalesce(sum(length(data)), 0) FROM vthumbs WHERE fmt != 'audio'")[0]
         return int(n), int(b)
 
     def vthumbs_prune(self, keep: set[str]) -> int:

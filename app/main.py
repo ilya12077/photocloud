@@ -1206,6 +1206,11 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
             raise _gone(p) from None             # эскиз удалённого файла: 404, а не «ПК выключен»
         PC.suspect()
         raise HTTPException(503, "pc") from None
+    except video.NoVideo:
+        # только звук: в ленте такого файла больше не будет
+        if await run_in_threadpool(library.mark_audio, p):
+            log.info("%s — только звук, убираю из ленты", p.rel)
+        raise HTTPException(404, "audio") from None
     except (UnidentifiedImageError, Image.DecompressionBombWarning, Image.DecompressionBombError,
             OSError, ValueError, SyntaxError, MemoryError, video.subprocess.TimeoutExpired) as e:
         # одну и ту же неудачу видят все, кто ждал этот эскиз, — в лог пишем один раз
@@ -1319,7 +1324,7 @@ library.info_reader = _info_from_file      # фоновый сбор подро�
 
 class VT:
     state = ""          # "" | running | stopped | done | pc
-    done = total = made = failed = 0
+    done = total = made = failed = audio = 0
     stop = threading.Event()
     thread: threading.Thread | None = None
 
@@ -1327,13 +1332,13 @@ class VT:
 def _vthumbs_run() -> None:
     fmt, box = S.image_format, S.thumb_small_size
     try:
-        have = db.vthumb_keys(fmt)
+        have = db.vthumb_keys(fmt) | db.vthumb_keys("audio")
     except Exception as e:  # noqa: BLE001
         log.warning("эскизы видео: база недоступна (%s)", e)
         VT.state = ""
         return
     todo = [p for p in library.by_id.values() if p.video and not p.live and p.cache_key() not in have]
-    VT.done, VT.total, VT.made, VT.failed, VT.state = 0, len(todo), 0, 0, "running"
+    VT.done, VT.total, VT.made, VT.failed, VT.audio, VT.state = 0, len(todo), 0, 0, 0, "running"
     log.info("эскизы видео: считаю %d", len(todo))
     t0 = time.time()
     for p in todo:
@@ -1345,6 +1350,9 @@ def _vthumbs_run() -> None:
             db.vthumb_put(p.cache_key(), fmt, data)
             thumb_cache.put(("s", p.id, p.mtime, p.size), data)
             VT.made += 1
+        except video.NoVideo:
+            if library.mark_audio(p):
+                VT.audio += 1
         except (ConnectionError, TimeoutError):
             VT.state = "pc"                           # ПК выключился — продолжим по кнопке
             break
@@ -1353,7 +1361,8 @@ def _vthumbs_run() -> None:
         VT.done += 1
     else:
         VT.state = "done"
-    log.info("эскизы видео: готово %d из %d за %.0fс, не вышло %d", VT.made, VT.total, time.time() - t0, VT.failed)
+    log.info("эскизы видео: готово %d из %d за %.0fс, не вышло %d, только звук %d", VT.made, VT.total,
+             time.time() - t0, VT.failed, VT.audio)
 
 
 @app.post("/api/admin/vthumbs/start", dependencies=[Depends(require_csrf)])
@@ -2435,7 +2444,7 @@ async def admin_setup_needed():
 async def admin_overview(_: Session = Depends(require_admin)):
     up = await PC.is_up()
     # считаем только то, что видно в ленте: ролики живых фото — часть снимка, а не отдельный файл
-    photos = [p for p in library.by_id.values() if not (p.video and p.live)]
+    photos = [p for p in library.by_id.values() if not (p.video and p.live) and not library.is_audio(p)]
     videos = sum(1 for p in photos if p.video)
     unhashed = await run_in_threadpool(_unhashed) if tokens.any() else 0
     n_hidden = await run_in_threadpool(db.hidden_count)                     # у всех пользователей
@@ -2443,7 +2452,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
     return no_store(JSONResponse({
         "hidden": n_hidden,
         "vthumbs": {"stored": vt_n, "bytes": vt_b, "videos": videos, "state": VT.state, "done": VT.done,
-                    "total": VT.total, "failed": VT.failed},
+                    "total": VT.total, "failed": VT.failed, "audio": len(library.audio)},
         "delete_marks": sum(1 for rel in list(_marks) if (q := _by_rel(rel)) is not None and not (q.video and q.live)),
         "version": config.app_version(),
         "uptime": int(time.time() - STARTED),

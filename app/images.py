@@ -16,7 +16,10 @@ try:  # HEIC с айфонов
 except Exception:  # noqa: BLE001
     pass
 
-Image.MAX_IMAGE_PIXELS = 200_000_000           # защита от «бомб» распаковки
+# Защита от «бомб» распаковки. JPEG декодируется через draft сразу в 1/2…1/8 масштаба,
+# поэтому ему можно больше (телефоны снимают по 200 Мп = 16384×12288), остальным — 200 Мп.
+Image.MAX_IMAGE_PIXELS = 1_000_000_000
+MAX_FULL_PIXELS = 200_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 warnings.simplefilter("error", Image.DecompressionBombWarning)
 
@@ -235,6 +238,8 @@ def decode(data: bytes, box: int, tm: dict | None = None):
         # Просим ровно столько, чтобы ДЛИННАЯ сторона была >= box (а не обе), — так draft
         # чаще берёт 1/8 вместо 1/4.
         w, h = im.size
+        if im.format != "JPEG" and w * h > MAX_FULL_PIXELS:
+            raise Image.DecompressionBombError(f"{w}x{h} — слишком большое изображение")
         req = (box, max(1, box * h // w)) if w >= h else (max(1, box * w // h), box)
         im.draft("RGB", req)
         im = ImageOps.exif_transpose(im)
