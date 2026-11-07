@@ -13,9 +13,9 @@ on:
   release:
     types: [published]
   # сборка и при изменении app/VERSION (версия сервера) — новая версия без релиза в интерфейсе.
-  # master -> теги <версия> и latest; ветка backup-cluster -> только тег backup-cluster
+  # master -> теги <версия> и latest; ветка beta -> только тег beta (основные не трогает)
   push:
-    branches: [master, backup-cluster]
+    branches: [master, beta]
     paths: [app/VERSION]
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
             type=ref,event=tag
             type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-            type=raw,value=backup-cluster,enable=${{ github.ref == 'refs/heads/backup-cluster' }}
+            type=raw,value=beta,enable=${{ github.ref == 'refs/heads/beta' }}
           labels: |
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
       

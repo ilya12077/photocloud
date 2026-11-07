@@ -60,6 +60,8 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
 library = Library(S.tz, S.meta_threads, db)
+_hidden_meta: dict[str, tuple[str, float]] = db.hidden_load()     # путь -> (кто скрыл, когда)
+library.set_hidden(_hidden_meta)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
 transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
@@ -253,8 +255,11 @@ def user_folders(s: Session):
 
 def visible(s: Session, p) -> bool:
     """Файл p в папках, доступных пользователю. Все запросы по id проходят через это:
-    чужой id отвечает 404 — так же, как несуществующий."""
-    return p is not None and folder_ok(p.rel, user_folders(s))
+    чужой id отвечает 404 — так же, как несуществующий. Скрытый файл — тоже 404, кроме тех,
+    кто может скрывать (и смотреть скрытое): им — только в их же папках."""
+    if p is None or not folder_ok(p.rel, user_folders(s)):
+        return False
+    return not library.is_hidden(p) or users.can_hide(s.user)
 
 
 async def require_admin(s: Session = Depends(require_user)) -> Session:
@@ -321,6 +326,12 @@ def _versioned_html(name: str) -> bytes:
 
 
 PAGES = {"/": _versioned_html("index.html"), "/admin": _versioned_html("admin.html")}
+
+
+@app.get("/hidden", include_in_schema=False)
+async def hidden_page():
+    """Скрытые фото — та же галерея (кто может смотреть — решает /api/library?hidden=1)."""
+    return Response(PAGES["/"], media_type="text/html; charset=utf-8", headers={"cache-control": "no-cache"})
 
 
 @app.get("/", include_in_schema=False)
@@ -463,7 +474,7 @@ async def me(s: Session = Depends(require_user)):
     return no_store(JSONResponse({"user": s.user, "role": s.role, "name": S.public_name,  # type: ignore[attr-defined]
                                   "sizes": {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size},
                                   "video": bool(FFMPEG), "transcode": TRANSCODE,
-                                  "can_wake": users.can_wake(s.user)}))
+                                  "can_wake": users.can_wake(s.user), "can_hide": users.can_hide(s.user)}))
 
 
 # ---------------------------------------------------------------- ПК и индекс
@@ -621,9 +632,10 @@ async def _pc_watch() -> None:
 
 
 @app.get("/api/status")
-async def status(s: Session = Depends(require_user)):
+async def status(hidden: int = 0, s: Session = Depends(require_user)):
     pc = pc_state(await PC.is_up())
-    view = await run_in_threadpool(library.view, user_folders(s))
+    # на странице скрытых — версия и число скрытых (у кого нет права — обычный список)
+    view = await run_in_threadpool(library.view, user_folders(s), bool(hidden) and users.can_hide(s.user))
     if pc == "up":
         PC.wake_at = 0
     return no_store(JSONResponse({
@@ -669,8 +681,11 @@ async def reindex(_: Session = Depends(require_admin)):
 
 
 @app.get("/api/library")
-async def get_library(request: Request, s: Session = Depends(require_user)):
-    v = await run_in_threadpool(library.view, user_folders(s))     # только свои папки
+async def get_library(request: Request, hidden: int = 0, s: Session = Depends(require_user)):
+    if hidden and not users.can_hide(s.user):
+        raise HTTPException(403, "hide not allowed")
+    # только свои папки; hidden=1 — только скрытые из них (страница /hidden)
+    v = await run_in_threadpool(library.view, user_folders(s), bool(hidden))
     etag = f'"{v.version}"'
     headers = {"etag": etag, "cache-control": "private, no-cache", "vary": "cookie, accept-encoding"}
     if v.version and request.headers.get("if-none-match") == etag:
@@ -679,6 +694,75 @@ async def get_library(request: Request, s: Session = Depends(require_user)):
         headers["content-encoding"] = "gzip"
         return Response(v.gz, media_type="application/json", headers=headers)
     return Response(v.payload, media_type="application/json", headers=headers)
+
+
+# ---------------------------------------------------------------- скрытые фото
+# Скрыть — убрать из галереи у всех; файл на ПК остаётся (и в бэкапе тоже). Может тот, кому
+# разрешено (админ — всегда), и только в своих папках; скрытые он же видит на /hidden.
+
+HIDE_MAX = 10000          # файлов за раз
+
+
+async def _hide_targets(request: Request, s: Session) -> list:
+    if not users.can_hide(s.user):
+        raise HTTPException(403, "hide not allowed")
+    ids = (await read_json(request, limit=HIDE_MAX * 12 + 100)).get("ids")
+    if not isinstance(ids, list) or not ids or len(ids) > HIDE_MAX or not all(isinstance(i, str) for i in ids):
+        return []
+    access = user_folders(s)
+    out = []
+    for pid in dict.fromkeys(ids):
+        p = library.get(pid)
+        if p is None or not folder_ok(p.rel, access):
+            continue                                  # чужое и несуществующее молча пропускаем
+        out.append(p)
+        q = library.get(p.live) if p.live else None   # живое фото — вместе с роликом
+        if q is not None:
+            out.append(q)
+    return out
+
+
+def _hidden_changed() -> None:
+    global _hidden_meta
+    _hidden_meta = db.hidden_load()
+    library.set_hidden(_hidden_meta)
+
+
+def _sample(ps) -> str:
+    names = [p.rel for p in ps if not (p.video and p.live)]
+    return ", ".join(names[:5]) + (f" и ещё {len(names) - 5}" if len(names) > 5 else "")
+
+
+@app.post("/api/hide", dependencies=[Depends(require_csrf)])
+async def hide_photos(request: Request, s: Session = Depends(require_user)):
+    ps = await _hide_targets(request, s)
+    if not ps:
+        return _bad("нечего скрывать")
+
+    def go() -> None:
+        db.hidden_put([p.rel for p in ps], s.user)
+        _hidden_changed()
+
+    await run_in_threadpool(go)
+    n = sum(1 for p in ps if not (p.video and p.live))
+    audit("hide", s.user, ip_of(request), f"{n}: {_sample(ps)}")
+    return no_store(JSONResponse({"ok": True, "count": n}))
+
+
+@app.post("/api/unhide", dependencies=[Depends(require_csrf)])
+async def unhide_photos(request: Request, s: Session = Depends(require_user)):
+    ps = await _hide_targets(request, s)
+    if not ps:
+        return _bad("нечего показывать")
+
+    def go() -> None:
+        db.hidden_delete([p.rel for p in ps])
+        _hidden_changed()
+
+    await run_in_threadpool(go)
+    n = sum(1 for p in ps if not (p.video and p.live))
+    audit("unhide", s.user, ip_of(request), f"{n}: {_sample(ps)}")
+    return no_store(JSONResponse({"ok": True, "count": n}))
 
 
 # ---------------------------------------------------------------- картинки
@@ -1076,6 +1160,10 @@ async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(r
     """Подробности сразу: адрес — только если уже известен (без похода в интернет),
     чтобы карта показалась мгновенно; неизвестный адрес — отдельным запросом ниже."""
     out = dict(await _photo_info(pid, s))
+    p = library.get(pid)
+    hid = _hidden_meta.get(p.rel) if p is not None else None
+    if hid:                                           # на странице скрытых: кто и когда скрыл
+        out["hidden_by"], out["hidden_at"] = hid[0], int(hid[1])
     if "lat" in out:
         addr = await geocoder.cached(out["lat"], out["lon"])
         if addr is not None:
@@ -2090,7 +2178,9 @@ async def admin_overview(_: Session = Depends(require_admin)):
     photos = [p for p in library.by_id.values() if not (p.video and p.live)]
     videos = sum(1 for p in photos if p.video)
     unhashed = await run_in_threadpool(_unhashed) if tokens.any() else 0
+    n_hidden = (await run_in_threadpool(library.view, None, True)).count     # кэшируется до изменений
     return no_store(JSONResponse({
+        "hidden": n_hidden,
         "version": config.app_version(),
         "uptime": int(time.time() - STARTED),
         "pc": pc_state(up),
@@ -2173,6 +2263,21 @@ async def admin_user_google(request: Request, name: str, s: Session = Depends(re
     except UserError as e:
         return _bad(str(e))
     audit("user_google", s.user, ip_of(request), f"{name} -> {email or 'отвязан'}")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/users/{name}/hide", dependencies=[Depends(require_csrf)])
+async def admin_user_hide(request: Request, name: str, s: Session = Depends(require_admin)):
+    """Может ли пользователь скрывать фото (и смотреть скрытые) в своих папках (админ — всегда)."""
+    name = _user_arg(name)
+    allow = (await read_json(request)).get("allow")
+    if not isinstance(allow, bool):
+        return _bad("allow: true/false")
+    try:
+        users.set_hide(name, allow)
+    except UserError as e:
+        return _bad(str(e))
+    audit("user_hide", s.user, ip_of(request), f"{name} -> {'может' if allow else 'не может'} скрывать фото")
     return no_store(JSONResponse({"ok": True}))
 
 

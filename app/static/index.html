@@ -41,11 +41,25 @@
           <button id="menu-btn" class="icon" aria-haspopup="true" aria-expanded="false" aria-label="Меню">⋯</button>
           <div id="menu" class="menu" hidden>
             <label class="mi"><input type="checkbox" id="rec"> Фото из подпапок</label>
+            <button class="mi" id="menu-select" type="button" hidden>Выбрать фото</button>
+            <a class="mi" id="menu-hidden" href="/hidden" hidden>Скрытые фото</a>
+            <a class="mi" id="menu-all" href="/" hidden>Все фото</a>
             <a class="mi" id="admin-link" href="/admin" hidden>Админка</a>
             <button class="mi" id="logout" type="button">Выйти</button>
           </div>
         </div>
       </div>
+    </div>
+    <!-- режим выбора: вместо строки с инструментами -->
+    <div id="selbar" class="row selbar" hidden>
+      <button id="sel-x" class="icon" type="button" aria-label="Отменить выбор" title="Отменить выбор (Esc)">✕</button>
+      <span id="sel-n" class="sel-n">Выбрано: 0</span>
+      <button id="sel-hide" class="icon sel-act" type="button" aria-label="Скрыть выбранные" title="Скрыть выбранные">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6 0 10 7 10 7a17.6 17.6 0 0 1-3.2 3.9"/><path d="M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7a10 10 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
+      </button>
+      <button id="sel-show" class="icon sel-act" type="button" aria-label="Вернуть выбранные в галерею" title="Вернуть в галерею" hidden>
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
     </div>
     <div id="banner" class="banner" hidden>
       <span id="banner-text"></span>
