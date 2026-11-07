@@ -11,7 +11,9 @@ const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16, F_FOLDER 
 // /hidden — та же галерея, но только скрытые фото (тем, кто может скрывать; сервер отдаёт их
 // только из папок пользователя)
 const HID = location.pathname === '/hidden';
-const HQ = HID ? '?hidden=1' : '';
+// /starred — избранное пользователя (у каждого своё)
+const STARRED = location.pathname === '/starred';
+const HQ = HID ? '?hidden=1' : STARRED ? '?starred=1' : '';
 
 const st = {
   me: null,
@@ -92,15 +94,19 @@ async function enter() {
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
-  $('menu-select').hidden = !me.can_hide;
   $('menu-hidden').hidden = !me.can_hide || HID;
-  $('menu-all').hidden = !HID;
-  $('sel-hide').hidden = HID; $('sel-show').hidden = !HID;
-  if (HID) {
-    document.title = 'Скрытые фото — ' + (me.name || 'Фотоархив');
-    // название сайта в шапке ведёт из скрытых на основную страницу
+  $('menu-starred').hidden = STARRED || HID;
+  $('menu-all').hidden = !HID && !STARRED;
+  // действия с выбранными: скрыть (кому можно), вернуть (на /hidden), избранное (всем, кроме /hidden)
+  $('sel-hide').hidden = HID || !me.can_hide; $('sel-show').hidden = !HID;
+  $('sel-star').hidden = HID || STARRED; $('sel-unstar').hidden = !STARRED;
+  $('v-star').hidden = HID;
+  if (HID || STARRED) {
+    document.title = (HID ? 'Скрытые фото — ' : 'Избранное — ') + (me.name || 'Фотоархив');
+    // название сайта в шапке ведёт на основную страницу
     const brand = document.querySelector('.top .brand'); brand.href = '/'; brand.title = 'Ко всем фото';
   }
+  loadStars();
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();
@@ -299,7 +305,7 @@ function render() {
   const lib = st.lib; if (!lib) return;
   const fi = st.folderIdx.get(st.folder) ?? 0;
 
-  const crumbs = [el('a', null, HID ? 'Скрытые фото' : 'Все фото')]; crumbs[0].href = '#/';
+  const crumbs = [el('a', null, HID ? 'Скрытые фото' : STARRED ? 'Избранное' : 'Все фото')]; crumbs[0].href = '#/';
   if (st.folder) {
     let acc = '';
     for (const part of st.folder.split('/')) {
@@ -312,7 +318,9 @@ function render() {
   $('crumbs').replaceChildren(...crumbs);
 
   const fwrap = $('folders'); fwrap.replaceChildren();
-  for (const c of st.children[fi]) {
+  // в избранном и скрытых — только папки, где что-то есть
+  const kids = HID || STARRED ? st.children[fi].filter((c) => st.totals[c] > 0) : st.children[fi];
+  for (const c of kids) {
     const path = lib.folders[c];
     const card = el('a', 'folder'); card.href = '#/';
     card.onclick = (e) => { e.preventDefault(); go(path); };
@@ -335,9 +343,9 @@ function render() {
   st.list = list;
 
   const videos = list.reduce((n, p) => n + (p[6] & F_VIDEO ? 1 : 0), 0);
-  $('summary').textContent = list.length ? count(list.length) + (videos ? `, из них видео: ${videos.toLocaleString('ru')}` : '') + (st.rec && st.children[fi].length ? ' — с подпапками' : '') : '';
-  $('empty').hidden = list.length > 0 || st.children[fi].length > 0;
-  $('empty').textContent = HID ? 'Скрытых фото здесь нет' : 'Здесь пусто';
+  $('summary').textContent = list.length ? count(list.length) + (videos ? `, из них видео: ${videos.toLocaleString('ru')}` : '') + (st.rec && kids.length ? ' — с подпапками' : '') : '';
+  $('empty').hidden = list.length > 0 || kids.length > 0;
+  $('empty').textContent = HID ? 'Скрытых фото здесь нет' : STARRED ? 'В избранном пока ничего нет — отметь фото звёздочкой ☆' : 'Здесь пусто';
 
   relayout(false);
 }
@@ -467,6 +475,7 @@ function buildRow(r) {
     img.onload = () => { img.classList.add('ok'); img.dataset.loaded = '1'; b.classList.remove('broken'); };
     img.onerror = () => { if (img.getAttribute('src')) thumbFailed(img); };
     b.append(img);
+    if (STAR.ids.has(ph[0])) b.append(el('span', 'sbadge', '★'));
     if (ph[6] & F_VIDEO) b.append(el('span', 'vbadge', '▶'));
     else if (ph[6] & F_LIVE) b.append(el('span', 'lbadge'));
     row.append(b);
@@ -617,9 +626,9 @@ function selUpdate() {
   row.hidden = SEL.on;
   $('grid').classList.toggle('selmode', SEL.on);
   $('sel-n').textContent = `Выбрано: ${SEL.set.size.toLocaleString('ru')}`;
-  $('sel-hide').disabled = $('sel-show').disabled = !SEL.set.size;
+  for (const id of ['sel-hide', 'sel-show', 'sel-star', 'sel-unstar']) $(id).disabled = !SEL.set.size;
 }
-function selStart() { if (!st.me || !st.me.can_hide) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
+function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {
   SEL.on = false; SEL.set.clear(); SEL.anchor = -1; SEL.drag = null;
   for (const t of $('grid').querySelectorAll('.tile.sel')) t.classList.remove('sel');
@@ -662,6 +671,53 @@ async function selApply(hide) {
 }
 $('sel-hide').addEventListener('click', () => selApply(true));
 $('sel-show').addEventListener('click', () => selApply(false));
+$('sel-star').addEventListener('click', () => selStar(true));
+$('sel-unstar').addEventListener('click', () => selStar(false));
+
+// ================================================================== избранное
+// У каждого пользователя своё: сервер хранит пути его избранных файлов. Здесь — id для
+// звёздочек на плитках и в просмотре; /starred — та же галерея только с избранным.
+const STAR = { ids: new Set(), dirty: false };
+async function loadStars() {
+  try { const j = await (await api('/api/starred')).json(); STAR.ids = new Set(j.ids || []); paintStars(); } catch (_) {}
+}
+function paintStars() {
+  for (const t of $('grid').querySelectorAll('.tile')) {
+    const ph = st.list[+t.dataset.i]; if (!ph) continue;
+    const on = STAR.ids.has(ph[0]), b = t.querySelector('.sbadge');
+    if (on && !b) t.append(el('span', 'sbadge', '★')); else if (!on && b) b.remove();
+  }
+  if (!$('viewer').hidden) starBtn();
+}
+function starBtn() {
+  const ph = st.list[V.i], on = !!ph && STAR.ids.has(ph[0]);
+  $('v-star').classList.toggle('on', on);
+  $('v-star').title = $('v-star').ariaLabel = on ? 'Убрать из избранного' : 'В избранное';
+}
+async function setStar(ids, on) {
+  const r = await api('/api/star', { method: 'POST', body: { ids, on } });
+  if (!r.ok) { banner(`Не получилось (${r.status})`, null, null, true); return false; }
+  for (const id of ids) { if (on) STAR.ids.add(id); else STAR.ids.delete(id); }
+  paintStars();
+  return true;
+}
+async function selStar(on) {
+  const ids = [...SEL.set]; if (!ids.length) return;
+  const btn = on ? $('sel-star') : $('sel-unstar'); btn.disabled = true;
+  try {
+    if (!(await setStar(ids, on))) { btn.disabled = false; return; }
+    const n = ids.length.toLocaleString('ru');
+    selEnd();
+    if (STARRED) await loadLibrary();                       // убранные из избранного уходят со страницы
+    banner(on ? `В избранном: +${n}` : `Убрано из избранного: ${n}`);
+    setTimeout(() => { if (/избранн/.test($('banner-text').textContent)) banner(null); }, 3000);
+  } catch (_) { btn.disabled = false; }
+}
+$('v-star').addEventListener('click', async () => {
+  const ph = st.list[V.i]; if (!ph) return;
+  const on = !STAR.ids.has(ph[0]);
+  if (await setStar([ph[0]], on).catch(() => false)) STAR.dirty = STAR.dirty || STARRED;
+});
 
 // --- палец: долгое нажатие и протягивание
 function tileAt(cx, cy) {
@@ -697,7 +753,7 @@ function autoScroll() {
   SEL.raf = requestAnimationFrame(autoScroll);
 }
 $('grid').addEventListener('touchstart', (e) => {
-  if (e.touches.length !== 1 || !st.me || !st.me.can_hide) {
+  if (e.touches.length !== 1 || !st.me) {
     clearTimeout(SEL.press && SEL.press.t); SEL.press = null;
     if (SEL.drag) { SEL.drag = null; cancelAnimationFrame(SEL.raf); SEL.raf = 0; }   // второй палец — щипок
     return;
@@ -951,6 +1007,7 @@ function show(i) {
   V.i = i; const ph = st.list[i]; const tok = ++V.token;
   const isVideo = !!(ph[6] & F_VIDEO) && (!(ph[6] & F_NOPLAY) || (st.me && st.me.transcode));
   $('v-name').textContent = ph[2];
+  starBtn();
   const fromMeta = ph[6] & F_TAKEN, fromName = ph[6] & F_NAME;
   let meta = (ph[6] & F_FOLDER)
     ? `${new Date(ph[3] * 1000).getFullYear()} год (по названию папки) · ${sizeStr(ph[5])}`
@@ -1469,6 +1526,8 @@ function closeViewer(silent) {
   gridPrefetchSoon();
   if (layoutW() !== lastW) { lastW = layoutW(); initZoom(); relayout(true); }   // повернули телефон в просмотре
   L.calmUntil = Date.now() + 2000;          // после выхода сетка пару секунд не перестраивается сама
+  // на странице избранного: пока смотрели, сняли звёздочки — обновляем список при выходе
+  if (STAR.dirty) { STAR.dirty = false; loadLibrary(); }
 }
 
 window.addEventListener('popstate', () => { if (!$('viewer').hidden) { V.pushed = false; closeViewer(true); } });

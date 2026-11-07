@@ -62,6 +62,9 @@ db = DB(S.data_dir / "photocloud.db")
 library = Library(S.tz, S.meta_threads, db)
 _hidden_meta: dict[str, tuple[str, float]] = db.hidden_load()     # путь -> (кто скрыл, когда)
 library.set_hidden(_hidden_meta)
+_starred: dict[str, set[str]] = db.starred_load()           # пользователь -> пути избранного
+_starred_gen: dict[str, int] = {}                          # версия избранного пользователя (для кэша списка)
+_star_mu = threading.Lock()
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
 transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
@@ -326,6 +329,12 @@ def _versioned_html(name: str) -> bytes:
 
 
 PAGES = {"/": _versioned_html("index.html"), "/admin": _versioned_html("admin.html")}
+
+
+@app.get("/starred", include_in_schema=False)
+async def starred_page():
+    """Избранное — та же галерея (список — /api/library?starred=1)."""
+    return Response(PAGES["/"], media_type="text/html; charset=utf-8", headers={"cache-control": "no-cache"})
 
 
 @app.get("/hidden", include_in_schema=False)
@@ -632,10 +641,10 @@ async def _pc_watch() -> None:
 
 
 @app.get("/api/status")
-async def status(hidden: int = 0, s: Session = Depends(require_user)):
+async def status(hidden: int = 0, starred: int = 0, s: Session = Depends(require_user)):
     pc = pc_state(await PC.is_up())
-    # на странице скрытых — версия и число скрытых (у кого нет права — обычный список)
-    view = await run_in_threadpool(library.view, user_folders(s), bool(hidden) and users.can_hide(s.user))
+    # на страницах скрытых и избранного — версия и число их файлов
+    view = await run_in_threadpool(_view_for, s, hidden, starred)
     if pc == "up":
         PC.wake_at = 0
     return no_store(JSONResponse({
@@ -680,12 +689,22 @@ async def reindex(_: Session = Depends(require_admin)):
     return no_store(JSONResponse({"ok": True}))
 
 
+def _view_for(s: Session, hidden: int, starred: int):
+    """Список для пользователя: свои папки; hidden=1 — только скрытые (кому можно);
+    starred=1 — только его избранное (без скрытых)."""
+    if hidden and users.can_hide(s.user):
+        return library.view(user_folders(s), True)
+    if starred:
+        return library.view(user_folders(s), False, frozenset(_starred.get(s.user, ())),
+                            ("starred", s.user, _starred_gen.get(s.user, 0)))
+    return library.view(user_folders(s))
+
+
 @app.get("/api/library")
-async def get_library(request: Request, hidden: int = 0, s: Session = Depends(require_user)):
+async def get_library(request: Request, hidden: int = 0, starred: int = 0, s: Session = Depends(require_user)):
     if hidden and not users.can_hide(s.user):
         raise HTTPException(403, "hide not allowed")
-    # только свои папки; hidden=1 — только скрытые из них (страница /hidden)
-    v = await run_in_threadpool(library.view, user_folders(s), bool(hidden))
+    v = await run_in_threadpool(_view_for, s, hidden, starred)
     etag = f'"{v.version}"'
     headers = {"etag": etag, "cache-control": "private, no-cache", "vary": "cookie, accept-encoding"}
     if v.version and request.headers.get("if-none-match") == etag:
@@ -763,6 +782,49 @@ async def unhide_photos(request: Request, s: Session = Depends(require_user)):
     n = sum(1 for p in ps if not (p.video and p.live))
     audit("unhide", s.user, ip_of(request), f"{n}: {_sample(ps)}")
     return no_store(JSONResponse({"ok": True, "count": n}))
+
+
+# ---------------------------------------------------------------- избранное
+# У каждого пользователя своё; отмечать можно всё, что он видит. Хранится путь: файл
+# переименовали или перенесли на ПК — из избранного он выпадет.
+
+@app.get("/api/starred")
+async def starred_ids(s: Session = Depends(require_user)):
+    """id избранных файлов пользователя (чтобы рисовать звёздочки в ленте и в просмотре)."""
+    def ids() -> list[str]:
+        out = []
+        for rel in list(_starred.get(s.user, ())):
+            p = _by_rel(rel)
+            if p is not None and visible(s, p):
+                out.append(p.id)
+        return out
+    return no_store(JSONResponse({"ids": await run_in_threadpool(ids)}))
+
+
+@app.post("/api/star", dependencies=[Depends(require_csrf)])
+async def star_photos(request: Request, s: Session = Depends(require_user)):
+    d = await read_json(request, limit=HIDE_MAX * 12 + 100)
+    ids, on = d.get("ids"), d.get("on")
+    if not isinstance(ids, list) or not ids or len(ids) > HIDE_MAX or not all(isinstance(i, str) for i in ids) \
+            or not isinstance(on, bool):
+        return _bad("ids: [...], on: true/false")
+    paths = [p.rel for p in (library.get(i) for i in dict.fromkeys(ids)) if visible(s, p)]
+    if not paths:
+        return _bad("нечего отмечать")
+
+    def go() -> None:
+        with _star_mu:
+            (db.starred_put if on else db.starred_delete)(s.user, paths)
+            cur = set(_starred.get(s.user, ()))
+            if on:
+                cur.update(paths)
+            else:
+                cur.difference_update(paths)
+            _starred[s.user] = cur                         # новый набор целиком: читатели видят старый или новый
+            _starred_gen[s.user] = _starred_gen.get(s.user, 0) + 1
+
+    await run_in_threadpool(go)
+    return no_store(JSONResponse({"ok": True, "count": len(paths)}))
 
 
 # ---------------------------------------------------------------- картинки
@@ -2343,6 +2405,8 @@ async def admin_user_delete(request: Request, name: str, s: Session = Depends(re
         return _bad(str(e))
     n = sessions.revoke_user(name)
     nt = tokens.revoke_user(name)
+    await run_in_threadpool(db.starred_delete_user, name)
+    _starred.pop(name, None)
     audit("user_delete", s.user, ip_of(request), f"{name}, закрыто сессий: {n}" + (f", токенов бэкапа: {nt}" if nt else ""))
     return no_store(JSONResponse({"ok": True}))
 
