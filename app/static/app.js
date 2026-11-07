@@ -96,7 +96,11 @@ async function enter() {
   $('menu-hidden').hidden = !me.can_hide || HID;
   $('menu-all').hidden = !HID;
   $('sel-hide').hidden = HID; $('sel-show').hidden = !HID;
-  if (HID) document.title = 'Скрытые фото — ' + (me.name || 'Фотоархив');
+  if (HID) {
+    document.title = 'Скрытые фото — ' + (me.name || 'Фотоархив');
+    // название сайта в шапке ведёт из скрытых на основную страницу
+    const brand = document.querySelector('.top .brand'); brand.href = '/'; brand.title = 'Ко всем фото';
+  }
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();
