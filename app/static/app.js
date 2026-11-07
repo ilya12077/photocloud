@@ -191,6 +191,12 @@ async function poll(delay) {
       admin ? 'Остановить' : null, stopInfo); next = 3000;
   } else if (st.newVersion && st.lib) {
     banner('Список файлов обновился', 'Показать', async () => { st.newVersion = null; banner(null); await loadLibrary(); });
+  } else if (s.bg) {
+    // фоновый подсчёт или проверка хешей (только админу) — читают файлы с ПК, эскизы медленнее
+    const b = s.bg, sp = b.speed ? ` · ${Math.round(b.speed * 8 / 1e6)} Мбит/с` + (b.eta ? ` · осталось ≈ ${leftTime(b.eta)}` : '') : '';
+    banner(`${b.kind === 'verify' ? 'Проверка хешей' : 'Считаю хеши для бэкапа'}: ${b.done.toLocaleString('ru')} из ${b.total.toLocaleString('ru')}${sp}`,
+      'Остановить', () => api(`/api/admin/backup/${b.kind === 'verify' ? 'verify' : 'hashes'}/stop`, { method: 'POST' }));
+    next = 3000;
   } else banner(null);
 
   if (ix.v && !st.lib && !st.libPromise) await loadLibrary();
@@ -202,6 +208,14 @@ async function poll(delay) {
   if (prevPc !== 'up' && s.pc === 'up') retryBroken();
   if (!st.lib && ix.state !== 'error' && s.pc === 'up') next = Math.min(next, 1500);
   st.pollTimer = setTimeout(() => poll(), next);
+}
+
+function leftTime(sec) {
+  if (sec < 60) return 'меньше минуты';
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60);
+  return h >= 24 ? `${Math.floor(h / 24)} д ${h % 24} ч` : `${h} ч ${m % 60} мин`;
 }
 
 async function stopInfo() {
@@ -794,6 +808,42 @@ function touchDone(e) {
 }
 $('grid').addEventListener('touchend', touchDone, { passive: false });
 $('grid').addEventListener('touchcancel', touchDone, { passive: false });
+// мышь: зажал левую кнопку на фото — то же, что долгое нажатие пальцем (выбор и протягивание)
+$('grid').addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'mouse' || e.button !== 0 || !st.me) return;
+  const tile = e.target.closest('.tile'); if (!tile) return;
+  const i = +tile.dataset.i, x = e.clientX, y = e.clientY;
+  clearTimeout(SEL.press && SEL.press.t);
+  SEL.press = { x, y, mouse: true, t: setTimeout(() => {
+    SEL.press = null;
+    if (!gridActive()) return;
+    if (!SEL.on) selStart();
+    const ph = st.list[i]; if (!ph) return;
+    const add = !SEL.set.has(ph[0]);
+    selMark(i, add); SEL.anchor = i; SEL.anchorOn = add;
+    SEL.drag = { add, last: i, px: x, py: y + window.scrollY, cx: x, cy: y, mouse: true };
+    selUpdate();
+  }, LONG_PRESS) };
+});
+document.addEventListener('pointermove', (e) => {
+  if (e.pointerType !== 'mouse') return;
+  if (SEL.press && SEL.press.mouse && Math.hypot(e.clientX - SEL.press.x, e.clientY - SEL.press.y) > 6) {
+    clearTimeout(SEL.press.t); SEL.press = null;
+  }
+  if (!SEL.drag || !SEL.drag.mouse) return;
+  e.preventDefault();
+  dragTo(e.clientX, e.clientY);
+  if (!SEL.raf) SEL.raf = requestAnimationFrame(autoScroll);
+});
+document.addEventListener('pointerup', (e) => {
+  if (e.pointerType !== 'mouse') return;
+  if (SEL.press && SEL.press.mouse) { clearTimeout(SEL.press.t); SEL.press = null; }
+  if (SEL.drag && SEL.drag.mouse) {
+    SEL.drag = null; cancelAnimationFrame(SEL.raf); SEL.raf = 0;
+    SEL.ignoreClick = Date.now() + 250;                     // отпустили кнопку — это не клик
+  }
+});
+document.addEventListener('selectstart', (e) => { if (SEL.drag) e.preventDefault(); });   // не выделять текст, пока ведём
 $('grid').addEventListener('contextmenu', (e) => { if (e.target.closest('.tile') && (SEL.on || SEL.press)) e.preventDefault(); });
 
 // плашка с текущим месяцем при прокрутке
@@ -932,6 +982,7 @@ const sizeStr = (kb) => (kb >= 1024 ? (kb / 1024).toFixed(1) + ' МБ' : kb + ' 
 function openViewer(i) {
   if (!$('viewer').hidden) { show(i); return; }
   $('viewer').hidden = false; document.body.style.overflow = 'hidden'; Z.pinch = null;
+  document.documentElement.classList.add('viewing');
   clearTimeout(GP.t); if (GP.ctl) { GP.ctl.abort(); GP.ctl = null; }
   // недогруженные эскизы под просмотрщиком не нужны — отменяем, весь канал отдаём фото
   for (const [, node] of L.rendered) cancelImgs(node);
@@ -1514,6 +1565,7 @@ function closeViewer(silent) {
   closeInfo(true);
   stopVideo(); stopLive(); resetZoom(false); cancelLoads();
   $('viewer').hidden = true; document.body.style.overflow = ''; resetPane(); pane.style.opacity = '';
+  document.documentElement.classList.remove('viewing');
   $('v-img').removeAttribute('src'); $('v-low').removeAttribute('src'); V.token++;
   if (shownBlob) { URL.revokeObjectURL(shownBlob); shownBlob = ''; }
   if (V.pushed && !silent) { V.pushed = false; history.back(); }
