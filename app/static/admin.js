@@ -156,10 +156,10 @@ async function loadOverview() {
       const base = `${(v.stored || 0).toLocaleString('ru')} из ${(v.videos || 0).toLocaleString('ru')} (${mb(v.bytes || 0)})`;
       if (vtRunning) return `${base} · считаются: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}`;
       return base + ({ stopped: ' · подсчёт остановлен', pc: ' · ПК выключился — продолжится по кнопке' }[v.state] || '')
-        + (v.failed ? ` · не вышло: ${v.failed}` : '') + (v.audio ? ` · только звук (не показываются): ${v.audio}` : '');
+        + (v.failed ? ` · не вышло: ${v.failed}` : '');
     })()],
     ['Скрыто (у всех пользователей)', (() => { const a = el('a', null, (o.hidden || 0).toLocaleString('ru')); a.href = '/hidden'; a.title = 'Мои скрытые фото'; return a; })()],
-    ['На удаление', `${(o.delete_marks || 0).toLocaleString('ru')} (удалит клиент на ПК — пока его нет)`],
+    ['На удаление', (o.delete_marks || 0).toLocaleString('ru')],
     ['Эскизы в памяти сервера', `${mb(o.cache.thumb[0])} из ${mb(o.cache.thumb[1])}`],
     ['Превью в памяти сервера', `${mb(o.cache.preview[0])} из ${mb(o.cache.preview[1])}`],
     ['Сессий', String(o.sessions)],
