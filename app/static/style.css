@@ -227,6 +227,8 @@ td .gmail { margin-right: 8px; }
 .chkline { display: flex !important; gap: 6px; align-items: center; color: var(--fg) !important; font-size: 14px !important; }
 .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
 .logs td { font-size: 13px; }
+.logs td.mono.nowrap { white-space: nowrap; word-break: normal; }
+.logs td.wrap { overflow-wrap: anywhere; min-width: 200px; }
 tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { color: var(--err); }
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 30; background: var(--fg); color: var(--bg);
   padding: 10px 16px; border-radius: 10px; font-size: 14px; margin: 0; box-shadow: 0 4px 16px #0004; }

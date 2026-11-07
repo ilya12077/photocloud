@@ -583,7 +583,9 @@ function drawLogs() {
       tr.append(el('td', 'nowrap', dt(it.t)), el('td', null, it.lvl), el('td', 'mono', it.msg));
     } else {
       if (/failed|denied|lockout/.test(it.ev)) tr.className = 'lvl-warning';
-      tr.append(el('td', 'nowrap', dt(it.t)), el('td', null, AUDIT[it.ev] || it.ev), el('td', 'mono', it.user), el('td', 'mono', it.ip), el('td', null, it.detail));
+      // пользователь и IP — в одну строку; длинные имена файлов переносятся только в подробностях
+      tr.append(el('td', 'nowrap', dt(it.t)), el('td', null, AUDIT[it.ev] || it.ev), el('td', 'mono nowrap', it.user),
+        el('td', 'mono nowrap', it.ip), el('td', 'wrap', it.detail));
     }
     rows.push(tr);
     if (rows.length >= 500) break;
