@@ -655,7 +655,19 @@ async def status(hidden: int = 0, starred: int = 0, s: Session = Depends(require
                   "built_at": int(library.built_at), "v": view.version,
                   "info": [library.info_done, library.info_total, library.info_state],
                   "meta": [library.meta_done, library.meta_total]},
+        # админу — фоновый подсчёт и проверка хешей (бэкап): они тоже читают файлы с ПК
+        "bg": _bg_hashes() if s.role == "admin" else None,  # type: ignore[attr-defined]
     }))
+
+
+def _bg_hashes() -> dict | None:
+    if library.verify_state == "running":
+        return {"kind": "verify", "done": library.verify_done, "total": library.verify_total,
+                **_speed_eta(library.verify_bytes_total - library.verify_bytes_done)}
+    if library.hash_state == "running":
+        return {"kind": "hash", "done": library.hash_done, "total": library.hash_total,
+                **_speed_eta(library.hash_bytes_total - library.hash_bytes_done)}
+    return None
 
 
 @app.post("/api/wake", dependencies=[Depends(require_csrf)])
