@@ -199,6 +199,10 @@ def _source_unavailable(err: bytes) -> bool:
                                 b"Connection timed out"))
 
 
+class NoVideo(ValueError):
+    """В файле нет видеодорожки — только звук (диктофонные .3gp и т. п.)."""
+
+
 def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: int) -> bytes:
     """Кадр (BMP/PNG) с длинной стороной <= box. src — 'file:<путь>' или http-URL."""
     global _preferred, _fast_fail
@@ -231,6 +235,8 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                         log.info("кадры видео: быстрый способ не подходит этим файлам, использую точный")
                 return r.stdout
             last = r
+            if r.returncode != 0 and b"matches no streams" in (r.stderr or b""):
+                raise NoVideo("audio only")     # перебирать способы бессмысленно
             if r.returncode != 0 and _source_unavailable(r.stderr):
                 # исходник не отдался (ПК выключен/не отвечает) — файл тут ни при чём:
                 # не перебираем способы и не помечаем видео как «не декодируется»
@@ -239,6 +245,9 @@ def frame(ffmpeg: str, src: str, protocols: str, ext: str, box: int, quality: in
                 break                       # ошибка формата вывода — пробуем следующий вариант вывода
             # код 0, но кадра нет — пробуем следующий способ
     code = _signed(last.returncode)
+    info = describe(ffmpeg, src, protocols, fmt)
+    if "Stream #" in info and "Video:" not in info:
+        raise NoVideo("audio only")             # в файле только звук — это не ошибка
     log.warning("ffmpeg не смог взять кадр из %s (код %s): %s || файл: %s", ext, code,
-                _clean_err(last.stderr), describe(ffmpeg, src, protocols, fmt))
+                _clean_err(last.stderr), info)
     raise ValueError("no frame")
