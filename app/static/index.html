@@ -57,10 +57,14 @@
       <span id="sel-n" class="sel-n">Выбрано: 0</span>
       <span class="sel-acts">
       <button id="sel-star" class="icon star-btn" type="button" aria-label="Добавить в избранное" title="Добавить в избранное"><svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path class="star-path" d="M12 3.2l2.7 5.6 6.1.8-4.5 4.2 1.1 6.1L12 17l-5.4 2.9 1.1-6.1-4.5-4.2 6.1-.8z"/></svg></button>
+      <button id="sel-group" class="icon" type="button" aria-label="Сгруппировать" title="Сгруппировать: в ленте останется первое фото" hidden><svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/><rect x="9" y="9" width="12" height="12" rx="2"/></svg></button>
+      <button id="sel-ungroup" class="txt" type="button" title="Разобрать группу" hidden>Разгруппировать</button>
       <button id="sel-unstar" class="icon star-btn on" type="button" aria-label="Убрать из избранного" title="Убрать из избранного" hidden><svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path class="star-path" d="M12 3.2l2.7 5.6 6.1.8-4.5 4.2 1.1 6.1L12 17l-5.4 2.9 1.1-6.1-4.5-4.2 6.1-.8z"/></svg></button>
       <button id="sel-hide" class="icon sel-act" type="button" aria-label="Скрыть выбранные" title="Скрыть выбранные">
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6 0 10 7 10 7a17.6 17.6 0 0 1-3.2 3.9"/><path d="M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7a10 10 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
       </button>
+      <button id="sel-undel" class="txt" type="button" title="Снять пометку «удалить окончательно»" hidden>Не удалять</button>
+      <button id="sel-del" class="icon sel-act del-btn" type="button" aria-label="Удалить окончательно" title="Удалить окончательно (пометить на удаление)" hidden><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16"/><path d="M9 6V4h6v2"/><path d="M6 6l1 14h10l1-14"/><path d="M10 12.5l4 4M14 12.5l-4 4"/></svg></button>
       <button id="sel-show" class="icon sel-act" type="button" aria-label="Вернуть выбранные в галерею" title="Вернуть в галерею" hidden>
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
       </button>

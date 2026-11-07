@@ -52,9 +52,19 @@ SCHEMA = [
          name TEXT NOT NULL, user TEXT NOT NULL,
          created REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
          report TEXT NOT NULL DEFAULT '{}', stale_sent INTEGER NOT NULL DEFAULT 0)""",
-    # скрытые из галереи файлы (сами файлы на ПК остаются): путь, кто скрыл, когда
-    """CREATE TABLE IF NOT EXISTS hidden (
-        path TEXT PRIMARY KEY, by TEXT NOT NULL, at REAL NOT NULL)""",
+    # скрытые из галереи: у каждого пользователя свои (файлы на ПК остаются)
+    """CREATE TABLE IF NOT EXISTS user_hidden (
+        user TEXT NOT NULL, path TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (user, path))
+       WITHOUT ROWID""",
+    # помеченные «удалить окончательно» (со страницы скрытых). Сами файлы пока не трогаются:
+    # удалять с ПК будет отдельный клиент, он же решает. key (путь+размер+mtime) и sha —
+    # каким файл был при пометке: изменившийся после пометки файл удалять нельзя
+    """CREATE TABLE IF NOT EXISTS delete_marks (
+        path TEXT PRIMARY KEY, key TEXT NOT NULL, sha TEXT, by TEXT NOT NULL, at REAL NOT NULL)""",
+    # группы (стопки): в ленте — одна обложка, по нажатию раскрывается. У каждого свои.
+    """CREATE TABLE IF NOT EXISTS user_groups (
+        user TEXT NOT NULL, path TEXT NOT NULL, gid TEXT NOT NULL, cover INTEGER NOT NULL DEFAULT 0, at REAL NOT NULL,
+        PRIMARY KEY (user, path)) WITHOUT ROWID""",
     # избранное: у каждого пользователя своё
     """CREATE TABLE IF NOT EXISTS starred (
         user TEXT NOT NULL, path TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (user, path))
@@ -98,6 +108,13 @@ class DB:
                 self.con.execute("ALTER TABLE hashes ADD COLUMN checked REAL NOT NULL DEFAULT 0")
                 self.con.execute("UPDATE hashes SET checked = ?", (__import__("time").time(),))
             self.con.execute("PRAGMA user_version = 2")
+        if ver < 3:
+            # 1.8.0-beta.1…6: скрытые были общими (таблица hidden) — теперь у каждого свои:
+            # скрытое переходит к тому, кто скрыл
+            if self.con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hidden'").fetchone():
+                self.con.execute("INSERT OR IGNORE INTO user_hidden (user, path, at) SELECT by, path, at FROM hidden")
+                self.con.execute("DROP TABLE hidden")
+            self.con.execute("PRAGMA user_version = 3")
 
     def run(self, sql: str, args=()):
         with self.mu:
@@ -231,15 +248,69 @@ class DB:
 
     # ------------------------------------------------------------ скрытые файлы
 
-    def hidden_load(self) -> dict[str, tuple[str, float]]:
-        return {p: (by, at) for p, by, at in self.run("SELECT path, by, at FROM hidden")}
+    def hidden_load(self) -> dict[str, dict[str, float]]:
+        """пользователь -> {путь: когда скрыл}"""
+        out: dict[str, dict[str, float]] = {}
+        for u, p, at in self.run("SELECT user, path, at FROM user_hidden"):
+            out.setdefault(u, {})[p] = at
+        return out
 
-    def hidden_put(self, paths: list[str], by: str) -> None:
+    def hidden_put(self, user: str, paths: list[str]) -> None:
         now = __import__("time").time()
-        self.many("INSERT OR IGNORE INTO hidden (path, by, at) VALUES (?, ?, ?)", [(p, by, now) for p in paths])
+        self.many("INSERT OR IGNORE INTO user_hidden (user, path, at) VALUES (?, ?, ?)", [(user, p, now) for p in paths])
 
-    def hidden_delete(self, paths: list[str]) -> None:
-        self.many("DELETE FROM hidden WHERE path = ?", [(p,) for p in paths])
+    def hidden_delete(self, user: str, paths: list[str]) -> None:
+        self.many("DELETE FROM user_hidden WHERE user = ? AND path = ?", [(user, p) for p in paths])
+
+    def hidden_count(self) -> int:
+        return self.run("SELECT count(*) FROM user_hidden")[0][0]
+
+    # ------------------------------------------------------------ пометки на удаление
+
+    def marks_load(self) -> dict[str, tuple[str, float]]:
+        return {p: (by, at) for p, by, at in self.run("SELECT path, by, at FROM delete_marks")}
+
+    def marks_put(self, rows: list[tuple[str, str, str | None]], by: str) -> None:
+        """rows: (путь, ключ, sha). Повторная пометка обновляет ключ, sha, кто и когда."""
+        now = __import__("time").time()
+        self.many("INSERT OR REPLACE INTO delete_marks (path, key, sha, by, at) VALUES (?, ?, ?, ?, ?)",
+                  [(p, k, h, by, now) for p, k, h in rows])
+
+    def marks_delete(self, paths: list[str]) -> None:
+        self.many("DELETE FROM delete_marks WHERE path = ?", [(p,) for p in paths])
+
+    # ------------------------------------------------------------ группы
+
+    def groups_load(self) -> dict[str, dict[str, tuple[str, bool]]]:
+        """пользователь -> {путь: (группа, обложка?)}"""
+        out: dict[str, dict[str, tuple[str, bool]]] = {}
+        for u, p, g, c in self.run("SELECT user, path, gid, cover FROM user_groups"):
+            out.setdefault(u, {})[p] = (g, bool(c))
+        return out
+
+    def groups_set(self, user: str, gid: str, paths: list[str], cover: str) -> None:
+        """Новая группа: файлы уходят из прежних групп; группы, где остался один файл, — распускаем."""
+        now = __import__("time").time()
+        with self.mu:
+            self.con.execute("BEGIN")
+            try:
+                self.con.executemany("DELETE FROM user_groups WHERE user = ? AND path = ?", [(user, p) for p in paths])
+                self.con.executemany("INSERT INTO user_groups (user, path, gid, cover, at) VALUES (?, ?, ?, ?, ?)",
+                                     [(user, p, gid, int(p == cover), now) for p in paths])
+                self.con.execute("DELETE FROM user_groups WHERE user = ? AND gid IN (SELECT gid FROM user_groups "
+                                 "WHERE user = ? GROUP BY gid HAVING count(*) < 2)", (user, user))
+                self.con.execute("COMMIT")
+            except Exception:
+                self.con.execute("ROLLBACK")
+                raise
+
+    def groups_drop(self, user: str, gids: list[str]) -> None:
+        self.many("DELETE FROM user_groups WHERE user = ? AND gid = ?", [(user, g) for g in gids])
+
+    def user_forget(self, user: str) -> None:
+        """Пользователя удалили: его скрытые, группы и избранное больше не нужны."""
+        for t in ("user_hidden", "user_groups", "starred"):
+            self.run(f"DELETE FROM {t} WHERE user = ?", (user,))
 
     # ------------------------------------------------------------ избранное
 
@@ -255,9 +326,6 @@ class DB:
 
     def starred_delete(self, user: str, paths: list[str]) -> None:
         self.many("DELETE FROM starred WHERE user = ? AND path = ?", [(user, p) for p in paths])
-
-    def starred_delete_user(self, user: str) -> None:
-        self.run("DELETE FROM starred WHERE user = ?", (user,))
 
     # ------------------------------------------------------------ служебные отметки
 

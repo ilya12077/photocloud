@@ -73,8 +73,7 @@ class UserStore:
                     self._u[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
                                      "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
                                      "folders": folders, "exclude": exclude,
-                                     "wake": rec.get("wake", True) is not False,
-                                     "hide": rec.get("hide") is True}
+                                     "wake": rec.get("wake", True) is not False}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,8 +94,7 @@ class UserStore:
 
     def list(self) -> list[dict]:
         return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
-                 "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True),
-                 "hide": r["role"] == "admin" or r.get("hide") is True}
+                 "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True)}
                 for n, r in sorted(self._u.items())]
 
     def folders(self, name: str):
@@ -113,18 +111,6 @@ class UserStore:
     def can_wake(self, name: str) -> bool:
         rec = self._u.get(name)
         return bool(rec) and (rec["role"] == "admin" or rec.get("wake", True) is not False)
-
-    def can_hide(self, name: str) -> bool:
-        """Скрывать фото из галереи (и видеть скрытые) — в своих папках; по умолчанию нет, админ — всегда."""
-        rec = self._u.get(name)
-        return bool(rec) and (rec["role"] == "admin" or rec.get("hide") is True)
-
-    def set_hide(self, name: str, allow: bool) -> None:
-        with self._mu:
-            if name not in self._u:
-                raise UserError("нет такого пользователя")
-            self._u[name]["hide"] = bool(allow)
-            self._save()
 
     def set_wake(self, name: str, allow: bool) -> None:
         with self._mu:
@@ -196,7 +182,7 @@ class UserStore:
         with self._mu:
             if name in self._u:
                 raise UserError("такой пользователь уже есть")
-            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "exclude": [], "wake": True, "hide": False}
+            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "exclude": [], "wake": True}
             self._save()
 
     def set_password(self, name: str, password: str) -> None:
