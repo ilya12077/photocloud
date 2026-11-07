@@ -94,11 +94,13 @@ async function enter() {
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
-  $('menu-hidden').hidden = !me.can_hide || HID;
+  $('menu-hidden').hidden = HID;
   $('menu-starred').hidden = STARRED || HID;
   $('menu-all').hidden = !HID && !STARRED;
   // действия с выбранными: скрыть (кому можно), вернуть (на /hidden), избранное (всем, кроме /hidden)
-  $('sel-hide').hidden = HID || !me.can_hide; $('sel-show').hidden = !HID;
+  // скрывать и группировать может каждый (у каждого свои); «удалить окончательно» — только админ
+  $('sel-hide').hidden = HID; $('sel-show').hidden = !HID; $('sel-del').hidden = !HID || !me.can_delete;
+  $('sel-group').hidden = HID;
   $('sel-star').hidden = HID || STARRED; $('sel-unstar').hidden = !STARRED;
   $('v-star').hidden = HID;
   if (HID || STARRED) {
@@ -107,6 +109,7 @@ async function enter() {
     const brand = document.querySelector('.top .brand'); brand.href = '/'; brand.title = 'Ко всем фото';
   }
   loadStars();
+  if (HID && me.can_delete) loadMarks();
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();
@@ -238,7 +241,7 @@ function decode(j) {
     d = i === 0 ? j.d[0] : d - j.d[i];
     out[i] = [j.id.substr(i * 8, 8), j.f[i], j.n[i], d, d + j.m[i], j.s[i], j.x[i]];
   }
-  return { v: j.v, folders: j.folders, photos: out, live: j.live || {} };
+  return { v: j.v, folders: j.folders, photos: out, live: j.live || {}, grp: j.grp || {}, cov: new Set(j.cov || []) };
 }
 
 async function loadLibrary(pre) {
@@ -250,7 +253,6 @@ async function loadLibraryInner(pre) {
   if (!st.lib) banner('Загружаю список файлов…');
   // cache:'no-cache' — браузер хранит копию и спрашивает сервер по ETag (304 = 0 байт)
   const r = pre || await api('/api/library' + HQ, { cache: 'no-cache' });
-  if (r.status === 403 && HID) { banner('Смотреть скрытые фото может только тот, кому разрешено их скрывать', 'Ко всем фото', () => { location.href = '/'; }, true); return; }
   if (!r.ok) return;
   const j = await r.json();
   if (!j.v) return;
@@ -354,7 +356,7 @@ function render() {
   } else list = lib.photos.filter((p) => p[1] === fi);
   if (st.sort === 'old') list = list.slice().reverse();
   else if (st.sort === 'name') { const coll = new Intl.Collator('ru', { numeric: true }); list = list.slice().sort((a, b) => coll.compare(a[2], b[2])); }
-  st.list = list;
+  st.list = groupList(list);
 
   const videos = list.reduce((n, p) => n + (p[6] & F_VIDEO ? 1 : 0), 0);
   $('summary').textContent = list.length ? count(list.length) + (videos ? `, из них видео: ${videos.toLocaleString('ru')}` : '') + (st.rec && kids.length ? ' — с подпапками' : '') : '';
@@ -362,6 +364,53 @@ function render() {
   $('empty').textContent = HID ? 'Скрытых фото здесь нет' : STARRED ? 'В избранном пока ничего нет — отметь фото звёздочкой ☆' : 'Здесь пусто';
 
   relayout(false);
+}
+
+// ================================================================== группы (стопки)
+// В ленте от группы — одна обложка (её выбрали первой) со значком и числом; нажатие раскрывает
+// группу на месте обложки (обратно — после перезагрузки). Фото группы, видимые пользователю
+// меньше чем по два, показываются как обычно.
+const GX = { open: new Set(), pop: new Set(), of: new Map(), byId: new Map(), cover: new Map() };
+function groupList(list) {
+  const grp = st.lib.grp || {};
+  GX.of = new Map(); GX.byId = new Map(); GX.cover = new Map();
+  for (const ph of list) { const g = grp[ph[0]]; if (g) { if (!GX.of.has(g)) GX.of.set(g, []); GX.of.get(g).push(ph); } }
+  if (!GX.of.size) return list;
+  for (const [g, m] of GX.of) {
+    if (m.length < 2) { GX.of.delete(g); continue; }
+    GX.cover.set(g, m.find((x) => st.lib.cov.has(x[0])) || m[0]);
+    for (const x of m) GX.byId.set(x[0], g);
+  }
+  const out = [];
+  for (const ph of list) {
+    const g = GX.byId.get(ph[0]);
+    if (!g) { out.push(ph); continue; }
+    const cover = GX.cover.get(g);
+    if (ph !== cover) continue;                       // члены группы встают за обложкой
+    out.push(cover);
+    if (GX.open.has(g)) for (const x of GX.of.get(g)) if (x !== cover) out.push(x);
+  }
+  return out;
+}
+// дата для заголовков месяцев: у раскрытой группы — дата обложки (группа не рвётся месяцами)
+function gdate(i) { const ph = st.list[i], g = GX.byId.get(ph[0]); return g ? GX.cover.get(g)[3] : ph[3]; }
+const groupCollapsed = (ph) => { const g = GX.byId.get(ph[0]); return !!g && !GX.open.has(g) && GX.cover.get(g) === ph; };
+function openGroup(i) {
+  const ph = st.list[i], g = GX.byId.get(ph[0]); if (!g) return;
+  GX.open.add(g);
+  GX.pop = new Set(GX.of.get(g).filter((x) => x !== ph).map((x) => x[0]));
+  // фото встают после обложки, всё выше неё не двигается — прокрутку не трогаем
+  render();
+  setTimeout(() => { GX.pop.clear(); }, 800);
+}
+// выбранные с учётом свёрнутых групп: выбрал обложку — значит всю группу
+function selIds() {
+  const out = [];
+  for (const ph of st.list) {
+    if (!SEL.set.has(ph[0])) continue;
+    if (groupCollapsed(ph)) for (const x of GX.of.get(GX.byId.get(ph[0]))) out.push(x[0]); else out.push(ph[0]);
+  }
+  return [...new Set(out)];
 }
 
 function count(n) { return `${n.toLocaleString('ru')} файл${n % 10 === 1 && n % 100 !== 11 ? '' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)) ? 'а' : 'ов'}`; }
@@ -386,9 +435,9 @@ function layout() {
   while (i < list.length) {
     let end = list.length, month = -1;
     if (byMonth) {
-      month = monthKey(list[i][3]);
+      month = monthKey(gdate(i));
       end = i + 1;
-      while (end < list.length && monthKey(list[end][3]) === month) end++;
+      while (end < list.length && monthKey(gdate(end)) === month) end++;
       rows.push({ h: true, month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
     }
     for (let s = i; s < end; s += cols) { rows.push({ h: false, start: s, end: Math.min(end, s + cols), month, top: y, height: rowH }); y += rowH; }
@@ -490,6 +539,15 @@ function buildRow(r) {
     img.onerror = () => { if (img.getAttribute('src')) thumbFailed(img); };
     b.append(img);
     if (STAR.ids.has(ph[0])) b.append(el('span', 'sbadge', '★'));
+    if (HID && MARK.ids.has(ph[0])) { b.classList.add('marked'); b.append(markBadge()); }
+    const g = GX.byId.get(ph[0]);
+    if (g) {
+      b.classList.add('grouped');
+      const gb = el('span', 'gbadge'); gb.append(GROUP_SVG.cloneNode(true));
+      if (groupCollapsed(ph)) { gb.append(String(GX.of.get(g).length)); b.title = `${ph[2]} — группа из ${GX.of.get(g).length}, нажми, чтобы раскрыть`; }
+      b.append(gb);
+      if (GX.pop.has(ph[0])) { b.classList.add('pop'); b.style.animationDelay = Math.min(300, (i - r.start) * 30) + 'ms'; }
+    }
     if (ph[6] & F_VIDEO) b.append(el('span', 'vbadge', '▶'));
     else if (ph[6] & F_LIVE) b.append(el('span', 'lbadge'));
     row.append(b);
@@ -618,6 +676,8 @@ $('grid').addEventListener('click', (e) => {
   const t = e.target.closest('.tile'); if (!t) return;
   if (Date.now() < SEL.ignoreClick) return;                 // клик после долгого нажатия
   if (SEL.on) { selClick(+t.dataset.i, e.shiftKey); return; }
+  const ph = st.list[+t.dataset.i];
+  if (ph && groupCollapsed(ph)) { openGroup(+t.dataset.i); return; }   // свёрнутая группа — раскрыть
   openViewer(+t.dataset.i);
 });
 
@@ -640,7 +700,12 @@ function selUpdate() {
   row.hidden = SEL.on;
   $('grid').classList.toggle('selmode', SEL.on);
   $('sel-n').textContent = `Выбрано: ${SEL.set.size.toLocaleString('ru')}`;
-  for (const id of ['sel-hide', 'sel-show', 'sel-star', 'sel-unstar']) $(id).disabled = !SEL.set.size;
+  for (const id of ['sel-hide', 'sel-show', 'sel-star', 'sel-unstar', 'sel-del']) $(id).disabled = !SEL.set.size;
+  $('sel-group').disabled = selIds().length < 2;
+  // «Разгруппировать» — если среди выбранных есть фото из группы
+  $('sel-ungroup').hidden = ![...SEL.set].some((id) => GX.byId.has(id));
+  // «Не удалять» — когда среди выбранных есть помеченные на удаление
+  $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {
@@ -670,15 +735,16 @@ $('sel-x').addEventListener('click', () => selEnd());
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && SEL.on && gridActive()) selEnd(); });
 
 async function selApply(hide) {
-  const ids = [...SEL.set]; if (!ids.length) return;
+  const ids = selIds(); if (!ids.length) return;
   const n = ids.length.toLocaleString('ru');
-  if (hide && !confirm(`Скрыть ${n} фото? Они пропадут из галереи у всех, файлы на компьютере останутся. Вернуть можно в меню ⋯ → «Скрытые фото».`)) return;
+  if (hide && !confirm(`Скрыть ${n} фото? Они пропадут из галереи только у тебя (у других останутся), файлы на компьютере не трогаются. Вернуть можно в меню ⋯ → «Скрытые фото».`)) return;
   const btn = hide ? $('sel-hide') : $('sel-show'); btn.disabled = true;
   try {
     const r = await api(hide ? '/api/hide' : '/api/unhide', { method: 'POST', body: { ids } });
     if (!r.ok) { banner(`Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
     selEnd();
     await loadLibrary();
+    if (HID) await loadMarks();                               // вернули в галерею — пометка снята
     banner(hide ? `Скрыто: ${n}` : `Возвращено в галерею: ${n}`);
     setTimeout(() => { if (/^(Скрыто|Возвращено)/.test($('banner-text').textContent)) banner(null); }, 3000);
   } catch (_) { btn.disabled = false; }
@@ -686,6 +752,54 @@ async function selApply(hide) {
 $('sel-hide').addEventListener('click', () => selApply(true));
 $('sel-show').addEventListener('click', () => selApply(false));
 $('sel-star').addEventListener('click', () => selStar(true));
+$('sel-del').addEventListener('click', () => selMarkDelete(true));
+$('sel-group').addEventListener('click', () => selGroup(true));
+$('sel-ungroup').addEventListener('click', () => selGroup(false));
+const GROUP_SVG = $('sel-group').querySelector('svg');
+async function selGroup(make) {
+  const ids = selIds();                                     // по порядку в ленте: первое — обложка
+  if (make && ids.length < 2) return;
+  const btn = make ? $('sel-group') : $('sel-ungroup'); btn.disabled = true;
+  try {
+    const r = await api(make ? '/api/group' : '/api/ungroup', { method: 'POST', body: { ids } });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); banner(j.error || `Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
+    selEnd(); await loadLibrary();
+    banner(make ? `Сгруппировано: ${ids.length}` : 'Группа разобрана');
+    setTimeout(() => { if (/^(Сгруппировано|Группа разобрана)/.test($('banner-text').textContent)) banner(null); }, 3000);
+  } catch (_) { btn.disabled = false; }
+}
+$('sel-undel').addEventListener('click', () => selMarkDelete(false));
+
+// ================================================================== «удалить окончательно» (на /hidden)
+// Пока только пометка в базе: удалять с компьютера будет отдельный клиент на ПК, он и решает.
+// Помеченные — с красной корзиной и бледнее; «Не удалять» или «вернуть в галерею» снимает пометку.
+const MARK = { ids: new Set() };
+const TRASH_SVG = $('sel-del').querySelector('svg');
+function markBadge() { const s = el('span', 'dbadge'); s.append(TRASH_SVG.cloneNode(true)); s.title = 'Помечено на удаление'; return s; }
+async function loadMarks() {
+  try { const j = await (await api('/api/marks')).json(); MARK.ids = new Set(j.ids || []); paintMarks(); } catch (_) {}
+}
+function paintMarks() {
+  for (const t of $('grid').querySelectorAll('.tile')) {
+    const ph = st.list[+t.dataset.i]; if (!ph) continue;
+    const on = MARK.ids.has(ph[0]), b = t.querySelector('.dbadge');
+    t.classList.toggle('marked', on);
+    if (on && !b) t.append(markBadge()); else if (!on && b) b.remove();
+  }
+}
+async function selMarkDelete(on) {
+  const ids = selIds(); if (!ids.length) return;
+  const n = ids.length.toLocaleString('ru');
+  if (on && !confirm(`Пометить ${n} фото на окончательное удаление?\n\nСейчас они только помечаются. Удалять файлы с компьютера будет отдельная программа на ПК; до этого пометку можно снять («Не удалять» или «вернуть в галерею»).`)) return;
+  const btn = on ? $('sel-del') : $('sel-undel'); btn.disabled = true;
+  try {
+    const r = await api('/api/marks', { method: 'POST', body: { ids, on } });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); banner(j.error || `Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
+    selEnd(); await loadMarks();
+    banner(on ? `Помечено на удаление: ${n}` : `Пометка снята: ${n}`);
+    setTimeout(() => { if (/^(Помечено|Пометка)/.test($('banner-text').textContent)) banner(null); }, 3000);
+  } catch (_) { btn.disabled = false; }
+}
 $('sel-unstar').addEventListener('click', () => selStar(false));
 
 // ================================================================== избранное
@@ -716,7 +830,7 @@ async function setStar(ids, on) {
   return true;
 }
 async function selStar(on) {
-  const ids = [...SEL.set]; if (!ids.length) return;
+  const ids = selIds(); if (!ids.length) return;
   const btn = on ? $('sel-star') : $('sel-unstar'); btn.disabled = true;
   try {
     if (!(await setStar(ids, on))) { btn.disabled = false; return; }
@@ -1502,7 +1616,8 @@ async function fillInfo() {
   extra.replaceChildren();
   const mp = info.width && info.height ? `${info.width} × ${info.height} (${(info.width * info.height / 1e6).toFixed(1)} Мп)` : '';
   if (mp || info.camera) extra.append(infoRows([['Разрешение', mp], ['Камера', info.camera]]));
-  if (info.hidden_by) extra.append(infoRows([['Скрыто', `${info.hidden_by}, ${fmt.format(new Date(info.hidden_at * 1000))}`]]));
+  if (info.hidden_at) extra.append(infoRows([['Скрыто', fmt.format(new Date(info.hidden_at * 1000))]]));
+  if (info.delete_by) extra.append(infoRows([['На удаление', `${info.delete_by}, ${fmt.format(new Date(info.delete_at * 1000))}`]]));
   if (info.lat == null) {
     extra.append(el('h3', null, 'Местоположение'), el('div', 'dim', 'В файле нет координат.'));
     return;

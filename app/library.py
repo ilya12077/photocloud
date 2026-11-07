@@ -93,7 +93,7 @@ class View:
         self.payload, self.gz, self.version, self.count = payload, gz, version, count
 
 
-def _encode(photos: list, folder_list: list[str], fmap: dict[int, int] | None = None) -> View:
+def _encode(photos: list, folder_list: list[str], fmap: dict[int, int] | None = None, groups=None) -> View:
     # колоночный формат: так gzip жмёт заметно лучше, чем массив строк
     dates = [int(p.date) for p in photos]
     cols = {
@@ -106,6 +106,9 @@ def _encode(photos: list, folder_list: list[str], fmap: dict[int, int] | None = 
         "s": [(p.size + 1023) // 1024 for p in photos],              # КБ
         "x": [p.flags() for p in photos],
         "live": {p.id: p.live for p in photos if p.live},
+        # группы: id файла -> id группы; обложки — отдельным списком
+        "grp": {p.id: groups[p.rel][0] for p in photos if groups and p.rel in groups},
+        "cov": [p.id for p in photos if groups and p.rel in groups and groups[p.rel][1]],
     }
     body = json.dumps({"folders": folder_list, **cols}, ensure_ascii=False, separators=(",", ":"))
     version = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
@@ -250,7 +253,6 @@ class Library:
         self._folders: list[str] = [""]
         self._empty = View(b"{}", gzip.compress(b"{}"), "", 0)
         self._views: dict = {}
-        self.hidden: frozenset[str] = frozenset()     # пути скрытых из галереи файлов (задаёт main)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -313,31 +315,23 @@ class Library:
         self._views = {}
         self.payload, self.payload_gz, self.version = full.payload, full.gz, full.version
 
-    def set_hidden(self, paths) -> None:
-        """Новый набор скрытых: списки собираются заново (по запросу, для каждого набора папок)."""
-        self.hidden = frozenset(paths)
+    def invalidate(self) -> None:
+        """Скрытые, группы или избранное пользователя изменились — списки соберутся заново."""
         self._views = {}
 
-    def is_hidden(self, p: Photo) -> bool:
-        """Скрыт сам файл или (у ролика живого фото) его фото — и наоборот."""
-        h = self.hidden
-        if p.rel in h:
-            return True
-        q = self.by_id.get(p.live) if p.live else None
-        return q is not None and q.rel in h
-
-    def view(self, folders, hidden: bool = False, only=None, only_key=None) -> View:
+    def view(self, folders, hide=frozenset(), only=None, groups=None, key=None) -> View:
         """Список только из разрешённых папок (folders=None — всё). Папки-предки разрешённых
         попадают в дерево только именами — чтобы до них можно было дойти; соседние — нет.
-        hidden=False — без скрытых файлов; True — только скрытые (страница /hidden).
-        only — только эти пути (избранное пользователя), only_key — их версия для кэша."""
-        views, feed, flist, hid = self._views, self._feed, self._folders, self.hidden   # один снимок
+        hide — пути, которых в списке нет (скрытые пользователем); only — только эти пути
+        (его скрытые или избранное); groups — его группы {путь: (группа, обложка?)};
+        key — что из этого задано (пользователь и версии его наборов) — для кэша."""
+        views, feed, flist = self._views, self._feed, self._folders     # один снимок
         if not self.version:
             return self._empty                  # список ещё не собран — пусто для всех
         acc = None if folders is None else (None if folders[0] is None else tuple(sorted(folders[0])),
                                             tuple(sorted(folders[1])))
-        key = (hidden, acc, only_key)
-        v = views.get(key)
+        ck = (acc, key)
+        v = views.get(ck)
         if v is not None:
             return v
         if acc is None:
@@ -350,12 +344,12 @@ class Library:
             keep = [i for i, fp in enumerate(flist) if fp in need or folder_ok(fp, acc)]
         fmap = {old: new for new, old in enumerate(keep)}
         # в ленте нет роликов живых фото, поэтому достаточно пути самого фото
-        v = _encode([p for p in feed if (p.rel in hid) == hidden and (acc is None or folder_ok(p.rel, acc))
-                     and (only is None or p.rel in only)],
-                    [flist[i] for i in keep], None if acc is None else fmap)
+        v = _encode([p for p in feed if p.rel not in hide and (only is None or p.rel in only)
+                     and (acc is None or folder_ok(p.rel, acc))],
+                    [flist[i] for i in keep], None if acc is None else fmap, groups)
         if len(views) > 64:
             views.clear()
-        views[key] = v
+        views[ck] = v
         return v
 
     # ------------------------------------------------------------ сборка
