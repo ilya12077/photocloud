@@ -36,6 +36,8 @@ async function api(path, body) {
   const sent = Date.now();
   const r = await fetch(path, init);
   noteServerTime(r, sent);
+  // после любого действия (кнопки) — сразу свежие данные открытой вкладки, не ждём опроса
+  if (body !== undefined) polledAt = 0;
   let j = {};
   try { j = await r.json(); } catch (_) {}
   if (!r.ok) throw new Error(j.error || j.detail || `HTTP ${r.status}`);

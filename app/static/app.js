@@ -121,14 +121,25 @@ function banner(text, btnText, onClick, bad) {
   b.hidden = false; b.classList.toggle('bad', !!bad);
   $('banner-text').textContent = text;
   const btn = $('banner-btn');
-  if (btnText) { btn.hidden = false; btn.textContent = btnText; btn.onclick = onClick; } else btn.hidden = true;
+  if (btnText) {
+    btn.hidden = false; btn.textContent = btnText; btn.disabled = false;
+    // после нажатия — сразу свежее состояние с сервера (надпись меняется сразу, а не при
+    // следующем опросе через 10–30 с)
+    btn.onclick = async () => {
+      btn.disabled = true;
+      let r;
+      try { r = await onClick(); } catch (_) { /* покажет опрос */ }
+      btn.disabled = false;
+      if (r !== false) poll();          // false — действие само показало ошибку, не затираем её
+    };
+  } else btn.hidden = true;
 }
 
 async function wake() {
   banner('Отправляю команду включения…');
   try {
     const r = await api('/api/wake', { method: 'POST' });
-    if (!r.ok) banner('Home Assistant не ответил на команду включения', 'Повторить', wake, true);
+    if (!r.ok) { banner('Home Assistant не ответил на команду включения', 'Повторить', wake, true); poll(10000); return false; }
   } catch (_) {}
   poll(1500);
 }
@@ -169,7 +180,7 @@ async function poll(delay) {
     banner(`Сбор метаданных из файлов (${ix.info[0].toLocaleString('ru')} из ${ix.info[1].toLocaleString('ru')})`,
       admin ? 'Остановить' : null, stopInfo); next = 3000;
   } else if (st.newVersion && st.lib) {
-    banner('Список файлов обновился', 'Показать', () => { st.newVersion = null; loadLibrary(); });
+    banner('Список файлов обновился', 'Показать', async () => { st.newVersion = null; banner(null); await loadLibrary(); });
   } else banner(null);
 
   if (ix.v && !st.lib && !st.libPromise) await loadLibrary();
@@ -589,12 +600,17 @@ $('grid').addEventListener('click', (e) => {
 // только середина плитки); у края экрана лента прокручивается сама. Касание — выбрать/снять.
 // Компьютер: меню ⋯ → «Выбрать фото», клик — выбрать/снять, Shift+клик — все между этим и
 // предыдущим по порядку строк. Сверху — «✕ Выбрано N» и действие.
-const SEL = { on: false, set: new Set(), anchor: -1, drag: null, press: null, ignoreClick: 0, raf: 0 };
+// anchor — последнее фото, по которому кликнули, anchorOn — выбрали его этим кликом или сняли
+const SEL = { on: false, set: new Set(), anchor: -1, anchorOn: true, drag: null, press: null, ignoreClick: 0, raf: 0 };
 const LONG_PRESS = 450;
+const SEL_EDGE = 0.15;      // протягивание: у краёв плитки (доля стороны) фото не выбирается
 
 function selUpdate() {
+  const row = document.querySelector('.top > .row');
+  // панель выбора — той же высоты, что строка, которую она заменяет: лента не сдвигается под пальцем
+  if (SEL.on && !row.hidden) $('selbar').style.minHeight = row.offsetHeight + 'px';
   $('selbar').hidden = !SEL.on;
-  document.querySelector('.top > .row').hidden = SEL.on;
+  row.hidden = SEL.on;
   $('grid').classList.toggle('selmode', SEL.on);
   $('sel-n').textContent = `Выбрано: ${SEL.set.size.toLocaleString('ru')}`;
   $('sel-hide').disabled = $('sel-show').disabled = !SEL.set.size;
@@ -614,10 +630,11 @@ function selMark(i, on) {
 function selClick(i, shift) {
   const ph = st.list[i]; if (!ph) return;
   if (shift && SEL.anchor >= 0 && SEL.anchor !== i) {
-    // все между предыдущим и этим — по порядку в ленте, то есть по строкам
+    // все между предыдущим и этим — по порядку в ленте, то есть по строкам; как с предыдущим:
+    // его выбрали — выбираем, сняли — снимаем
     const [a, b] = SEL.anchor < i ? [SEL.anchor, i] : [i, SEL.anchor];
-    for (let k = a; k <= b; k++) selMark(k, true);
-  } else selMark(i, !SEL.set.has(ph[0]));
+    for (let k = a; k <= b; k++) selMark(k, SEL.anchorOn);
+  } else { SEL.anchorOn = !SEL.set.has(ph[0]); selMark(i, SEL.anchorOn); }
   SEL.anchor = i;
   selUpdate();
 }
@@ -644,11 +661,11 @@ $('sel-show').addEventListener('click', () => selApply(false));
 
 // --- палец: долгое нажатие и протягивание
 function tileAt(cx, cy) {
-  // плитка под точкой, только если точка в её середине (без 20 % у краёв): идя по диагонали
+  // плитка под точкой, только если точка в её середине (без 15 % у краёв): идя по диагонали
   // через угол, соседние плитки не цепляем
   const t = document.elementFromPoint(cx, cy); const tile = t && t.closest && t.closest('.tile');
   if (!tile || !$('grid').contains(tile)) return -1;
-  const r = tile.getBoundingClientRect(), m = Math.min(r.width, r.height) * 0.2;
+  const r = tile.getBoundingClientRect(), m = Math.min(r.width, r.height) * SEL_EDGE;
   return cx > r.left + m && cx < r.right - m && cy > r.top + m && cy < r.bottom - m ? +tile.dataset.i : -1;
 }
 function dragTo(cx, cy) {
@@ -690,7 +707,7 @@ $('grid').addEventListener('touchstart', (e) => {
     if (!SEL.on) selStart();
     const ph = st.list[i]; if (!ph) return;
     const add = !SEL.set.has(ph[0]);
-    selMark(i, add); SEL.anchor = i;
+    selMark(i, add); SEL.anchor = i; SEL.anchorOn = add;
     SEL.drag = { add, last: i, px: x, py: y + window.scrollY, cx: x, cy: y };
     if (navigator.vibrate) navigator.vibrate(20);
     selUpdate();
