@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.0.2"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.0.3"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -98,18 +98,22 @@ class Config:
     def __init__(self):
         self.path = app_dir() / "config.json"
         self.server = self.root = self.client_id = self.key_type = self.fp = ""
+        self.updates = True                              # проверять обновления при запуске
         try:
             d = json.loads(self.path.read_text(encoding="utf-8"))
             for k in self.FIELDS:
                 if isinstance(d.get(k), str):
                     setattr(self, k, d[k])
+            if isinstance(d.get("updates"), bool):
+                self.updates = d["updates"]
         except (OSError, ValueError):
             pass
 
     def save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({k: getattr(self, k) for k in self.FIELDS}, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
+        d = {k: getattr(self, k) for k in self.FIELDS}
+        d["updates"] = self.updates
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, self.path)
 
 
@@ -232,15 +236,21 @@ if IS_WIN:
                     ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
                     ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
 
-    def to_recycle_bin(p: Path) -> None:
-        """В корзину (можно восстановить): SHFileOperation с FOF_ALLOWUNDO. Если в корзину нельзя (файл
-        больше её размера, корзина отключена) — FOF_WANTNUKEWARNING: Windows спросит, а не удалит молча."""
-        op = _SHFILEOPSTRUCTW(None, 3, str(p) + "\0\0", None, 0x40 | 0x10 | 0x4 | 0x400 | 0x4000, False, None, None)
+    def to_recycle_bin(paths: list[Path]) -> str:
+        """Пачку файлов — в корзину (можно восстановить) одним вызовом SHFileOperation с FOF_ALLOWUNDO:
+        по одному файлу это в разы дольше. Если в корзину нельзя (файл больше её размера, корзина
+        отключена) — FOF_WANTNUKEWARNING: Windows спросит, а не удалит молча.
+        -> пояснение ошибки или ""; что удалилось, вызывающий проверяет сам (файла больше нет)."""
+        buf = ctypes.create_unicode_buffer("\0".join(str(p) for p in paths) + "\0\0")
+        op = _SHFILEOPSTRUCTW(None, 3, ctypes.cast(buf, wintypes.LPCWSTR), None,
+                              0x40 | 0x10 | 0x4 | 0x400 | 0x4000, False, None, None)
         r = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-        if r != 0 or op.fAnyOperationsAborted:
-            raise OSError(f"не удалось отправить в корзину (код {r})")
-        if p.exists():
-            raise OSError("файл остался на месте")
+        if op.fAnyOperationsAborted:
+            return "отменено"
+        return f"не удалось отправить в корзину (код {r})" if r else ""
+
+    def open_folder(p: Path) -> None:
+        os.startfile(str(p))  # noqa: S606
 else:
     class FileKey:
         """ТОЛЬКО ДЛЯ ПРОВЕРКИ НА LINUX: ключ в файле."""
@@ -282,10 +292,15 @@ else:
     def set_hidden(p: Path) -> None:
         pass
 
-    def to_recycle_bin(p: Path) -> None:
+    def to_recycle_bin(paths: list[Path]) -> str:
         trash = app_dir() / "trash"
         trash.mkdir(exist_ok=True)
-        shutil.move(str(p), str(trash / f"{int(time.time() * 1000)}-{p.name}"))
+        for p in paths:
+            shutil.move(str(p), str(trash / f"{time.time_ns()}-{p.name}"))
+        return ""
+
+    def open_folder(p: Path) -> None:
+        subprocess.Popen(["xdg-open", str(p)])
 
 
 # ======================================================================== сервер
@@ -431,28 +446,26 @@ def _ver(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v)[:4]) or (0,)
 
 
-def update_if_newer() -> str | None:
-    """Новая версия поставлена -> её номер (надо перезапуститься); иначе None."""
-    try:
-        with httpx.Client(timeout=httpx.Timeout(30, connect=10), follow_redirects=True,
-                          headers={"user-agent": f"photocloud-pc/{VERSION}"}) as c:
-            r = c.get(f"https://api.github.com/repos/{REPO}/commits/master", headers={"accept": "application/vnd.github.sha"})
-            sha = r.text.strip() if r.status_code == 200 and re.fullmatch(r"[0-9a-f]{40}", r.text.strip()) else "master"
-            r = c.get(f"https://raw.githubusercontent.com/{REPO}/{sha}/{REMOTE_PATH}", headers={"cache-control": "no-cache"})
-        if r.status_code != 200:
-            return None
-        m = _VERSION_RE.search(r.text)
-        if not m or _ver(m.group(1)) <= _ver(VERSION):
-            return None
-        compile(r.text, str(SCRIPT), "exec")
-        tmp = SCRIPT.with_name(SCRIPT.name + ".new")
-        tmp.write_text(r.text, encoding="utf-8", newline="\n")
-        os.replace(tmp, SCRIPT)
-        log.info("обновлено до %s (коммит %s)", m.group(1), sha[:10])
-        return m.group(1)
-    except Exception as e:  # noqa: BLE001 — обновление не обязательно
-        log.warning("проверка обновлений: %s", e)
-        return None
+def fetch_update() -> tuple[str, str, str] | None:
+    """-> (версия, текст файла, коммит), если на GitHub версия новее; иначе None. Сбой — исключение."""
+    with httpx.Client(timeout=httpx.Timeout(30, connect=10), follow_redirects=True,
+                      headers={"user-agent": f"photocloud-pc/{VERSION}"}) as c:
+        r = c.get(f"https://api.github.com/repos/{REPO}/commits/master", headers={"accept": "application/vnd.github.sha"})
+        sha = r.text.strip() if r.status_code == 200 and re.fullmatch(r"[0-9a-f]{40}", r.text.strip()) else "master"
+        r = c.get(f"https://raw.githubusercontent.com/{REPO}/{sha}/{REMOTE_PATH}", headers={"cache-control": "no-cache"})
+    if r.status_code != 200:
+        raise ServerError(f"GitHub: HTTP {r.status_code}")
+    m = _VERSION_RE.search(r.text)
+    if not m:
+        raise ServerError("на GitHub нет клиента")
+    return (m.group(1), r.text, sha) if _ver(m.group(1)) > _ver(VERSION) else None
+
+
+def install(text: str) -> None:
+    compile(text, str(SCRIPT), "exec")                 # битый файл не поставится
+    tmp = SCRIPT.with_name(SCRIPT.name + ".new")
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    os.replace(tmp, SCRIPT)
 
 
 def restart() -> None:
@@ -494,19 +507,36 @@ class App:
         self.want: set[str] = set()                  # видно сейчас (и экран вокруг)
         self.drawn: dict[int, object] = {}           # нарисованные карточки -> их картинка
         self.cols, self.gen, self._pending = 1, 0, False
+        self.busy, self.stop = False, False              # идёт удаление; просили остановить
         self._build()
+        h = _UiLog(self)
+        log.addHandler(h)
         self.root.after(100, self._pump)
         self.root.after(200, self.start)
 
     # ---- разметка
     def _build(self) -> None:
-        top = ttk.Frame(self.root, padding=(12, 10))
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True)
+        main = ttk.Frame(self.nb)
+        self.nb.add(main, text="Удаление")
+        self._build_main(main)
+        lg = ttk.Frame(self.nb)
+        self.nb.add(lg, text="Журнал")
+        self._build_log(lg)
+        st = ttk.Frame(self.nb)
+        self.nb.add(st, text="Настройки")
+        self._build_settings(st)
+        self._buttons(False)
+
+    def _build_main(self, main) -> None:
+        top = ttk.Frame(main, padding=(12, 10))
         top.pack(fill="x")
         self.b_reload = ttk.Button(top, text="Обновить список", command=self.load)
         self.b_reload.pack(side="right", padx=4)          # сначала кнопка — длинная строка её не вытеснит
         self.status = ttk.Label(top, text="Запуск…")
         self.status.pack(side="left", fill="x", expand=True)
-        bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        bar = ttk.Frame(main, padding=(12, 0, 12, 8))
         bar.pack(fill="x")
         self.b_del = ttk.Button(bar, text="Удалить выбранные в корзину", command=self.delete)
         self.b_del.pack(side="left")
@@ -516,10 +546,17 @@ class App:
         self.b_unmark.pack(side="left", padx=8)
         ttk.Button(bar, text="Выбрать все проверенные", command=lambda: self._select(True)).pack(side="left")
         ttk.Button(bar, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=8)
-        self.summary = ttk.Label(self.root, text="", padding=(12, 0, 12, 8))
+        self.summary = ttk.Label(main, text="", padding=(12, 0, 12, 8))
         self.summary.pack(fill="x")
-        wrap = ttk.Frame(self.root)
+        self.prog = ttk.Frame(main, padding=(12, 0, 12, 8))       # прогресс: проверка файлов, удаление
+        self.prog_text = ttk.Label(self.prog, text="")
+        self.prog_text.pack(side="left")
+        self.b_stop = ttk.Button(self.prog, text="Остановить", command=self._stop)
+        self.prog_bar = ttk.Progressbar(self.prog, maximum=1)
+        self.prog_bar.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        wrap = ttk.Frame(main)
         wrap.pack(fill="both", expand=True)
+        self._wrap = wrap
         self.canvas = tk.Canvas(wrap, highlightthickness=0, background=BG, yscrollincrement=20)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self._soon()))
@@ -531,7 +568,90 @@ class App:
         self.root.bind_all("<MouseWheel>", self._wheel)
         self.root.bind_all("<Button-4>", self._wheel)
         self.root.bind_all("<Button-5>", self._wheel)
-        self._buttons(False)
+
+    def _build_log(self, lg) -> None:
+        bot = ttk.Frame(lg, padding=(8, 6))
+        bot.pack(fill="x", side="bottom")
+        ttk.Button(bot, text="Открыть папку", command=lambda: open_folder(app_dir())).pack(side="right")
+        ttk.Label(bot, text=f"Подробный журнал: {app_dir() / 'pc.log'}", foreground="#777").pack(side="left")
+        self.logbox = tk.Text(lg, wrap="none", state="disabled", font=("Consolas", 9), height=10)
+        ys = ttk.Scrollbar(lg, orient="vertical", command=self.logbox.yview)
+        xs = ttk.Scrollbar(lg, orient="horizontal", command=self.logbox.xview)
+        self.logbox.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side="right", fill="y")
+        xs.pack(side="bottom", fill="x")
+        self.logbox.pack(fill="both", expand=True)
+        try:                                             # прошлые запуски — последние строки файла
+            with open(app_dir() / "pc.log", encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-300:]
+            for line in tail:
+                self._log_line(line.rstrip("\n"))
+        except OSError:
+            pass
+
+    def _log_line(self, line: str) -> None:
+        b = self.logbox
+        at_end = b.yview()[1] >= 0.999
+        b.configure(state="normal")
+        b.insert("end", line + "\n")
+        if int(b.index("end-1c").split(".")[0]) > 3000:
+            b.delete("1.0", "500.0")
+        b.configure(state="disabled")
+        if at_end:
+            b.see("end")
+
+    def _build_settings(self, s) -> None:
+        s.columnconfigure(1, weight=1)
+        pad = {"padx": 12, "pady": 4}
+        self.v_server = tk.StringVar(value=self.cfg.server)
+        self.v_root = tk.StringVar(value=self.cfg.root)
+        self.v_setmsg, self.v_key, self.v_updmsg = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.v_upd = tk.BooleanVar(value=self.cfg.updates)
+        r = 0
+        ttk.Label(s, text="Адрес сайта:").grid(row=r, column=0, sticky="w", padx=12, pady=(14, 4))
+        ttk.Entry(s, textvariable=self.v_server).grid(row=r, column=1, columnspan=2, sticky="ew", padx=12, pady=(14, 4))
+        r += 1
+        ttk.Label(s, text="Папка архива:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(s, textvariable=self.v_root).grid(row=r, column=1, sticky="ew", padx=(12, 4), pady=4)
+        ttk.Button(s, text="Выбрать…", command=self._pick_root).grid(row=r, column=2, padx=(0, 12), pady=4)
+        r += 1
+        b = ttk.Frame(s)
+        b.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Button(b, text="Сохранить", command=self.save_settings).pack(side="left")
+        ttk.Label(b, textvariable=self.v_setmsg, foreground="#666", wraplength=520).pack(side="left", padx=10)
+        r += 1
+        ttk.Separator(s).grid(row=r, column=0, columnspan=3, sticky="ew", padx=12, pady=10)
+        r += 1
+        ttk.Label(s, text="Ключ входа:").grid(row=r, column=0, sticky="w", **pad)
+        kb = ttk.Frame(s)
+        kb.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(kb, textvariable=self.v_key).pack(side="left")
+        ttk.Button(kb, text="Привязать заново", command=self.repair).pack(side="left", padx=10)
+        r += 1
+        ttk.Separator(s).grid(row=r, column=0, columnspan=3, sticky="ew", padx=12, pady=10)
+        r += 1
+        ttk.Label(s, text="Версия:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Label(s, text=VERSION).grid(row=r, column=1, sticky="w", **pad)
+        r += 1
+        ttk.Checkbutton(s, text="Проверять обновления на GitHub при запуске", variable=self.v_upd,
+                        command=self._save_upd).grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        r += 1
+        ub = ttk.Frame(s)
+        ub.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Button(ub, text="Проверить обновления", command=self.check_update).pack(side="left")
+        ttk.Label(ub, textvariable=self.v_updmsg, foreground="#666", wraplength=520).pack(side="left", padx=10)
+        r += 1
+        ttk.Label(s, text="Автозапуска нет: программа работает, только пока открыто окно. Настройки и журнал — "
+                          f"в {app_dir()}.", foreground="#777", wraplength=700).grid(
+            row=r, column=0, columnspan=3, sticky="w", padx=12, pady=(18, 4))
+        self._key_text()
+
+    def _key_text(self) -> None:
+        if self.cfg.client_id and self.cfg.fp:
+            kind = "программный, не в TPM" if self.cfg.key_type == "software" else "в TPM"
+            self.v_key.set(f"{self.cfg.fp} ({kind})")
+        else:
+            self.v_key.set("не привязан")
 
     def _wheel(self, e) -> None:
         try:
@@ -570,7 +690,15 @@ class App:
                 fn()
             except Exception as e:  # noqa: BLE001
                 log.exception("ошибка")
-                self.ui(lambda: (self.say(f"Ошибка: {e}"), self._buttons(True)))
+                msg = str(e) or type(e).__name__
+
+                def show():
+                    self.busy = False
+                    self.b_stop.pack_forget()
+                    self._progress(None)
+                    self._buttons(True)
+                    messagebox.showerror(APP, f"Ошибка: {msg}\n\nПодробности — на вкладке «Журнал».")
+                self.ui(show)
         threading.Thread(target=run, daemon=True).start()
 
     # ---- запуск: адрес сервера, ключ, привязка
@@ -581,7 +709,7 @@ class App:
                 self.root.destroy()
                 return
             s = s.strip().rstrip("/")
-            if not re.match(r"^https://[^/\s]+$", s) and not re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", s):
+            if not valid_server(s):
                 messagebox.showerror(APP, "Нужен адрес вида https://домен")
                 self.root.after(10, self.start)
                 return
@@ -597,6 +725,8 @@ class App:
             self.root.destroy()
             return
         self.api = Api(self.cfg, self.key)
+        if self.cfg.updates and "--no-update" not in sys.argv:
+            self.root.after(1500, lambda: self.check_update(quiet=True))
         if not self.cfg.client_id:
             self.bg(self._pair)
         else:
@@ -662,6 +792,7 @@ class App:
         self.cfg.client_id, self.cfg.root, self.cfg.fp = res["id"], str(rootp), res["fp"]
         self.cfg.key_type = getattr(self.key, "kind", "tpm")
         self.cfg.save()
+        self.ui(lambda: (self.v_root.set(self.cfg.root), self._key_text()))
         log.info("привязан: ключ %s, папка %s", res["fp"], rootp)
         self.ui(lambda: messagebox.showinfo(APP, f"Привязано.\n\nОтпечаток ключа: {res['fp']}\nСверь его с админкой "
                                                  "(«Бэкап» → «Клиент на ПК»)."))
@@ -881,6 +1012,9 @@ class App:
         picked = [it for it in self.items if it["pick"]]
         ok = sum(1 for it in self.items if it["state"] == "ok")
         wait = sum(1 for it in self.items if it["state"] == "checking")
+        if not self.busy:
+            n = len(self.items)
+            self._progress(f"Проверяю файлы на диске: {n - wait} из {n}" if wait else None, n - wait, n)
         self.summary.configure(text=f"Помечено: {len(self.items)} · проверены: {ok}" + (f" · проверяю: {wait}" if wait else "")
                                     + f" · выбрано: {len(picked)} ({human(sum(max(0, it['size']) for it in picked))})"
                                     + "\nЩелчок по карточке — выбрать, двойной щелчок по фото — открыть крупно")
@@ -901,42 +1035,99 @@ class App:
                                         + (f"\n\nНе проверенные ({skip}) удалены не будут." if skip else "")):
             return
         self._buttons(False)
-        self.say("Удаляю в корзину…")
+        self.busy, self.stop = True, False
+        self.b_stop.state(["!disabled"])
+        self.b_stop.pack(side="right", padx=(10, 0))
+        self._progress(f"Удаляю в корзину: 0 из {len(picked)}", 0, len(picked))
         self.bg(lambda: self._delete(picked))
 
     def _delete(self, picked: list[dict]) -> None:
-        done, failed = [], []
+        """Пачками по 50: перепроверка, в корзину одним вызовом, отчёт серверу с подписью TPM —
+        после каждой пачки сетка и сервер уже знают, что удалено (можно остановить в любой момент)."""
+        total, done, reported, failed, rep_err = len(picked), 0, 0, [], ""
         root = Path(self.cfg.root)
-        for it in picked:
-            state, p, _n = check_file(root, it)          # перепроверка прямо перед удалением
-            if state != "ok":
-                failed.append((it["path"], "изменился после проверки"))
-                continue
-            try:
-                to_recycle_bin(p)
-                done.append({"path": it["path"], "sha": it.get("sha"), "size": it["size"]})
-                log.info("в корзину: %s", it["path"])
-            except OSError as e:
-                failed.append((it["path"], str(e)))
-                log.error("не удалён %s: %s", it["path"], e)
-        reported = 0
+        for k in range(0, total, 50):
+            if self.stop:
+                break
+            ready = []
+            for it in picked[k:k + 50]:
+                state, p, _n = check_file(root, it)      # перепроверка прямо перед удалением
+                if state == "ok":
+                    ready.append((it, p))
+                else:
+                    failed.append((it["path"], "изменился после проверки"))
+            if ready:
+                err = to_recycle_bin([p for _it, p in ready])
+                gone = []
+                for it, p in ready:
+                    if p.exists():
+                        failed.append((it["path"], err or "остался на месте"))
+                        log.error("не удалён %s: %s", it["path"], err or "остался на месте")
+                    else:
+                        gone.append(it)
+                        log.info("в корзину: %s", it["path"])
+                if gone:
+                    done += len(gone)
+                    try:
+                        reported += self._report(gone)
+                    except Exception as e:  # noqa: BLE001
+                        rep_err = str(e)
+                        log.error("отчёт об удалении не принят: %s", e)
+                    self.ui(lambda g=gone: self._drop(g))
+            n = min(total, k + 50)
+            self.ui(lambda n=n: self._progress(f"Удаляю в корзину: {n} из {total}", n, total))
+        msg = f"В корзине: {done} из {total}." + (" Остановлено." if self.stop and done + len(failed) < total else "")
         if done:
-            ts = int(time.time())
-            with self.api.mu:
-                if not self.api.sid or time.time() > self.api.exp - 60:
-                    self.api._session()
-                sid = self.api.sid
-            sig = b64e(self.key.sign(delete_message(sid, ts, done)))      # свежая подпись ключа TPM
-            r = self.api.call("POST", "/api/pc/deleted", {"items": done, "ts": ts, "sig": sig})
-            if r.status_code == 200:
-                reported = r.json().get("count", 0)
-            else:
-                log.error("отчёт об удалении не принят: %s", _err(r))
-        msg = f"В корзине: {len(done)}." + (f" Сервер отметил: {reported}." if done else "")
+            msg += f" Сервер отметил: {reported}."
+        if rep_err:
+            msg += f"\n\nСервер не принял отчёт ({rep_err}) — у удалённых останется пометка, в списке они будут " \
+                   "«файла уже нет»: выбери их и «Снять пометку на удаление»."
         if failed:
-            msg += "\n\nНе удалены:\n" + "\n".join(f"{p} — {why}" for p, why in failed[:15])
-        self.ui(lambda: messagebox.showinfo(APP, msg))
-        self.ui(self.load)
+            msg += f"\n\nНе удалены ({len(failed)}):\n" + "\n".join(f"{p} — {why}" for p, why in failed[:15])
+        log.info("удаление: %s", msg.replace("\n", " "))
+
+        def finish():
+            self.busy = False
+            self.b_stop.pack_forget()
+            self._progress(None)
+            messagebox.showinfo(APP, msg)
+            self.load()
+        self.ui(finish)
+
+    def _report(self, gone: list[dict]) -> int:
+        items = [{"path": it["path"], "sha": it.get("sha"), "size": it["size"]} for it in gone]
+        ts = int(time.time())
+        with self.api.mu:
+            if not self.api.sid or time.time() > self.api.exp - 60:
+                self.api._session()
+            sid = self.api.sid
+        sig = b64e(self.key.sign(delete_message(sid, ts, items)))      # свежая подпись ключа TPM
+        r = self.api.call("POST", "/api/pc/deleted", {"items": items, "ts": ts, "sig": sig})
+        if r.status_code != 200:
+            raise ServerError(_err(r))
+        return int(r.json().get("count", 0))
+
+    def _drop(self, gone: list[dict]) -> None:
+        """Удалённое — сразу из сетки."""
+        g = {it["path"] for it in gone}
+        self.items = [it for it in self.items if it["path"] not in g]
+        self.index = {it["path"]: i for i, it in enumerate(self.items)}
+        self._layout()
+        self._count()
+
+    def _stop(self) -> None:
+        self.stop = True
+        self.b_stop.state(["disabled"])
+        self.prog_text.configure(text="Останавливаю после текущей пачки…")
+
+    def _progress(self, text: str | None, done: int = 0, total: int = 1) -> None:
+        if text is None:
+            self.prog.pack_forget()
+            return
+        if not self.prog.winfo_ismapped():
+            self.prog.pack(fill="x", before=self._wrap)
+        self.prog_text.configure(text=text)
+        self.prog_bar.configure(maximum=max(1, total), value=done)
 
     def unmark(self) -> None:
         self._send("/api/pc/unmark", "Снять пометку «на удаление» с {n} файл(ов)? Файлы останутся на месте "
@@ -964,12 +1155,118 @@ class App:
             self.ui(self.load)
         self.bg(go)
 
+    # ---- настройки
+    def _pick_root(self) -> None:
+        d = filedialog.askdirectory(title="Папка архива", initialdir=self.v_root.get() or None)
+        if d:
+            self.v_root.set(str(Path(d)))
+
+    def save_settings(self) -> None:
+        if self.busy:
+            messagebox.showinfo(APP, "Дождись окончания удаления.")
+            return
+        srv = self.v_server.get().strip().rstrip("/")
+        if not valid_server(srv):
+            self.v_setmsg.set("Нужен адрес вида https://домен")
+            return
+        root = self.v_root.get().strip()
+        if not root or not Path(root).is_dir():
+            self.v_setmsg.set("Такой папки нет")
+            return
+        moved = srv != self.cfg.server
+        self.cfg.server, self.cfg.root = srv, str(Path(root))
+        if moved:                                        # другой сервер — другая привязка
+            self.cfg.client_id = self.cfg.fp = ""
+        self.cfg.save()
+        log.info("настройки: сервер %s, папка %s", self.cfg.server, self.cfg.root)
+        self.v_setmsg.set("Сохранено.")
+        self._key_text()
+        if self.api is None:
+            return
+        if moved:
+            self.api.close()
+            self.api = Api(self.cfg, self.key)
+            self.v_setmsg.set("Сохранено. Новый адрес — нужна привязка: в админке «Привязать».")
+            self.bg(self._pair)
+        else:
+            self.load()
+
+    def repair(self) -> None:
+        if self.busy or self.api is None:
+            return
+        if not messagebox.askyesno(APP, "Привязать этот ПК заново?\n\nСначала в админке: «Бэкап» → «Клиент на ПК» → "
+                                        "«Привязать заново», потом «Да» здесь."):
+            return
+        self.cfg.client_id = self.cfg.fp = ""
+        self.cfg.save()
+        self._key_text()
+        self.bg(self._pair)
+
+    def _save_upd(self) -> None:
+        self.cfg.updates = bool(self.v_upd.get())
+        self.cfg.save()
+
+    def check_update(self, quiet: bool = False) -> None:
+        """quiet — сама при запуске: спрашивает, только если есть новая версия."""
+        self.v_updmsg.set("Проверяю…")
+
+        def run():
+            try:
+                u = fetch_update()
+            except Exception as e:  # noqa: BLE001
+                log.warning("проверка обновлений: %s", e)
+                self.ui(lambda: self.v_updmsg.set(f"Не удалось проверить: {e}"))
+                return
+            self.ui(lambda: self._update_found(u))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_found(self, u) -> None:
+        if not u:
+            self.v_updmsg.set(f"Установлена последняя версия {VERSION}.")
+            return
+        ver, text, sha = u
+        self.v_updmsg.set(f"Доступна версия {ver} (сейчас {VERSION}).")
+        if self.busy:
+            return
+        if not messagebox.askyesno(APP, f"Доступно обновление: {ver} (сейчас {VERSION}).\n\nОбновить сейчас? "
+                                        "Программа перезапустится."):
+            return
+        try:
+            install(text)
+        except Exception as e:  # noqa: BLE001
+            log.exception("обновление не удалось")
+            messagebox.showerror(APP, f"Обновление не удалось: {e}")
+            return
+        log.info("обновлено до %s (коммит %s), перезапуск", ver, sha[:10])
+        restart()
+        self.root.destroy()
+
     def run(self) -> None:
         self.root.mainloop()
         self.check_pool.shutdown(wait=False, cancel_futures=True)
         self.thumb_pool.shutdown(wait=False, cancel_futures=True)
         if self.api:
             self.api.close()
+
+
+class _UiLog(logging.Handler):
+    """Журнал — и во вкладку «Журнал» (через очередь окна: из рабочих потоков в tk нельзя)."""
+
+    def __init__(self, app: "App"):
+        super().__init__(logging.INFO)
+        self.app = app
+        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
+    def emit(self, record) -> None:
+        try:
+            line = self.format(record).split("\n", 1)[0]
+        except Exception:  # noqa: BLE001
+            return
+        self.app.ui(lambda: self.app._log_line(line))
+
+
+def valid_server(s: str) -> bool:
+    return bool(re.match(r"^https://[^/\s]+$", s) or re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", s))
 
 
 def ask_text(parent, title: str, prompt: str) -> str:
@@ -1024,10 +1321,6 @@ def main() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
     log.info("старт %s: %s", VERSION, SCRIPT)
     if not _ensure_deps():
-        return
-    if "--no-update" not in sys.argv and (new := update_if_newer()):
-        log.info("перезапуск в версии %s", new)
-        restart()
         return
     App(Config()).run()
 
