@@ -463,3 +463,93 @@ class DB:
         if rows:
             self.many("UPDATE backup_tokens SET last_seen = ?, last_ip = ?, report = ?, stale_sent = ? WHERE id = ?",
                       rows)
+
+
+class ThumbStore:
+    """Эскизы фото (240 и 400 px) — отдельный файл thumbs.db рядом с основной базой: он большой
+    (~1 ГБ на 45 тыс. фото), запись эскизов не держит замок основной базы, а «Очистить эскизы фото»
+    просто удаляет файл — место освобождается сразу. Ключ — путь+размер+mtime файла (файл
+    изменился — эскиз считается заново), вид — формат:размер:качество (сменили настройки —
+    старые не подходят). Неудачные эскизы сюда не попадают."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.mu = threading.Lock()
+        self.con: sqlite3.Connection | None = None
+        self._stats: tuple[float, tuple] = (0.0, ())
+        self._open()
+
+    def _open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=10)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("""CREATE TABLE IF NOT EXISTS thumbs (
+            key TEXT NOT NULL, kind TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY (key, kind))""")
+        self.con = con
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+    def _q(self, sql: str, args=()):
+        with self.mu:
+            return self.con.execute(sql, args).fetchall()
+
+    def get(self, key: str, kind: str) -> bytes | None:
+        r = self._q("SELECT data FROM thumbs WHERE key = ? AND kind = ?", (key, kind))
+        return r[0][0] if r else None
+
+    def put(self, key: str, kind: str, data: bytes) -> None:
+        self._q("INSERT OR REPLACE INTO thumbs (key, kind, data) VALUES (?, ?, ?)", (key, kind, data))
+
+    def keys(self, kind: str) -> set[str]:
+        return {k for (k,) in self._q("SELECT key FROM thumbs WHERE kind = ?", (kind,))}
+
+    def stats(self, kinds: tuple[str, ...]) -> tuple[int, int]:
+        """-> (фото, у которых есть все эскизы kinds; байт на диске). Считается не чаще раза в 15 с."""
+        t, v = self._stats
+        if v and v[0] == kinds and time.time() - t < 15:
+            return v[1], v[2]
+        marks = ",".join("?" * len(kinds))
+        n = self._q(f"SELECT count(*) FROM (SELECT key FROM thumbs WHERE kind IN ({marks}) GROUP BY key "
+                    f"HAVING count(*) = ?)", (*kinds, len(kinds)))[0][0]
+        size = 0
+        for suffix in ("", "-wal"):
+            try:
+                size += os.path.getsize(str(self.path) + suffix)
+            except OSError:
+                pass
+        self._stats = (time.time(), (kinds, int(n), size))
+        return int(n), size
+
+    def fresh(self) -> None:
+        """Следующий stats() — посчитать заново."""
+        self._stats = (0.0, ())
+
+    def prune(self, keep: set[str]) -> int:
+        """Эскизы файлов, которых больше нет (переименованы, удалены, изменены)."""
+        gone = [(k,) for (k,) in self._q("SELECT DISTINCT key FROM thumbs") if k not in keep]
+        if gone:
+            with self.mu:
+                self.con.execute("BEGIN")
+                try:
+                    self.con.executemany("DELETE FROM thumbs WHERE key = ?", gone)
+                    self.con.execute("COMMIT")
+                except BaseException:
+                    self.con.execute("ROLLBACK")
+                    raise
+            self._stats = (0.0, ())
+        return len(gone)
+
+    def clear(self) -> None:
+        """Удалить все эскизы фото вместе с файлом базы."""
+        with self.mu:
+            self.con.close()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(str(self.path) + suffix)
+                except FileNotFoundError:
+                    pass
+            self._open()
+            self._stats = (0.0, ())

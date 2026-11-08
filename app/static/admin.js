@@ -22,8 +22,8 @@ const AUDIT = {
   '2fa_reset': 'сброшено приложение 2FA (настройка заново)', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
-  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', group: 'фото сгруппированы', vthumbs: 'подсчёт эскизов видео', ungroup: 'группа разобрана', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', delete_mark: 'помечены на удаление', delete_unmark: 'снята пометка на удаление', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
-  unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка кэша',
+  user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', group: 'фото сгруппированы', vthumbs: 'подсчёт эскизов видео', pthumbs: 'подсчёт эскизов фото', pthumbs_clear: 'эскизы фото удалены из базы', ungroup: 'группа разобрана', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', delete_mark: 'помечены на удаление', delete_unmark: 'снята пометка на удаление', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
+  unlock_ip: 'IP разблокирован', settings: 'изменены настройки', wake: 'пробуждение ПК', cache_clear: 'очистка памяти эскизов',
   backup_token_add: 'создан токен бэкапа', backup_token_revoke: 'отозван токен бэкапа', backup_denied: 'бэкап: неверный токен',
   hash_stop: 'остановлен подсчёт хешей', hash_verify: 'запущена проверка хешей', hash_verify_done: 'проверка хешей завершена',
   hash_mismatch: 'хеш не совпал', damaged_found: 'повреждён файл на сервере', damaged_restored: 'восстановлена копия в Restored',
@@ -157,6 +157,14 @@ async function loadOverview() {
     ['Индекс', ix.state + (ix.error ? ` (${ix.error})` : '') + (ix.meta[1] && ix.meta[0] < ix.meta[1] ? `, даты ${ix.meta[0]}/${ix.meta[1]}` : '')],
     ['Список файлов обновлён', dt(ix.built_at)],
     ...(o.hashes ? [['Хеши файлов', hashText(o.hashes, o.hashes.unhashed, o.hashes.files)]] : []),
+    ['Эскизы фото в базе', (() => {
+      const v = o.pthumbs || {}; ptRunning = v.state === 'running';
+      $('act-pthumbs').textContent = ptRunning ? 'Остановить эскизы фото' : 'Посчитать эскизы фото';
+      const base = `${(v.stored || 0).toLocaleString('ru')} из ${(v.photos || 0).toLocaleString('ru')} (${mb(v.bytes || 0)})`;
+      if (ptRunning) return `${base} · считаются: ${v.done.toLocaleString('ru')} из ${v.total.toLocaleString('ru')}`;
+      return base + ({ stopped: ' · подсчёт остановлен', pc: ' · ПК выключился — продолжится по кнопке' }[v.state] || '')
+        + (v.failed ? ` · не вышло: ${v.failed}` : '');
+    })()],
     // число — ссылка на свои скрытые (/hidden)
     ['Эскизы видео в базе', (() => {
       const v = o.vthumbs || {}; vtRunning = v.state === 'running';
@@ -200,9 +208,16 @@ $('act-vthumbs').onclick = () => (vtRunning
   ? act(() => api('/api/admin/vthumbs/stop', {}), 'Подсчёт остановлен')
   : act(() => api('/api/admin/vthumbs/start', {}), 'Считаю эскизы видео'));
 let vtRunning = false;
-$('act-wake').onclick = () => act(() => api('/api/wake', {}), 'Команда отправлена');
-$('act-notify').onclick = () => act(() => api('/api/admin/notify-test', {}), 'Уведомление отправлено');
-$('act-cache').onclick = () => act(() => api('/api/admin/cache/clear', {}), 'Кэш очищен').then(loadOverview);
+$('act-cache').onclick = () => act(() => api('/api/admin/cache/clear', {}), 'Память эскизов очищена').then(loadOverview);
+// эскизы фото в базе: идёт подсчёт — кнопка останавливает
+$('act-pthumbs').onclick = () => (ptRunning
+  ? act(() => api('/api/admin/pthumbs/stop', {}), 'Подсчёт остановлен')
+  : act(() => api('/api/admin/pthumbs/start', {}), 'Считаю эскизы фото')).then(loadOverview);
+$('act-pthumbs-clear').onclick = () => {
+  if (!confirm('Удалить все эскизы фото из базы? Они будут делаться заново с ПК при просмотре или по кнопке «Посчитать эскизы фото». Эскизы видео останутся.')) return;
+  act(() => api('/api/admin/pthumbs/clear', {}), 'Эскизы фото удалены').then(loadOverview);
+};
+let ptRunning = false;
 
 // ================================================================== пользователи
 

@@ -32,7 +32,7 @@ from . import config
 from . import geo
 from . import logs
 from . import totp
-from .db import DB
+from .db import DB, ThumbStore
 from .backup import TokenStore
 from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserStore
 from .ha import HomeAssistant, clean
@@ -64,6 +64,7 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
+pthumbs = ThumbStore(S.data_dir / "thumbs.db")      # эскизы фото 240/400 — отдельный файл
 library = Library(S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
@@ -1592,10 +1593,17 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
         raise HTTPException(415)
     data = None
     timing = ""
-    # самый маленький эскиз видео хранится в базе: посчитали раз — дальше сразу (и без ПК)
+    # в базе хранятся: самый маленький эскиз видео и эскизы фото 240 и 400 — посчитали раз,
+    # дальше сразу (и без ПК). Порядок: память сервера -> база на диске -> делаем с ПК.
     vkeep = p.video and kind == "s"
-    if vkeep and cache.get(key) is None:
-        stored = await run_in_threadpool(db.vthumb_get, p.cache_key(), S.image_format)
+    pkind = _pkind(kind) if not p.video and kind in "st" else None
+    if (vkeep or pkind) and cache.get(key) is None:
+        try:
+            stored = await run_in_threadpool(db.vthumb_get, p.cache_key(), S.image_format) if vkeep else \
+                await run_in_threadpool(pthumbs.get, p.cache_key(), pkind)
+        except Exception as e:  # noqa: BLE001 — нет базы — сделаем с ПК
+            log.warning("эскизы в базе: не читаются (%s)", e)
+            stored = None
         if stored is not None:
             cache.put(key, stored)
     try:
@@ -1659,9 +1667,14 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
                 timing = ", ".join(f"{k};dur={v:.1f}" for k, v in tm.items() if k != "src") + \
                     (", src;desc=embedded" if tm.get("src") else "")
                 cache.put(key, data)
-                if vkeep:
-                    await run_in_threadpool(db.vthumb_put, p.cache_key(), S.image_format, data)
                 fut.set_result(data)
+                try:
+                    if vkeep:
+                        await run_in_threadpool(db.vthumb_put, p.cache_key(), S.image_format, data)
+                    elif pkind:
+                        await run_in_threadpool(pthumbs.put, p.cache_key(), pkind, data)
+                except Exception as e:  # noqa: BLE001 — эскиз уже есть, не сохранился — сделаем в другой раз
+                    log.warning("эскизы в базе: не записался (%s)", e)
                 break
             except BaseException as e:
                 if not fut.done():
@@ -1791,6 +1804,101 @@ def _info_from_file(p) -> dict:
 
 
 library.info_reader = _info_from_file      # фоновый сбор подробностей после сканирования
+library.thumbstore = pthumbs               # после сканирования — убрать эскизы пропавших файлов
+
+
+# ---- эскизы фото в базе (240 и 400): при просмотре — сами, «Посчитать эскизы фото» — все заранее
+
+def _pkind(kind: str) -> str:
+    """Вид эскиза фото в базе: формат:размер:качество — сменили настройки, старые не подходят."""
+    box = S.thumb_small_size if kind == "s" else S.thumb_size
+    return f"{S.image_format}:{box}:{S.thumb_quality}"
+
+
+class PT:
+    state = ""          # "" | running | stopped | done | pc
+    done = total = made = failed = 0
+    stop = threading.Event()
+    thread: threading.Thread | None = None
+
+
+def _pthumbs_run() -> None:
+    ks, kt = _pkind("s"), _pkind("t")
+    try:
+        have_s, have_t = pthumbs.keys(ks), pthumbs.keys(kt)
+    except Exception as e:  # noqa: BLE001
+        log.warning("эскизы фото: база недоступна (%s)", e)
+        PT.state = ""
+        return
+    todo = sorted((p for p in library.by_id.values() if not p.video
+                   and not (p.cache_key() in have_s and p.cache_key() in have_t)), key=lambda p: p.date, reverse=True)
+    PT.done, PT.total, PT.made, PT.failed, PT.state = 0, len(todo), 0, 0, "running"
+    log.info("эскизы фото: считаю %d", len(todo))
+    t0 = time.time()
+    for p in todo:
+        if PT.stop.is_set():
+            PT.state = "stopped"
+            break
+        k = p.cache_key()
+        try:
+            # файл с ПК читается один раз: 400 — из оригинала (или встроенного эскиза), 240 — из 400
+            t = pthumbs.get(k, kt) if k in have_t else None
+            if t is None:
+                t = _produce(p, S.thumb_size, S.thumb_quality, {})
+                pthumbs.put(k, kt, t)
+            thumb_cache.put(("t", p.id, p.mtime, p.size), t)
+            if k not in have_s:
+                sm = render(t, S.thumb_small_size, S.thumb_quality, S.image_format)
+                pthumbs.put(k, ks, sm)
+                thumb_cache.put(("s", p.id, p.mtime, p.size), sm)
+            PT.made += 1
+        except (ConnectionError, TimeoutError):
+            PT.state = "pc"                           # ПК выключился — продолжим по кнопке
+            break
+        except Exception:  # noqa: BLE001 — битое фото: не сохраняем, в другой раз попробуем снова
+            PT.failed += 1
+        PT.done += 1
+    else:
+        PT.state = "done"
+    pthumbs.fresh()
+    log.info("эскизы фото: готово %d из %d за %.0fс, не вышло %d", PT.made, PT.total, time.time() - t0, PT.failed)
+
+
+def _pt_running() -> bool:
+    return PT.thread is not None and PT.thread.is_alive()
+
+
+@app.post("/api/admin/pthumbs/start", dependencies=[Depends(require_csrf)])
+async def admin_pthumbs_start(request: Request, s: Session = Depends(require_admin)):
+    if _pt_running():
+        return no_store(JSONResponse({"ok": True, "running": True}))
+    if not await PC.is_up():
+        raise HTTPException(409, "pc down")
+    PT.stop.clear()
+    # «meta…» — фоновый поток: чтение с ПК уступает эскизам и просмотру
+    PT.thread = threading.Thread(target=_pthumbs_run, name="meta-pthumbs", daemon=True)
+    PT.thread.start()
+    audit("pthumbs", s.user, ip_of(request), "запущен подсчёт эскизов фото")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/pthumbs/stop", dependencies=[Depends(require_csrf)])
+async def admin_pthumbs_stop(_: Session = Depends(require_admin)):
+    PT.stop.set()
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/pthumbs/clear", dependencies=[Depends(require_csrf)])
+async def admin_pthumbs_clear(request: Request, s: Session = Depends(require_admin)):
+    """Удалить все эскизы фото из базы (видео не трогаем)."""
+    if _pt_running():
+        return _bad("идёт подсчёт эскизов фото — сначала останови его", 409)
+    _, size = await run_in_threadpool(pthumbs.stats, (_pkind("s"), _pkind("t")))
+    await run_in_threadpool(pthumbs.clear)
+    thumb_cache.clear()                     # и из памяти: эскизы видео вернутся из базы
+    PT.state = ""
+    audit("pthumbs_clear", s.user, ip_of(request), f"удалено {size // 1048576} МБ")
+    return no_store(JSONResponse({"ok": True}))
 
 
 # ---- эскизы видео в базе: «Посчитать эскизы видео» — все, которых ещё нет (по одному, в фоне)
@@ -2929,7 +3037,10 @@ async def admin_overview(_: Session = Depends(require_admin)):
     unhashed = await run_in_threadpool(_unhashed) if tokens.any() else 0
     n_hidden = await run_in_threadpool(db.hidden_count)                     # у всех пользователей
     vt_n, vt_b = await run_in_threadpool(db.vthumb_stats)
+    pt_n, pt_b = await run_in_threadpool(pthumbs.stats, (_pkind("s"), _pkind("t")))
     return no_store(JSONResponse({
+        "pthumbs": {"stored": pt_n, "bytes": pt_b, "photos": len(photos) - videos, "state": PT.state, "done": PT.done,
+                    "total": PT.total, "failed": PT.failed},
         "hidden": n_hidden,
         "vthumbs": {"stored": vt_n, "bytes": vt_b, "videos": videos, "state": VT.state, "done": VT.done,
                     "total": VT.total, "failed": VT.failed, "audio": len(library.audio)},

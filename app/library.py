@@ -225,6 +225,7 @@ class Library:
         self.meta_done = 0
         # фаза 3: подробности (камера, размеры, GPS) для панели «Подробнее» -> в базу
         self.info_reader = None       # p -> dict; задаёт main (читает файл с ПК)
+        self.thumbstore = None        # эскизы фото в базе (ThumbStore); задаёт main
         self.on_built = None          # () -> None; после каждого сканирования (main: повреждённые файлы)
         self.info_total = self.info_done = 0
         self.info_state = ""          # "" | running | stopped | done
@@ -495,6 +496,10 @@ class Library:
             if gone:
                 self.audio = self.audio & keep
                 log.info("эскизы видео: убрано %d об отсутствующих файлах", gone)
+            if self.thumbstore is not None:
+                gone = self.thumbstore.prune(keep)
+                if gone:
+                    log.info("эскизы фото: убрано %d об отсутствующих и изменённых файлах", gone)
             have = db.info_keys()
         except Exception as e:  # noqa: BLE001
             log.warning("подробности: база недоступна (%s)", e)
