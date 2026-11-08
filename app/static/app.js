@@ -50,6 +50,9 @@ const LOGIN_ERRORS = {
   'google': 'Не удалось войти через Google, попробуй ещё раз',
   'google-denied': 'Этот Google-аккаунт не привязан ни к одному пользователю',
   'google-cancel': 'Вход через Google отменён',
+  'yandex': 'Не удалось войти через Яндекс ID, попробуй ещё раз',
+  'yandex-denied': 'Этот аккаунт Яндекса не привязан ни к одному пользователю',
+  'yandex-cancel': 'Вход через Яндекс ID отменён',
   'locked': 'Слишком много попыток входа, подожди 15 минут',
 };
 
@@ -58,7 +61,7 @@ async function showLogin(msg) {
   $('main').hidden = true; $('login').hidden = false;
   $('login-form').hidden = false; $('tfa-form').hidden = true;
   $('lerr').textContent = msg || '';
-  try { const r = await fetch('/api/auth/providers', { cache: 'no-store' }); const p = await r.json(); $('lgoogle').hidden = !p.google; googleHref(); } catch (_) {}
+  try { const r = await fetch('/api/auth/providers', { cache: 'no-store' }); const p = await r.json(); $('lgoogle').hidden = !p.google; $('lyandex').hidden = !p.yandex; googleHref(); } catch (_) {}
   setTimeout(() => $('lu').focus(), 0);
 }
 
@@ -125,7 +128,10 @@ $('pk-create').addEventListener('click', async () => {
 });
 
 // «Запомнить вход» действует и на вход через Google
-const googleHref = () => { $('lgoogle').href = '/auth/google' + ($('lr').checked ? '?r=1' : ''); };
+const googleHref = () => {
+  const q = $('lr').checked ? '?r=1' : '';
+  $('lgoogle').href = '/auth/google' + q; $('lyandex').href = '/auth/yandex' + q;
+};
 $('lr').addEventListener('change', googleHref);
 
 $('login-form').addEventListener('submit', async (e) => {

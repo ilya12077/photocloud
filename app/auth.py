@@ -75,7 +75,7 @@ class UserStore:
             if not (USER_RE.match(name) and isinstance(rec, dict) and str(rec.get("hash", "")).startswith("$argon2")
                     and rec.get("role") in ROLES):
                 continue
-            g = rec.get("google")
+            g, y = rec.get("google"), rec.get("yandex")
             try:
                 folders = norm_folders(rec.get("folders"))
                 exclude = norm_folders(rec.get("exclude")) or []
@@ -83,6 +83,7 @@ class UserStore:
                 folders, exclude = [], []   # испорченная запись — безопаснее ничего, чем всё
             users[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
                            "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
+                           "yandex": y.lower() if isinstance(y, str) and EMAIL_RE.match(y) else None,
                            "folders": folders, "exclude": exclude,
                            "wake": rec.get("wake", True) is not False}
             sec = rec.get("totp")
@@ -125,7 +126,7 @@ class UserStore:
     def list(self) -> list[dict]:
         with self._mu:
             self._sync()
-        return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
+        return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"), "yandex": r.get("yandex"),
                  "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True),
                  "totp": "on" if r.get("totp") else "pending" if r.get("totp_required") else "off",
                  "passkey_offer": bool(r.get("passkey_offer"))}
@@ -243,14 +244,18 @@ class UserStore:
             self._u[name]["exclude"] = exclude
             self._save()
 
-    def by_google(self, email: str) -> tuple[str, str] | None:
-        email = email.lower()
-        for n, r in self._u.items():
-            if r.get("google") == email:
-                return n, r["role"]
+    # ---- вход через внешний аккаунт (google, yandex): к пользователю привязан email аккаунта
+    def by_ext(self, kind: str, emails) -> tuple[str, str] | None:
+        want = [e.lower() for e in ([emails] if isinstance(emails, str) else emails)]
+        with self._mu:
+            self._sync()
+        for e in want:                      # по порядку: сначала основной адрес аккаунта
+            for n, r in self._u.items():
+                if r.get(kind) == e:
+                    return n, r["role"]
         return None
 
-    def set_google(self, name: str, email: str | None) -> None:
+    def set_ext(self, kind: str, name: str, email: str | None) -> None:
         if email:
             email = email.strip().lower()
             if not EMAIL_RE.match(email):
@@ -259,10 +264,16 @@ class UserStore:
             self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
-            if email and any(r.get("google") == email for n, r in self._u.items() if n != name):
-                raise UserError("этот Google-аккаунт уже привязан к другому пользователю")
-            self._u[name]["google"] = email or None
+            if email and any(r.get(kind) == email for n, r in self._u.items() if n != name):
+                raise UserError("этот аккаунт уже привязан к другому пользователю")
+            self._u[name][kind] = email or None
             self._save()
+
+    def by_google(self, email: str) -> tuple[str, str] | None:
+        return self.by_ext("google", email)
+
+    def set_google(self, name: str, email: str | None) -> None:
+        self.set_ext("google", name, email)
 
     def verify(self, username: str, password: str) -> str | None:
         """Роль при верном пароле, иначе None. Время ответа не зависит от наличия логина."""
@@ -301,7 +312,7 @@ class UserStore:
             self._sync()
             if name in self._u:
                 raise UserError("такой пользователь уже есть")
-            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "exclude": [], "wake": True}
+            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "yandex": None, "folders": None, "exclude": [], "wake": True}
             self._save()
 
     def set_password(self, name: str, password: str) -> None:

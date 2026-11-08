@@ -12,7 +12,8 @@ const EVENTS = {
   damaged: 'повреждённые файлы на сервере (найден, восстановлен, исправлен)',
 };
 const AUDIT = {
-  login: 'вход', login_google: 'вход через Google', login_passkey: 'вход по ключу', login_passkey_failed: 'ключ не подошёл',
+  login: 'вход', login_google: 'вход через Google', login_yandex: 'вход через Яндекс ID',
+  login_yandex_failed: 'Яндекс ID: ошибка', login_yandex_denied: 'Яндекс ID: аккаунт не привязан', user_yandex: 'привязка Яндекс ID', login_passkey: 'вход по ключу', login_passkey_failed: 'ключ не подошёл',
   passkey_add: 'создан ключ входа', passkey_offer: 'предложено создать ключ', passkey_cancel: 'ключ больше не предлагается',
   passkey_delete: 'удалены ключи входа', login_2fa_failed: 'неверный код второго шага',
   '2fa_on': 'включён двухфакторный вход', '2fa_off': 'отключён двухфакторный вход',
@@ -179,7 +180,7 @@ async function loadOverview() {
     storage: 'Режим', source: 'Источник', smb_encrypt: 'Шифрование SMB', bind: 'Адрес', public_url: 'Внешний адрес',
     cookie_secure: 'Secure cookie', trusted_proxies: 'Доверенные прокси', require_proxy: 'Только через прокси',
     allowed_origins: 'Разрешённые Origin', ha_url: 'Home Assistant', ha_token: 'Токен HA задан', google: 'Вход через Google',
-    google_redirect: 'Google redirect URI', ffmpeg: 'ffmpeg', data_dir: 'Папка данных', workers: 'Потоков эскизов',
+    google_redirect: 'Google redirect URI', yandex: 'Вход через Яндекс ID', yandex_redirect: 'Яндекс Redirect URI', ffmpeg: 'ffmpeg', data_dir: 'Папка данных', workers: 'Потоков эскизов',
     timezone: 'Часовой пояс', format: 'Формат эскизов', sizes: 'Размеры',
   };
   const rows = Object.entries(o.config).map(([k, v]) => {
@@ -215,13 +216,19 @@ async function loadUsers(force) {
     const role = el('select'); for (const [v, t] of [['user', 'пользователь'], ['admin', 'администратор']]) { const o = el('option', null, t); o.value = v; role.append(o); }
     role.value = u.role;
     role.onchange = () => act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/role`, { role: role.value }), 'Роль изменена').then((x) => { if (!x) role.value = u.role; });
-    const g = el('td');
-    g.append(el('span', 'gmail', u.google || '—'), btn(u.google ? 'изменить' : 'привязать', async () => {
-      const email = prompt('Email Google-аккаунта (пусто — отвязать):', u.google || '');
-      if (email === null) return;
-      await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/google`, { email: email.trim() || null }), email.trim() ? 'Google привязан' : 'Google отвязан');
-      loadUsers(true);
-    }));
+    // внешние аккаунты для входа: Google и Яндекс ID — по email аккаунта
+    const ext = (kind, title) => {
+      const td = el('td'), cur = u[kind];
+      td.append(el('span', 'gmail', cur || '—'), btn(cur ? 'изменить' : 'привязать', async () => {
+        const email = prompt(`Email аккаунта ${title} (пусто — отвязать):`, cur || '');
+        if (email === null) return;
+        await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/${kind}`, { email: email.trim() || null }),
+          email.trim() ? `${title}: привязан` : `${title}: отвязан`);
+        loadUsers(true);
+      }));
+      return td;
+    };
+    const g = ext('google', 'Google'), ya = ext('yandex', 'Яндекс ID');
     const ops = el('td', 'ops');
     ops.append(btn('пароль', async () => {
       const p = prompt(`Новый пароль для ${u.user} (от 8 символов). Все его сессии будут закрыты.`);
@@ -274,7 +281,7 @@ async function loadUsers(force) {
     else pk.append(pka('offer', u.passkeys ? 'ещё ключ' : 'предложить', 'При следующем входе появится предложение создать ключ'));
     if (u.passkeys) pk.append(pka('delete', 'удалить ключи', 'Ключи удалены',
       `Удалить все ключи входа ${u.user}? Войти по ключу он больше не сможет (пароль и Google остаются).`, 'danger'));
-    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, tf, pk, el('td', null, dt(u.created)), ops);
+    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, ya, tf, pk, el('td', null, dt(u.created)), ops);
     return tr;
   }));
 }
@@ -293,7 +300,7 @@ function foldersText(u) {
 async function editFolders(u, tr) {
   if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
-  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 9; row.append(td);
+  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 10; row.append(td);
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
   allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');

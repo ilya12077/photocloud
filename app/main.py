@@ -39,6 +39,7 @@ from .ha import HomeAssistant, clean
 from .images import LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_head, read_limited, render
 from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
+from .yandex_auth import YandexAuth, YandexError
 from .passkeys import Passkeys, PasskeyError, rp_for
 from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
@@ -67,6 +68,7 @@ FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
 transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
 google = GoogleAuth(S.google_client_id, S.google_client_secret, S.public_url) if S.google_client_id else None
+yandex = YandexAuth(S.yandex_client_id, S.yandex_client_secret, S.public_url) if S.yandex_client_id else None
 # одноразовый секрет для внутреннего канала ffmpeg -> приложение (только loopback)
 INTERNAL_TOKEN = secrets.token_urlsafe(32)
 ha = HomeAssistant(S)
@@ -229,6 +231,8 @@ async def lifespan(_app):
     await geocoder.close()
     if google:
         await google.close()
+    if yandex:
+        await yandex.close()
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -587,7 +591,7 @@ async def passkey_register(request: Request, s: Session = Depends(require_user))
 
 @app.get("/api/auth/providers")
 async def auth_providers():
-    return no_store(JSONResponse({"google": google is not None}))
+    return no_store(JSONResponse({"google": google is not None, "yandex": yandex is not None}))
 
 
 @app.get("/auth/google")
@@ -643,6 +647,62 @@ async def google_callback(request: Request):
     limiter.success(ip)
     audit("login_google", u, ip, email)
     resp = start_session(request, RedirectResponse("/", 303), u, ip, "Google", remember)
+    resp.delete_cookie(OAUTH_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
+    return no_store(resp)
+
+
+@app.get("/auth/yandex")
+async def yandex_start(request: Request):
+    if yandex is None:
+        raise HTTPException(404)
+    if limiter.blocked(ip_of(request)):
+        return RedirectResponse("/#err=locked", 303)
+    try:
+        url, state = yandex.start(request.query_params.get("r") == "1")
+    except YandexError:
+        raise HTTPException(503) from None
+    resp = RedirectResponse(url, 303)
+    # Lax: cookie должна вернуться при переходе со страницы Яндекса обратно к нам
+    resp.set_cookie(OAUTH_COOKIE, state, max_age=600, path="/", secure=S.cookie_secure,
+                    httponly=True, samesite="lax")
+    return no_store(resp)
+
+
+@app.get("/auth/yandex/callback")
+async def yandex_callback(request: Request):
+    if yandex is None:
+        raise HTTPException(404)
+    ip = ip_of(request)
+    q = request.query_params
+
+    def fail(code: str) -> Response:
+        r = RedirectResponse(f"/#err={code}", 303)
+        r.delete_cookie(OAUTH_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
+        return no_store(r)
+
+    if limiter.blocked(ip):
+        return fail("locked")
+    if q.get("error"):
+        return fail("yandex-cancel")
+    try:
+        emails, remember = await yandex.finish(q.get("state", ""), request.cookies.get(OAUTH_COOKIE, ""),
+                                               q.get("code", ""))
+    except YandexError as e:
+        log.info("вход через Яндекс отклонён: %s", e)
+        audit("login_yandex_failed", "", ip, str(e))
+        return fail("yandex")
+    hit = users.by_ext("yandex", emails)
+    if hit is None:
+        limiter.fail(ip)
+        audit("login_yandex_denied", "", ip, ", ".join(emails)[:200])
+        bg(ha.notify("login_failed", f"Вход через Яндекс с непривязанного аккаунта {clean(emails[0])} с {clean(ip)}",
+                     dedupe_s=300, key=ip))
+        return fail("yandex-denied")
+    u, _role = hit
+    # как и с Google: код из приложения не спрашиваем, аккаунт защищает сам Яндекс
+    limiter.success(ip)
+    audit("login_yandex", u, ip, emails[0])
+    resp = start_session(request, RedirectResponse("/", 303), u, ip, "Яндекс ID", remember)
     resp.delete_cookie(OAUTH_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
     return no_store(resp)
 
@@ -2670,6 +2730,7 @@ async def admin_overview(_: Session = Depends(require_admin)):
             "allowed_origins": sorted(S.allowed_origins), "ha_url": S.ha_url, "ha_token": bool(S.ha_token),
             "public_url": S.public_url, "google": bool(google),
             "google_redirect": google.redirect_uri if google else "",
+            "yandex": bool(yandex), "yandex_redirect": yandex.redirect_uri if yandex else "",
             "ffmpeg": FFMPEG or "", "data_dir": str(S.data_dir), "workers": S.workers,
             "timezone": str(S.tz), "format": S.image_format,
             "sizes": f"{S.thumb_small_size}/{S.thumb_size}/{S.thumb_large_size}, превью {S.preview_quick_size}/{S.preview_size}",
@@ -2722,16 +2783,26 @@ async def admin_user_password(request: Request, name: str, s: Session = Depends(
 
 @app.post("/api/admin/users/{name}/google", dependencies=[Depends(require_csrf)])
 async def admin_user_google(request: Request, name: str, s: Session = Depends(require_admin)):
+    return await _user_ext(request, name, "google", s)
+
+
+@app.post("/api/admin/users/{name}/yandex", dependencies=[Depends(require_csrf)])
+async def admin_user_yandex(request: Request, name: str, s: Session = Depends(require_admin)):
+    return await _user_ext(request, name, "yandex", s)
+
+
+async def _user_ext(request: Request, name: str, kind: str, s: Session):
+    """Привязка внешнего аккаунта для входа (google, yandex) — по email."""
     name = _user_arg(name)
     d = await read_json(request)
     email = d.get("email")
     if email is not None and not isinstance(email, str):
         return _bad("email строкой")
     try:
-        users.set_google(name, email or None)
+        await run_in_threadpool(users.set_ext, kind, name, email or None)
     except UserError as e:
         return _bad(str(e))
-    audit("user_google", s.user, ip_of(request), f"{name} -> {email or 'отвязан'}")
+    audit("user_" + kind, s.user, ip_of(request), f"{name} -> {email or 'отвязан'}")
     return no_store(JSONResponse({"ok": True}))
 
 
