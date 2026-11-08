@@ -29,6 +29,7 @@ const AUDIT = {
 
 async function api(path, body) {
   const init = { credentials: 'same-origin', cache: 'no-store', headers: {} };
+  if (POLL && body === undefined) init.headers['X-Poll'] = '1';   // фоновый опрос не продлевает сессию
   if (body !== undefined) {
     init.method = 'POST';
     init.headers['X-Requested-With'] = 'photocloud';
@@ -327,7 +328,8 @@ async function loadSecurity() {
     const tr = el('tr'); const ops = el('td', 'ops');
     if (s.id === r.current) ops.append(el('span', 'dim2', 'текущая'));
     else ops.append(btn('закрыть', async () => { await act(() => api(`/api/admin/sessions/${s.id}/revoke`, {}), 'Сессия закрыта'); loadSecurity(); }, 'danger'));
-    tr.append(el('td', 'mono', s.user), el('td', 'mono', s.ip), el('td', null, dt(s.created)), el('td', null, dt(s.last_seen)), ops);
+    tr.append(el('td', 'mono', s.user), el('td', 'mono', s.ip), el('td', null, s.remember ? 'да' : 'нет'),
+      el('td', null, dt(s.created)), el('td', null, dt(s.last_seen)), ops);
     return tr;
   }));
   const l = await act(() => api('/api/admin/lockouts')); if (!l) return;
@@ -516,6 +518,7 @@ async function loadSettings() {
   $('s-wake').value = w.ha_wake_service || '';
   $('s-wakedata').value = Object.keys(w.ha_wake_data || {}).length ? JSON.stringify(w.ha_wake_data) : '';
   $('s-waket').value = s.wake_timeout; $('s-ttl').value = s.index_ttl; $('s-idle').value = s.session_idle_hours;
+  $('s-short').value = s.session_short_minutes;
   $('s-bkstale').value = s.backup_stale_days;
   $('s-events').replaceChildren(...r.events.map((ev) => {
     const l = el('label', 'chkline'); const c = el('input'); c.type = 'checkbox'; c.value = ev; c.checked = s.notify_events.includes(ev);
@@ -530,6 +533,7 @@ $('settings').addEventListener('submit', async (e) => {
     notify_events: [...$('s-events').querySelectorAll('input:checked')].map((c) => c.value),
     ha_notify_service: $('s-notify').value.trim(),
     wake_timeout: +$('s-waket').value, index_ttl: +$('s-ttl').value, session_idle_hours: +$('s-idle').value,
+    session_short_minutes: +$('s-short').value,
     backup_stale_days: +$('s-bkstale').value,
   };
   const r = await act(() => api('/api/admin/settings', body));

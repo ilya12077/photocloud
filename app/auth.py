@@ -301,18 +301,22 @@ class Session:
     ip: str
     created: float
     last_seen: float
+    remember: bool = True
 
 
 class SessionStore:
     """Токен живёт только в cookie; на сервере (и в базе) храним его SHA-256,
     так что даже копия базы не даёт готовых токенов. Сессии переживают перезапуск.
-    В памяти — рабочая копия; время последней активности пишется в базу не чаще раза в минуту."""
+    В памяти — рабочая копия; время последней активности пишется в базу не чаще раза в минуту.
+    Без «Запомнить вход» сессия живёт до short_s бездействия (и cookie сеансовая), с ней — до idle_s.
+    Бездействие — это отсутствие запросов от человека: фоновый опрос состояния сессию не продлевает."""
 
     MAX_PER_USER = 20
     TOUCH_EVERY = 60
 
-    def __init__(self, idle_s: int, max_s: int, db=None):
+    def __init__(self, idle_s: int, max_s: int, db=None, short_s: int = 900):
         self.idle_s = idle_s
+        self.short_s = short_s
         self.max_s = max_s
         self.db = db
         self._s: dict[str, Session] = {}
@@ -320,11 +324,17 @@ class SessionStore:
         self._lock = threading.Lock()
         if db is not None:
             now = time.time()
-            for key, user, ip, created, last in db.run("SELECT key, user, ip, created, last_seen FROM sessions"):
-                if now - last <= idle_s and now - created <= max_s:
-                    self._s[key] = Session(user, ip, created, last)
+            for key, user, ip, created, last, rem in db.run(
+                    "SELECT key, user, ip, created, last_seen, remember FROM sessions"):
+                s = Session(user, ip, created, last, bool(rem))
+                if not self._dead(s, now):
+                    self._s[key] = s
                     self._saved[key] = last
-            db.run("DELETE FROM sessions WHERE ? - last_seen > ? OR ? - created > ?", (now, idle_s, now, max_s))
+            db.many("DELETE FROM sessions WHERE key = ?",
+                    [(k,) for (k,) in db.run("SELECT key FROM sessions") if k not in self._s])
+
+    def _dead(self, s: Session, now: float) -> bool:
+        return now - s.last_seen > (self.idle_s if s.remember else self.short_s) or now - s.created > self.max_s
 
     @staticmethod
     def _key(token: str) -> str:
@@ -336,7 +346,7 @@ class SessionStore:
         if self.db is not None and keys:
             self.db.many("DELETE FROM sessions WHERE key = ?", [(k,) for k in keys])
 
-    def create(self, user: str, ip: str) -> str:
+    def create(self, user: str, ip: str, remember: bool = True) -> str:
         token = secrets.token_urlsafe(32)
         now = time.time()
         k = self._key(token)
@@ -346,15 +356,16 @@ class SessionStore:
             old = [key for _, key in mine[: max(0, len(mine) - self.MAX_PER_USER + 1)]]
             for key in old:
                 del self._s[key]
-            self._s[k] = Session(user, ip, now, now)
+            self._s[k] = Session(user, ip, now, now, remember)
             self._db_del(old)
             if self.db is not None:
-                self.db.run("INSERT OR REPLACE INTO sessions(key, user, ip, created, last_seen) VALUES(?,?,?,?,?)",
-                            (k, user, ip, now, now))
+                self.db.run("INSERT OR REPLACE INTO sessions(key, user, ip, created, last_seen, remember) "
+                            "VALUES(?,?,?,?,?,?)", (k, user, ip, now, now, int(remember)))
                 self._saved[k] = now
         return token
 
-    def get(self, token: str | None) -> Session | None:
+    def get(self, token: str | None, touch: bool = True) -> Session | None:
+        """touch=False — фоновый запрос (опрос состояния): сессию не продлевает."""
         if not token or len(token) > 128:
             return None
         k = self._key(token)
@@ -363,10 +374,12 @@ class SessionStore:
             s = self._s.get(k)
             if s is None:
                 return None
-            if now - s.last_seen > self.idle_s or now - s.created > self.max_s:
+            if self._dead(s, now):
                 del self._s[k]
                 self._db_del([k])
                 return None
+            if not touch:
+                return s
             s.last_seen = now
             if self.db is not None and now - self._saved.get(k, 0) > self.TOUCH_EVERY:
                 self.db.run("UPDATE sessions SET last_seen = ? WHERE key = ?", (now, k))
@@ -389,7 +402,7 @@ class SessionStore:
         with self._lock:
             self._purge(now)
             return [{"id": k[:16], "user": s.user, "ip": s.ip, "created": int(s.created),
-                     "last_seen": int(s.last_seen)} for k, s in sorted(self._s.items(), key=lambda kv: -kv[1].last_seen)]
+                     "last_seen": int(s.last_seen), "remember": s.remember} for k, s in sorted(self._s.items(), key=lambda kv: -kv[1].last_seen)]
 
     def revoke(self, sid: str) -> bool:
         with self._lock:
@@ -408,8 +421,7 @@ class SessionStore:
             return len(ks)
 
     def _purge(self, now: float) -> None:
-        dead = [k for k, s in self._s.items()
-                if now - s.last_seen > self.idle_s or now - s.created > self.max_s]
+        dead = [k for k, s in self._s.items() if self._dead(s, now)]
         for k in dead:
             del self._s[k]
         self._db_del(dead)

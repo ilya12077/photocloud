@@ -33,6 +33,7 @@ function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.
 async function api(path, opts = {}) {
   const init = { credentials: 'same-origin', cache: opts.cache || 'no-store', headers: {} };
   if (opts.timeout && window.AbortSignal && AbortSignal.timeout) init.signal = AbortSignal.timeout(opts.timeout);
+  if (opts.poll) init.headers['X-Poll'] = '1';     // фоновый опрос: сессию не продлевает
   if (opts.method && opts.method !== 'GET') {
     init.method = opts.method;
     init.headers['X-Requested-With'] = 'photocloud';
@@ -58,7 +59,7 @@ $('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const btn = $('lbtn'); btn.disabled = true; $('lerr').textContent = '';
   try {
-    const r = await api('/api/login', { method: 'POST', body: { u: $('lu').value.trim(), p: $('lp').value }, allow401: true });
+    const r = await api('/api/login', { method: 'POST', body: { u: $('lu').value.trim(), p: $('lp').value, r: $('lr').checked }, allow401: true });
     if (r.ok) {
       $('lp').value = '';
       const j = await r.json().catch(() => ({}));
@@ -198,7 +199,7 @@ async function poll(delay) {
   stopPoll();
   if (delay) { st.pollTimer = setTimeout(() => poll(), delay); return; }
   let s;
-  try { s = await (await api('/api/status' + HQ, { timeout: 15000 })).json(); }
+  try { s = await (await api('/api/status' + HQ, { timeout: 15000, poll: true })).json(); }
   catch (e) {
     if (e.message !== 'auth') { banner('Сервер недоступен, пробую снова…', null, null, true); st.pollTimer = setTimeout(() => poll(), 5000); }
     return;

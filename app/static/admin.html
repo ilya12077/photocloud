@@ -72,7 +72,7 @@
         <button class="btn primary">Добавить</button>
       </form>
       <h3>Активные сессии</h3>
-      <table class="list" id="sessions"><thead><tr><th>Пользователь</th><th>IP</th><th>Вход</th><th>Активность</th><th></th></tr></thead><tbody></tbody></table>
+      <table class="list" id="sessions"><thead><tr><th>Пользователь</th><th>IP</th><th>Запомнить</th><th>Вход</th><th>Активность</th><th></th></tr></thead><tbody></tbody></table>
       <h3>Заблокированные IP</h3>
       <table class="list" id="locks"><thead><tr><th>IP</th><th>Осталось</th><th></th></tr></thead><tbody></tbody></table>
     </div>
@@ -124,7 +124,8 @@
         <div class="grid3">
           <label>Ждать пробуждения, с<input id="s-waket" type="number" min="10" max="1800"></label>
           <label>Пересканировать папки, с<input id="s-ttl" type="number" min="30" max="86400"></label>
-          <label>Выход при бездействии, ч<input id="s-idle" type="number" min="1" max="2160"></label>
+          <label>С «Запомнить вход» — выход при бездействии, ч<input id="s-idle" type="number" min="1" max="2160"></label>
+          <label>Без «Запомнить вход» — выход при бездействии, мин<input id="s-short" type="number" min="5" max="1440"></label>
           <label>Бэкап молчит — уведомить через, дн (0 — нет)<input id="s-bkstale" type="number" min="0" max="365"></label>
         </div>
         <button class="btn primary">Сохранить</button>

@@ -71,7 +71,8 @@ except (OSError, ValueError) as e:
     raise SystemExit(f"Не читается {S.data_dir / 'users.json'}: {e}") from None
 # пока нет ни одного пользователя — первичная настройка по одноразовому токену из консоли
 SETUP_TOKEN = secrets.token_urlsafe(24) if users.empty() else ""
-sessions = SessionStore(S.session_idle_hours * 3600, S.session_max_hours * 3600, db)
+sessions = SessionStore(S.session_idle_hours * 3600, S.session_max_hours * 3600, db,
+                        short_s=S.session_short_minutes * 60)
 tokens = TokenStore(db)                       # клиенты бэкапа
 library.hash_wanted = tokens.any              # хеши файлов считаем, только если бэкап есть
 limiter = LoginLimiter()
@@ -234,7 +235,8 @@ def ip_of(request: Request) -> str:
 
 async def require_user(request: Request) -> Session:
     token = request.cookies.get(COOKIE)
-    s = sessions.get(token)
+    # фоновый опрос (X-Poll) не считается действием человека — сессию не продлевает
+    s = sessions.get(token, touch=request.headers.get("x-poll") != "1")
     if s is None:
         raise HTTPException(401, "auth")
     role = users.role(s.user)
@@ -371,6 +373,7 @@ async def login(request: Request):
                                      headers={"retry-after": str(wait)}))
     data = await read_json(request)
     u, p = data.get("u"), data.get("p")
+    remember = data.get("r") is True      # «Запомнить вход»: по умолчанию — нет
     if not isinstance(u, str) or not isinstance(p, str) or not (0 < len(u) <= 64) or not (0 < len(p) <= 256):
         raise HTTPException(400)
     async with login_sem:
@@ -387,10 +390,10 @@ async def login(request: Request):
         return no_store(JSONResponse({"error": "bad"}, 401))
     if users.totp_required(u):
         # пароль верный, но нужен код из приложения (или его настройка) — сессию дадим после него
-        return no_store(_need_2fa(JSONResponse({"need": "totp"}), u, ip, "паролю"))
+        return no_store(_need_2fa(JSONResponse({"need": "totp"}), u, ip, "паролю", remember))
     limiter.success(ip)
     audit("login", u, ip)
-    return no_store(start_session(request, JSONResponse({"user": u, "role": role}), u, ip, "паролю"))
+    return no_store(start_session(request, JSONResponse({"user": u, "role": role}), u, ip, "паролю", remember))
 
 
 # ---- двухфакторный вход: включает админ («Пользователи» → 2FA). После пароля —
@@ -401,14 +404,14 @@ TFA_TTL = 600
 _tfa: dict[str, dict] = {}          # билет -> {user, ip, how, exp, tries, setup: новый секрет или ""}
 
 
-def _need_2fa(resp: Response, u: str, ip: str, how: str) -> Response:
+def _need_2fa(resp: Response, u: str, ip: str, how: str, remember: bool) -> Response:
     now = time.time()
     for k in [k for k, v in _tfa.items() if v["exp"] < now]:
         del _tfa[k]
     if len(_tfa) > 1000:
         _tfa.clear()
     ticket = secrets.token_urlsafe(24)
-    _tfa[ticket] = {"user": u, "ip": ip, "how": how, "exp": now + TFA_TTL, "tries": 0,
+    _tfa[ticket] = {"user": u, "ip": ip, "how": how, "exp": now + TFA_TTL, "tries": 0, "remember": remember,
                     "setup": "" if users.totp_on(u) else totp.new_secret()}
     resp.set_cookie(TFA_COOKIE, ticket, max_age=TFA_TTL, path="/", secure=S.cookie_secure,
                     httponly=True, samesite="strict")
@@ -475,20 +478,21 @@ async def login_2fa(request: Request):
     if role is None:
         return no_store(JSONResponse({"error": "expired"}, 401))
     audit("login", u, ip, "с кодом из приложения")
-    resp = start_session(request, JSONResponse({"user": u, "role": role}), u, ip, t["how"])
+    resp = start_session(request, JSONResponse({"user": u, "role": role}), u, ip, t["how"], t["remember"])
     resp.delete_cookie(TFA_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="strict")
     return no_store(resp)
 
 
-def start_session(request: Request, resp: Response, u: str, ip: str, how: str) -> Response:
+def start_session(request: Request, resp: Response, u: str, ip: str, how: str, remember: bool) -> Response:
     sessions.delete(request.cookies.get(COOKIE))   # против фиксации сессии
-    token = sessions.create(u, ip)
+    token = sessions.create(u, ip, remember)
     seen = known_ips.setdefault(u, set())
     if ip not in seen:
         seen.add(ip)
         bg(ha.notify("login_new_ip", f"Вход {u} с нового адреса {clean(ip)} (по {how})", dedupe_s=0))
     bg(ha.notify("login", f"Вход {u} с {clean(ip)} (по {how})", dedupe_s=0))
-    resp.set_cookie(COOKIE, token, max_age=S.session_max_hours * 3600, path="/",
+    # без «Запомнить вход» — сеансовая cookie: закрыл браузер — вышел
+    resp.set_cookie(COOKIE, token, max_age=S.session_max_hours * 3600 if remember else None, path="/",
                     secure=S.cookie_secure, httponly=True, samesite="strict")
     return resp
 
@@ -2699,6 +2703,7 @@ async def admin_settings_save(request: Request, s: Session = Depends(require_adm
     for k, v in new.items():
         setattr(S, k, v)
     sessions.idle_s = S.session_idle_hours * 3600
+    sessions.short_s = S.session_short_minutes * 60
     try:
         await run_in_threadpool(config.save_overrides, S)
     except OSError as e:
