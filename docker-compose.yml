@@ -31,6 +31,8 @@ services:
       HA_NOTIFY_SERVICE: ${HA_NOTIFY_SERVICE:-}
       NOTIFY_EVENTS: ${NOTIFY_EVENTS:-login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale,damaged}
       WAKE_TIMEOUT: ${WAKE_TIMEOUT:-180}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       PUBLIC_NAME: ${PUBLIC_NAME:-Фотоархив}
     volumes:

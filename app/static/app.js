@@ -46,14 +46,25 @@ async function api(path, opts = {}) {
 
 // ================================================================== вход
 
+const LOGIN_ERRORS = {
+  'google': 'Не удалось войти через Google, попробуй ещё раз',
+  'google-denied': 'Этот Google-аккаунт не привязан ни к одному пользователю',
+  'google-cancel': 'Вход через Google отменён',
+  'locked': 'Слишком много попыток входа, подожди 15 минут',
+};
 
 async function showLogin(msg) {
   stopPoll(); closeViewer(true);
   $('main').hidden = true; $('login').hidden = false;
   $('login-form').hidden = false; $('tfa-form').hidden = true;
   $('lerr').textContent = msg || '';
+  try { const r = await fetch('/api/auth/providers', { cache: 'no-store' }); const p = await r.json(); $('lgoogle').hidden = !p.google; googleHref(); } catch (_) {}
   setTimeout(() => $('lu').focus(), 0);
 }
+
+// «Запомнить вход» действует и на вход через Google
+const googleHref = () => { $('lgoogle').href = '/auth/google' + ($('lr').checked ? '?r=1' : ''); };
+$('lr').addEventListener('change', googleHref);
 
 $('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -123,11 +134,14 @@ $('logout').addEventListener('click', async () => {
 });
 
 async function enter() {
+  let err = null;
+  const m = location.hash.match(/^#err=([a-z-]+)$/);
+  if (m) { err = LOGIN_ERRORS[m[1]] || 'Ошибка входа'; history.replaceState(null, '', location.pathname); }
   // список файлов запрашиваем сразу, параллельно с проверкой входа — на медленном канале
   // это экономит пару «туда-обратно» до первых эскизов
   st.libPromise = fetch('/api/library' + HQ, { credentials: 'same-origin', cache: 'no-cache' }).catch(() => null);
   const r = await api('/api/me', { allow401: true });
-  if (r.status === 401) { st.libPromise = null; showLogin(); return; }
+  if (r.status === 401) { st.libPromise = null; showLogin(err); return; }
   const me = await r.json(); st.me = me;
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
