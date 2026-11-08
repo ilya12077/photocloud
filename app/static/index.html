@@ -13,6 +13,9 @@
 <script src="/static/app.js" defer></script>
 </head>
 <body>
+<!-- iPhone (Safari 26): строку адреса и статус-бар Safari красит в цвет закреплённого (fixed) элемента у верхнего края;
+     без него — прозрачное «стекло», под которым видна лента -->
+<div class="topfill" aria-hidden="true"></div>
 
 <section id="login" class="login" hidden>
   <form id="login-form" class="login-card" autocomplete="on">
