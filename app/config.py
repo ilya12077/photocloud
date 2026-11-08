@@ -160,6 +160,8 @@ class Settings:
     public_url: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
+    yandex_client_id: str = ""
+    yandex_client_secret: str = ""
     data_dir: Path = PROJECT_ROOT / "data"
     tz: object = None
     ffmpeg: str = ""
@@ -274,6 +276,10 @@ def load() -> Settings:
     s.google_client_secret = _secret("GOOGLE_CLIENT_SECRET", "") or ""
     if (s.google_client_id or s.google_client_secret) and not (s.google_client_id and s.google_client_secret and s.public_url):
         raise ConfigError("для входа через Google нужны GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET и PUBLIC_URL")
+    s.yandex_client_id = _get("YANDEX_CLIENT_ID", "") or ""
+    s.yandex_client_secret = _secret("YANDEX_CLIENT_SECRET", "") or ""
+    if (s.yandex_client_id or s.yandex_client_secret) and not (s.yandex_client_id and s.yandex_client_secret and s.public_url):
+        raise ConfigError("для входа через Яндекс ID нужны YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET и PUBLIC_URL")
     s.data_dir = Path(_get("DATA_DIR", str(PROJECT_ROOT / "data")))
     tzname = _get("TIMEZONE", "Europe/Moscow")
     try:
