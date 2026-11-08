@@ -446,6 +446,7 @@ async function loadLibraryInner(pre) {
   if (!st.folderIdx.has(st.folder)) st.folder = '';
   render();
   if ($('banner-text').textContent.startsWith('Загружаю')) banner(null);
+  if (!st.placed) { st.placed = true; restorePlace(loadPlace()); }   // первая загрузка — туда, где был
 }
 
 function readRoute() {
@@ -841,7 +842,30 @@ function retryBroken() {
 }
 
 let rafPending = false;
+// Обновил страницу — лента на том же месте: фото у верха экрана запоминаем во вкладке
+// (sessionStorage — у каждой вкладки своё) и после загрузки списка ставим его туда же.
+// Обычное восстановление прокрутки браузера тут не работает: лента строится уже после загрузки.
+try { history.scrollRestoration = 'manual'; } catch (_) {}
+const placeKey = () => location.pathname + location.hash + '|' + st.sort + '|' + (st.rec ? 1 : 0);
+let placeT = 0;
+function savePlace() {
+  clearTimeout(placeT); placeT = 0;
+  if (!st.list || $('main').hidden) return;
+  try {
+    const a = keepPlace(null);
+    if (a) sessionStorage.setItem('pc.place', JSON.stringify({ k: placeKey(), ...a }));
+    else sessionStorage.removeItem('pc.place');
+  } catch (_) {}
+}
+function loadPlace() {
+  try { const a = JSON.parse(sessionStorage.getItem('pc.place') || 'null'); return a && a.k === placeKey() ? a : null; }
+  catch (_) { return null; }
+}
+window.addEventListener('pagehide', savePlace);
+document.addEventListener('visibilitychange', () => { if (document.hidden) savePlace(); });
+
 window.addEventListener('scroll', () => {
+  if (!placeT) placeT = setTimeout(savePlace, 400);
   gridPrefetchSoon();
   if (rafPending) return; rafPending = true;
   requestAnimationFrame(() => { rafPending = false; draw(false); updateScrub(); });
