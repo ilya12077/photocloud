@@ -2686,7 +2686,6 @@ async def admin_lockout_clear(request: Request, ip: str, s: Session = Depends(re
 @app.get("/api/admin/settings")
 async def admin_settings(_: Session = Depends(require_admin)):
     return no_store(JSONResponse({"settings": config.export_editable(S),
-                                  "wake": {k: getattr(S, k) for k in config.LEGACY},
                                   "events": sorted(config.ALL_NOTIFY_EVENTS)}))
 
 
