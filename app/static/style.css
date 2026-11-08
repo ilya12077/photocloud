@@ -27,6 +27,8 @@ a { color: inherit; text-decoration: none; }
 .login-card input { padding: 11px 12px; border-radius: 9px; border: 1px solid var(--line);
   background: var(--bg); font-size: 16px; }
 .login-card input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.login-card label.remember { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--fg); cursor: pointer; }
+.login-card label.remember input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
 .login-card button { padding: 11px; border: 0; border-radius: 9px; background: var(--accent);
   color: var(--accent-fg); font-weight: 600; cursor: pointer; }
 .login-card button:disabled { opacity: .6; cursor: default; }

@@ -17,7 +17,8 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sessions (
          key TEXT PRIMARY KEY,          -- SHA-256 токена (сам токен не хранится)
          user TEXT NOT NULL, ip TEXT NOT NULL,
-         created REAL NOT NULL, last_seen REAL NOT NULL)""",
+         created REAL NOT NULL, last_seen REAL NOT NULL,
+         remember INTEGER NOT NULL DEFAULT 1)  -- 0: без «Запомнить вход» — короткий срок бездействия""",
     "CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user)",
     """CREATE TABLE IF NOT EXISTS dates (
          key TEXT PRIMARY KEY,          -- путь \\0 размер \\0 mtime
@@ -118,6 +119,12 @@ class DB:
                 self.con.execute("INSERT OR IGNORE INTO user_hidden (user, path, at) SELECT by, path, at FROM hidden")
                 self.con.execute("DROP TABLE hidden")
             self.con.execute("PRAGMA user_version = 3")
+        if ver < 4:
+            # 1.8.1: галочка «Запомнить вход»; прежние сессии считаем запомненными
+            cols = {r[1] for r in self.con.execute("PRAGMA table_info(sessions)")}
+            if "remember" not in cols:
+                self.con.execute("ALTER TABLE sessions ADD COLUMN remember INTEGER NOT NULL DEFAULT 1")
+            self.con.execute("PRAGMA user_version = 4")
 
     def run(self, sql: str, args=()):
         with self.mu:

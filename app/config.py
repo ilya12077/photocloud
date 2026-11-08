@@ -149,6 +149,7 @@ class Settings:
     # веб / безопасность
     cookie_secure: bool = True
     session_idle_hours: int = 24 * 7
+    session_short_minutes: int = 15
     session_max_hours: int = 24 * 30
     trusted_proxies: list = field(default_factory=list)
     require_proxy: bool = True
@@ -249,6 +250,7 @@ def load() -> Settings:
 
     s.cookie_secure = _bool("COOKIE_SECURE", True)
     s.session_idle_hours = _int("SESSION_IDLE_HOURS", 24 * 7, 1, 24 * 90)
+    s.session_short_minutes = _int("SESSION_SHORT_MINUTES", 15, 5, 24 * 60)
     s.session_max_hours = _int("SESSION_MAX_HOURS", 24 * 30, 1, 24 * 365)
     s.trusted_proxies = _networks("TRUSTED_PROXIES")
     s.require_proxy = _bool("REQUIRE_PROXY", bool(s.trusted_proxies))
@@ -323,7 +325,7 @@ def wake_data(v, name: str) -> dict:
 # ---------------------------------------------------------------- настройки из админки
 # Только то, что безопасно менять на лету. Секреты, пути и сервис пробуждения — в .env.
 EDITABLE = ("public_name", "notify_events", "ha_notify_service",
-            "wake_timeout", "index_ttl", "session_idle_hours", "backup_stale_days")
+            "wake_timeout", "index_ttl", "session_idle_hours", "session_short_minutes", "backup_stale_days")
 # Раньше менялись в админке. Если в .env их нет, а в settings.json остались — берём оттуда
 # (с той же проверкой доменов), но поменять через админку больше нельзя.
 LEGACY = ("ha_wake_service", "ha_wake_data")
@@ -344,6 +346,7 @@ def validate_override(s: Settings, key: str, val):
             raise ConfigError("уведомления: notify.… или сущность с его именем (input_text.…)")
         return val
     limits = {"wake_timeout": (10, 1800), "index_ttl": (30, 86400), "session_idle_hours": (1, 24 * 90),
+              "session_short_minutes": (5, 24 * 60),
               "backup_stale_days": (0, 365)}
     if key in limits:
         lo, hi = limits[key]
