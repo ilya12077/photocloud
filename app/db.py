@@ -73,6 +73,11 @@ SCHEMA = [
          user TEXT NOT NULL, pubkey BLOB NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
          name TEXT NOT NULL DEFAULT '', created REAL NOT NULL, last_used REAL NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS passkeys_user ON passkeys(user)",
+    # клиент на ПК с архивом: открытый ключ из TPM (один действующий; отвязанные — revoked=1)
+    """CREATE TABLE IF NOT EXISTS pc_client (
+         id TEXT PRIMARY KEY, pub TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', key_type TEXT NOT NULL DEFAULT '',
+         created REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
+         guid TEXT NOT NULL DEFAULT '', revoked INTEGER NOT NULL DEFAULT 0)""",
     """CREATE TABLE IF NOT EXISTS vthumbs (
         key TEXT PRIMARY KEY, fmt TEXT NOT NULL, data BLOB NOT NULL) WITHOUT ROWID""",
     # избранное: у каждого пользователя своё
@@ -351,6 +356,34 @@ class DB:
         n = self.run("SELECT count(*) FROM passkeys WHERE user = ?", (user,))[0][0]
         self.run("DELETE FROM passkeys WHERE user = ?", (user,))
         return n
+
+    # ------------------------------------------------------------ клиент на ПК
+
+    def pc_pair(self, cid: str, pub: str, name: str, key_type: str, ip: str) -> None:
+        """Новая привязка: прежний ключ отзывается."""
+        self.run("UPDATE pc_client SET revoked = 1 WHERE revoked = 0")
+        self.run("INSERT INTO pc_client (id, pub, name, key_type, created, last_ip) VALUES (?,?,?,?,?,?)",
+                 (cid, pub, name, key_type, time.time(), ip))
+
+    def pc_get(self) -> dict | None:
+        r = self.run("SELECT id, pub, name, key_type, created, last_seen, last_ip, guid FROM pc_client "
+                     "WHERE revoked = 0 ORDER BY created DESC LIMIT 1")
+        if not r:
+            return None
+        k = ("id", "pub", "name", "key_type", "created", "last_seen", "last_ip", "guid")
+        return dict(zip(k, r[0]))
+
+    def pc_seen(self, cid: str, ip: str, guid: str) -> None:
+        self.run("UPDATE pc_client SET last_seen = ?, last_ip = ?, guid = ? WHERE id = ?", (time.time(), ip, guid, cid))
+
+    def pc_unpair(self) -> bool:
+        had = bool(self.run("SELECT 1 FROM pc_client WHERE revoked = 0"))
+        self.run("UPDATE pc_client SET revoked = 1 WHERE revoked = 0")
+        return had
+
+    def marks_rows(self) -> list[tuple]:
+        """Пометки целиком: (путь, ключ файла, sha, кто, когда)."""
+        return self.run("SELECT path, key, sha, by, at FROM delete_marks ORDER BY at")
 
     # ------------------------------------------------------------ эскизы видео
 

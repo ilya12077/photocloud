@@ -103,6 +103,10 @@
         <p>Токен показывается один раз — скопируй его в клиент бэкапа:</p>
         <div class="inline"><input id="bk-token" class="mono" readonly><button class="btn" type="button" id="bk-copy">Копировать</button></div>
       </div>
+      <h3>Клиент на ПК — удаление в корзину</h3>
+      <p class="dim2">Программа <b>photocloud_pc.pyw</b> на самом ПК с архивом: показывает помеченные «на удаление» и после твоего подтверждения отправляет их в корзину Windows. Входит не по токену, а ключом в TPM этого ПК: «Привязать» открывает окно на 10 минут — запусти программу на ПК, и она привяжется (положит подписанный файл в служебную папку шары, сервер его проверит). После переустановки Windows — привязать заново, старый ключ перестанет действовать.</p>
+      <div class="cards" id="pc-cards"></div>
+      <div class="actions"><button class="btn primary" id="pc-pair">Привязать</button><button class="btn danger" id="pc-unpair">Отвязать</button></div>
     </div>
 
     <div data-pane="perf" hidden>

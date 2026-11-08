@@ -9,3 +9,4 @@ imageio-ffmpeg>=0.5
 tzdata>=2024.1
 segno>=1.6
 webauthn>=2.2
+cryptography>=42

@@ -15,7 +15,9 @@ const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_yandex: 'вход через Яндекс ID',
   login_yandex_failed: 'Яндекс ID: ошибка', login_yandex_denied: 'Яндекс ID: аккаунт не привязан', user_yandex: 'привязка Яндекс ID', login_passkey: 'вход по ключу', login_passkey_failed: 'ключ не подошёл',
   passkey_add: 'создан ключ входа', passkey_offer: 'предложено создать ключ', passkey_cancel: 'ключ больше не предлагается',
-  passkey_delete: 'удалены ключи входа', login_2fa_failed: 'неверный код второго шага',
+  passkey_delete: 'удалены ключи входа', pc_pair: 'привязан клиент ПК', pc_unpair: 'отвязан клиент ПК',
+  pc_pair_window: 'открыто окно привязки клиента ПК', pc_denied: 'клиент ПК: отказ', pc_deleted: 'клиент ПК удалил в корзину',
+  pc_guid_changed: 'клиент ПК: другой MachineGuid', pc_ip_changed: 'клиент ПК: новый адрес', login_2fa_failed: 'неверный код второго шага',
   '2fa_on': 'включён двухфакторный вход', '2fa_off': 'отключён двухфакторный вход',
   '2fa_reset': 'сброшено приложение 2FA (настройка заново)', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
@@ -432,8 +434,26 @@ setInterval(() => { for (const e of document.querySelectorAll('[data-ago]')) e.t
 const BK_STATE = { copying: 'копирует', restoring: 'восстанавливает файл на сервере', disk_full: 'мало места на диске', done: 'всё скопировано', paused: 'пауза', pc_off: 'ждёт включения ПК', waiting: 'ждёт хешей', error: 'ошибка', confirm: 'ждёт подтверждения удалений' };
 
 const mbs = (b) => (b >= 1048576 ? (b / 1048576).toFixed(1).replace('.', ',') + ' МБ/с' : Math.round(b / 1024) + ' КБ/с');
+async function loadPc() {
+  const r = await act(() => api('/api/admin/pc')); if (!r) return;
+  if (unchanged('pc', r)) return;
+  const c = r.client, left = Math.max(0, r.pair_until - r.now);
+  const cards = [['Клиент на ПК', c ? `${c.name || 'привязан'} · ключ ${c.key_type === 'tpm' ? 'в TPM' : c.key_type === 'software' ? 'программный (без TPM)' : '—'}` : 'не привязан'],
+    ['Отпечаток ключа', c ? c.fp.replace(/:/g, ':\u200b') : '—'], ['На связи', c && c.last_seen ? `${ago(c.last_seen)} · ${c.last_ip}` : '—'],
+    ['На удаление', String(r.marks)]];
+  if (left > 0) cards.unshift(['Окно привязки', `открыто ещё ${Math.ceil(left / 60)} мин — запусти программу на ПК`]);
+  $('pc-cards').replaceChildren(...cards.map(([k, val]) => { const d = el('div', 'card'); d.append(el('div', 'k', k), el('div', 'v', val)); return d; }));
+  $('pc-unpair').hidden = !c;
+  $('pc-pair').textContent = c ? 'Привязать заново' : 'Привязать';
+}
+$('pc-pair').onclick = () => act(() => api('/api/admin/pc/pair', {}), 'Окно привязки открыто на 10 минут').then(loadPc);
+$('pc-unpair').onclick = async () => {
+  if (!confirm('Отвязать клиент на ПК? Его ключ перестанет действовать; чтобы снова удалять, привяжи заново.')) return;
+  await act(() => api('/api/admin/pc/unpair', {}), 'Клиент отвязан'); loadPc();
+};
+
 async function loadBackup() {
-  loadDamaged();
+  loadDamaged(); loadPc();
   const r = await act(() => api('/api/admin/backup')); if (!r) return;
     if (unchanged('backup', r)) return;
   const v = r.verify;
