@@ -103,10 +103,11 @@ a { color: inherit; text-decoration: none; }
 /* --- выбор фото --- */
 .tile { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
 .tile img { -webkit-user-drag: none; }
-.selmode .tile::before { content: ""; position: absolute; left: 6px; top: 6px; z-index: 2; width: 20px; height: 20px;
-  border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 3px #0008; background: #0002; box-sizing: border-box; }
+/* значки на плитках: размер — вместе с масштабом сетки (--bs задаёт раскладка), непрозрачность 70% */
+.selmode .tile::before { content: ""; position: absolute; left: calc(6px * var(--bs, 1)); top: calc(6px * var(--bs, 1)); z-index: 2; width: calc(20px * var(--bs, 1)); height: calc(20px * var(--bs, 1));
+  border-radius: 50%; border: calc(2px * var(--bs, 1)) solid #fff; box-shadow: 0 0 3px #0008; background: #0002; box-sizing: border-box; opacity: .7; }
 .selmode .tile.sel::before { content: "✓"; display: grid; place-items: center; background: var(--accent); border-color: var(--accent);
-  color: var(--accent-fg); font-size: 13px; font-weight: 700; line-height: 1; }
+  color: var(--accent-fg); font-size: calc(13px * var(--bs, 1)); font-weight: 700; line-height: 1; }
 .tile.sel { background: color-mix(in srgb, var(--accent) 22%, var(--tile)); }
 .tile.sel img { transform: scale(.86); border-radius: 6px; }
 .tile img { transition: opacity .15s, transform .12s; }
@@ -117,21 +118,21 @@ a { color: inherit; text-decoration: none; }
 .star-btn.on svg { fill: var(--accent); stroke: var(--accent); }
 .v-top .star-btn.on svg { fill: #f5c344; stroke: #f5c344; }
 .del-btn { color: var(--err); }
-.dbadge { position: absolute; right: 4px; top: 4px; width: 22px; height: 22px; border-radius: 6px; background: var(--err);
-  display: grid; place-items: center; pointer-events: none; box-shadow: 0 1px 3px #0008; }
-.dbadge svg { width: 15px; height: 15px; stroke: #fff; }
+.dbadge { position: absolute; right: calc(4px * var(--bs, 1)); top: calc(4px * var(--bs, 1)); width: calc(22px * var(--bs, 1)); height: calc(22px * var(--bs, 1)); border-radius: calc(6px * var(--bs, 1)); background: var(--err);
+  display: grid; place-items: center; pointer-events: none; box-shadow: 0 1px 3px #0008; opacity: .7; }
+.dbadge svg { width: calc(15px * var(--bs, 1)); height: calc(15px * var(--bs, 1)); stroke: #fff; }
 .tile.marked img { opacity: .45; }
 /* группы: значок «два квадратика» справа снизу; у свёрнутой — с числом фото */
-.gbadge { position: absolute; right: 4px; bottom: 4px; display: flex; align-items: center; gap: 2px; padding: 2px 4px;
-  border-radius: 6px; background: #0008; color: #fff; font-size: 11px; font-weight: 650; line-height: 1; pointer-events: none; }
-.gbadge svg { width: 14px; height: 14px; }
-.tile.grouped .sbadge { right: auto; left: 6px; bottom: 3px; }
-.tile.grouped .vbadge + .sbadge, .tile.grouped:has(.vbadge) .sbadge { left: 24px; }
+.gbadge { position: absolute; right: calc(4px * var(--bs, 1)); bottom: calc(4px * var(--bs, 1)); display: flex; align-items: center; gap: calc(2px * var(--bs, 1)); padding: calc(2px * var(--bs, 1)) calc(4px * var(--bs, 1));
+  border-radius: calc(6px * var(--bs, 1)); background: #0008; color: #fff; font-size: calc(11px * var(--bs, 1)); font-weight: 650; line-height: 1; pointer-events: none; opacity: .7; }
+.gbadge svg { width: calc(14px * var(--bs, 1)); height: calc(14px * var(--bs, 1)); }
+.tile.grouped .sbadge { right: auto; left: calc(6px * var(--bs, 1)); bottom: calc(3px * var(--bs, 1)); }
+.tile.grouped .vbadge + .sbadge, .tile.grouped:has(.vbadge) .sbadge { left: calc(24px * var(--bs, 1)); }
 .tile.pop { animation: pop .38s cubic-bezier(.2,.8,.2,1) both; }
 @keyframes pop { from { opacity: 0; transform: scale(.55); } to { opacity: 1; transform: none; } }
-.sbadge { position: absolute; right: 5px; bottom: 3px; color: #f5c344; font-size: 14px; line-height: 1; text-shadow: 0 1px 3px #000c; pointer-events: none; }
+.sbadge { position: absolute; right: calc(5px * var(--bs, 1)); bottom: calc(3px * var(--bs, 1)); color: #f5c344; font-size: calc(14px * var(--bs, 1)); line-height: 1; text-shadow: 0 1px 3px #000c; pointer-events: none; opacity: .7; }
 .sel-act:disabled { opacity: .4; cursor: default; }
-.vbadge { position: absolute; left: 6px; bottom: 5px; color: #fff; font-size: 13px; text-shadow: 0 1px 3px #000a; pointer-events: none; }
+.vbadge { position: absolute; left: calc(6px * var(--bs, 1)); bottom: calc(5px * var(--bs, 1)); color: #fff; font-size: calc(13px * var(--bs, 1)); text-shadow: 0 1px 3px #000a; pointer-events: none; opacity: .7; }
 .empty { text-align: center; color: var(--dim); padding: 60px 16px; }
 .pill { position: fixed; top: calc(var(--header-h, 57px) + 10px); left: 50%; transform: translateX(-50%); z-index: 9;
   background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 5px 14px; font-size: 13px;
@@ -278,9 +279,9 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .live-ico { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid currentColor;
   box-shadow: inset 0 0 0 2px transparent; position: relative; }
 .live-ico::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: currentColor; }
-.lbadge { position: absolute; left: 6px; top: 5px; width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid #fff;
-  box-shadow: 0 0 3px #0008; pointer-events: none; }
-.lbadge::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #fff; }
+.lbadge { position: absolute; left: calc(6px * var(--bs, 1)); top: calc(5px * var(--bs, 1)); width: calc(14px * var(--bs, 1)); height: calc(14px * var(--bs, 1)); border-radius: 50%; border: calc(1.5px * var(--bs, 1)) solid #fff;
+  box-shadow: 0 0 3px #0008; pointer-events: none; opacity: .7; }
+.lbadge::after { content: ""; position: absolute; inset: calc(3px * var(--bs, 1)); border-radius: 50%; background: #fff; }
 .v-note { position: absolute; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 2;
   background: #000b; color: #fff; padding: 8px 14px; border-radius: 10px; font-size: 14px; text-align: center; max-width: 90%; }
 
