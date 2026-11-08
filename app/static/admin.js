@@ -176,8 +176,8 @@ async function loadOverview() {
   const labels = {
     storage: 'Режим', source: 'Источник', smb_encrypt: 'Шифрование SMB', bind: 'Адрес', public_url: 'Внешний адрес',
     cookie_secure: 'Secure cookie', trusted_proxies: 'Доверенные прокси', require_proxy: 'Только через прокси',
-    allowed_origins: 'Разрешённые Origin', ha_url: 'Home Assistant', ha_token: 'Токен HA задан',
-    ffmpeg: 'ffmpeg', data_dir: 'Папка данных', workers: 'Потоков эскизов',
+    allowed_origins: 'Разрешённые Origin', ha_url: 'Home Assistant', ha_token: 'Токен HA задан', google: 'Вход через Google',
+    google_redirect: 'Google redirect URI', ffmpeg: 'ffmpeg', data_dir: 'Папка данных', workers: 'Потоков эскизов',
     timezone: 'Часовой пояс', format: 'Формат эскизов', sizes: 'Размеры',
   };
   const rows = Object.entries(o.config).map(([k, v]) => {
@@ -213,6 +213,13 @@ async function loadUsers(force) {
     const role = el('select'); for (const [v, t] of [['user', 'пользователь'], ['admin', 'администратор']]) { const o = el('option', null, t); o.value = v; role.append(o); }
     role.value = u.role;
     role.onchange = () => act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/role`, { role: role.value }), 'Роль изменена').then((x) => { if (!x) role.value = u.role; });
+    const g = el('td');
+    g.append(el('span', 'gmail', u.google || '—'), btn(u.google ? 'изменить' : 'привязать', async () => {
+      const email = prompt('Email Google-аккаунта (пусто — отвязать):', u.google || '');
+      if (email === null) return;
+      await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/google`, { email: email.trim() || null }), email.trim() ? 'Google привязан' : 'Google отвязан');
+      loadUsers(true);
+    }));
     const ops = el('td', 'ops');
     ops.append(btn('пароль', async () => {
       const p = prompt(`Новый пароль для ${u.user} (от 8 символов). Все его сессии будут закрыты.`);
@@ -250,11 +257,11 @@ async function loadUsers(force) {
       }, mode === 'off' ? 'danger' : undefined);
     if (u.totp === 'on') tf.append(el('span', null, 'вкл'), ' ',
       tfa('reset', 'При следующем входе — настройка заново', `Сбросить приложение у ${u.user} (потерян или сменён телефон)? При следующем входе он настроит его заново.`),
-      tfa('off', 'Двухфакторный вход выключен', `Выключить двухфакторный вход у ${u.user}? Дальше вход только по паролю.`));
+      tfa('off', 'Двухфакторный вход выключен', `Выключить двухфакторный вход у ${u.user}? Дальше вход по паролю — без кода (через Google — как обычно).`));
     else if (u.totp === 'pending') tf.append(el('span', 'dim2', 'настроит при входе'), ' ',
       tfa('off', 'Двухфакторный вход выключен'));
     else tf.append(tfa('on', 'Включено: при следующем входе появится настройка'));
-    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, tf, el('td', null, dt(u.created)), ops);
+    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, tf, el('td', null, dt(u.created)), ops);
     return tr;
   }));
 }
@@ -273,7 +280,7 @@ function foldersText(u) {
 async function editFolders(u, tr) {
   if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
-  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 7; row.append(td);
+  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 8; row.append(td);
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
   allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');

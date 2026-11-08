@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -38,6 +38,7 @@ from .auth import USER_RE, LoginLimiter, Session, SessionStore, UserError, UserS
 from .ha import HomeAssistant, clean
 from .images import LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_head, read_limited, render
 from . import transcode, video
+from .google_auth import GoogleAuth, GoogleError
 from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
 from .storage import RESTORED, RestoreWriter, is_missing, is_read_error, make_storage
@@ -54,6 +55,7 @@ audit = logs.Audit(S.data_dir / "audit.log")
 STARTED = time.time()
 STATIC = Path(__file__).parent / "static"
 COOKIE = "__Host-pc_sess" if S.cookie_secure else "pc_sess"
+OAUTH_COOKIE = "__Host-pc_oauth" if S.cookie_secure else "pc_oauth"
 ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
@@ -62,6 +64,7 @@ library = Library(S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
 TRANSCODE = bool(S.transcode and FFMPEG and transcode.has_x264(FFMPEG))
 transcoder = transcode.Transcoder(LRUBytes(S.transcode_cache_mb * 1024 * 1024), S.transcode_slots)
+google = GoogleAuth(S.google_client_id, S.google_client_secret, S.public_url) if S.google_client_id else None
 # одноразовый секрет для внутреннего канала ffmpeg -> приложение (только loopback)
 INTERNAL_TOKEN = secrets.token_urlsafe(32)
 ha = HomeAssistant(S)
@@ -222,6 +225,8 @@ async def lifespan(_app):
     yield
     await ha.close()
     await geocoder.close()
+    if google:
+        await google.close()
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -396,7 +401,8 @@ async def login(request: Request):
     return no_store(start_session(request, JSONResponse({"user": u, "role": role}), u, ip, "паролю", remember))
 
 
-# ---- двухфакторный вход: включает админ («Пользователи» → 2FA). После пароля —
+# ---- двухфакторный вход: включает админ («Пользователи» → 2FA). Спрашивается при входе по паролю
+# (вход через Google его не требует: там защищает сам аккаунт Google) —
 # код из приложения; если приложение ещё не настроено — сначала QR-код и первый код.
 # Потерян телефон — админ сбрасывает в «Пользователях» или из консоли: python -m app 2fa-reset <логин>
 TFA_COOKIE = "pc_2fa"
@@ -495,6 +501,68 @@ def start_session(request: Request, resp: Response, u: str, ip: str, how: str, r
     resp.set_cookie(COOKIE, token, max_age=S.session_max_hours * 3600 if remember else None, path="/",
                     secure=S.cookie_secure, httponly=True, samesite="strict")
     return resp
+
+
+@app.get("/api/auth/providers")
+async def auth_providers():
+    return no_store(JSONResponse({"google": google is not None}))
+
+
+@app.get("/auth/google")
+async def google_start(request: Request):
+    if google is None:
+        raise HTTPException(404)
+    if limiter.blocked(ip_of(request)):
+        return RedirectResponse("/#err=locked", 303)
+    try:
+        url, state = google.start(request.query_params.get("r") == "1")
+    except GoogleError:
+        raise HTTPException(503) from None
+    resp = RedirectResponse(url, 303)
+    # Lax: cookie должна вернуться при переходе со страницы Google обратно к нам
+    resp.set_cookie(OAUTH_COOKIE, state, max_age=600, path="/", secure=S.cookie_secure,
+                    httponly=True, samesite="lax")
+    return no_store(resp)
+
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request):
+    if google is None:
+        raise HTTPException(404)
+    ip = ip_of(request)
+    q = request.query_params
+
+    def fail(code: str) -> Response:
+        r = RedirectResponse(f"/#err={code}", 303)
+        r.delete_cookie(OAUTH_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
+        return no_store(r)
+
+    if limiter.blocked(ip):
+        return fail("locked")
+    if q.get("error"):
+        return fail("google-cancel")
+    try:
+        email, remember = await google.finish(q.get("state", ""), request.cookies.get(OAUTH_COOKIE, ""),
+                                              q.get("code", ""))
+    except GoogleError as e:
+        log.info("Google-вход отклонён: %s", e)
+        audit("login_google_failed", "", ip, str(e))
+        return fail("google")
+    hit = users.by_google(email)
+    if hit is None:
+        limiter.fail(ip)
+        audit("login_google_denied", "", ip, email)
+        bg(ha.notify("login_failed", f"Вход через Google с непривязанного аккаунта {clean(email)} с {clean(ip)}",
+                     dedupe_s=300, key=ip))
+        return fail("google-denied")
+    u, _role = hit
+    # второй шаг (код из приложения) не спрашиваем: вход через Google — сам по себе вход без пароля,
+    # защищённый аккаунтом Google; 2FA — для входа по паролю (запасной путь)
+    limiter.success(ip)
+    audit("login_google", u, ip, email)
+    resp = start_session(request, RedirectResponse("/", 303), u, ip, "Google", remember)
+    resp.delete_cookie(OAUTH_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
+    return no_store(resp)
 
 
 @app.post("/api/logout", dependencies=[Depends(require_csrf)])
@@ -2517,7 +2585,8 @@ async def admin_overview(_: Session = Depends(require_admin)):
             "smb_encrypt": S.smb_encrypt, "bind": f"{S.bind}:{S.port}", "cookie_secure": S.cookie_secure,
             "trusted_proxies": [str(n) for n in S.trusted_proxies], "require_proxy": S.require_proxy,
             "allowed_origins": sorted(S.allowed_origins), "ha_url": S.ha_url, "ha_token": bool(S.ha_token),
-            "public_url": S.public_url,
+            "public_url": S.public_url, "google": bool(google),
+            "google_redirect": google.redirect_uri if google else "",
             "ffmpeg": FFMPEG or "", "data_dir": str(S.data_dir), "workers": S.workers,
             "timezone": str(S.tz), "format": S.image_format,
             "sizes": f"{S.thumb_small_size}/{S.thumb_size}/{S.thumb_large_size}, превью {S.preview_quick_size}/{S.preview_size}",
@@ -2565,6 +2634,21 @@ async def admin_user_password(request: Request, name: str, s: Session = Depends(
     n = sessions.revoke_user(name)          # смена пароля выкидывает все сессии пользователя
     audit("user_password", s.user, ip_of(request), f"{name}, закрыто сессий: {n}")
     return no_store(JSONResponse({"ok": True, "revoked": n}))
+
+
+@app.post("/api/admin/users/{name}/google", dependencies=[Depends(require_csrf)])
+async def admin_user_google(request: Request, name: str, s: Session = Depends(require_admin)):
+    name = _user_arg(name)
+    d = await read_json(request)
+    email = d.get("email")
+    if email is not None and not isinstance(email, str):
+        return _bad("email строкой")
+    try:
+        users.set_google(name, email or None)
+    except UserError as e:
+        return _bad(str(e))
+    audit("user_google", s.user, ip_of(request), f"{name} -> {email or 'отвязан'}")
+    return no_store(JSONResponse({"ok": True}))
 
 
 @app.post("/api/admin/users/{name}/wake", dependencies=[Depends(require_csrf)])
