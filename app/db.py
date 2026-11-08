@@ -9,6 +9,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger("photocloud.db")
@@ -67,6 +68,11 @@ SCHEMA = [
         user TEXT NOT NULL, path TEXT NOT NULL, gid TEXT NOT NULL, cover INTEGER NOT NULL DEFAULT 0, at REAL NOT NULL,
         PRIMARY KEY (user, path)) WITHOUT ROWID""",
     # самые маленькие эскизы видео (ffmpeg долгий): ключ файла (путь+размер+mtime), формат, байты
+    """CREATE TABLE IF NOT EXISTS passkeys (
+         id TEXT PRIMARY KEY,           -- id ключа (base64url), его выдаёт устройство
+         user TEXT NOT NULL, pubkey BLOB NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+         name TEXT NOT NULL DEFAULT '', created REAL NOT NULL, last_used REAL NOT NULL DEFAULT 0)""",
+    "CREATE INDEX IF NOT EXISTS passkeys_user ON passkeys(user)",
     """CREATE TABLE IF NOT EXISTS vthumbs (
         key TEXT PRIMARY KEY, fmt TEXT NOT NULL, data BLOB NOT NULL) WITHOUT ROWID""",
     # избранное: у каждого пользователя своё
@@ -319,8 +325,32 @@ class DB:
 
     def user_forget(self, user: str) -> None:
         """Пользователя удалили: его скрытые, группы и избранное больше не нужны."""
-        for t in ("user_hidden", "user_groups", "starred"):
+        for t in ("user_hidden", "user_groups", "starred", "passkeys"):
             self.run(f"DELETE FROM {t} WHERE user = ?", (user,))
+
+    # ------------------------------------------------------------ ключи входа (passkey)
+
+    def passkey_add(self, cid: str, user: str, pubkey: bytes, sign_count: int, name: str) -> None:
+        self.run("INSERT OR REPLACE INTO passkeys (id, user, pubkey, sign_count, name, created) VALUES (?,?,?,?,?,?)",
+                 (cid, user, pubkey, sign_count, name, time.time()))
+
+    def passkey_get(self, cid: str):
+        r = self.run("SELECT user, pubkey, sign_count FROM passkeys WHERE id = ?", (cid,))
+        return r[0] if r else None
+
+    def passkey_used(self, cid: str, sign_count: int) -> None:
+        self.run("UPDATE passkeys SET sign_count = ?, last_used = ? WHERE id = ?", (sign_count, time.time(), cid))
+
+    def passkeys_of(self, user: str) -> list[tuple]:
+        return self.run("SELECT id, name, created, last_used FROM passkeys WHERE user = ? ORDER BY created", (user,))
+
+    def passkey_counts(self) -> dict[str, int]:
+        return dict(self.run("SELECT user, count(*) FROM passkeys GROUP BY user"))
+
+    def passkeys_delete_user(self, user: str) -> int:
+        n = self.run("SELECT count(*) FROM passkeys WHERE user = ?", (user,))[0][0]
+        self.run("DELETE FROM passkeys WHERE user = ?", (user,))
+        return n
 
     # ------------------------------------------------------------ эскизы видео
 

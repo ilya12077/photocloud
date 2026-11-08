@@ -90,6 +90,8 @@ class UserStore:
                 users[name].update(totp=sec, totp_step=int(rec.get("totp_step") or 0))
             if rec.get("totp_required") or users[name].get("totp"):
                 users[name]["totp_required"] = True
+            if rec.get("passkey_offer"):
+                users[name]["passkey_offer"] = True
         self._u, self._mtime = users, mtime
 
     def _sync(self) -> None:
@@ -125,7 +127,8 @@ class UserStore:
             self._sync()
         return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
                  "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True),
-                 "totp": "on" if r.get("totp") else "pending" if r.get("totp_required") else "off"}
+                 "totp": "on" if r.get("totp") else "pending" if r.get("totp_required") else "off",
+                 "passkey_offer": bool(r.get("passkey_offer"))}
                 for n, r in sorted(self._u.items())]
 
     # ---- двухфакторный вход (TOTP). Включает админ; пользователь настраивает приложение при
@@ -143,6 +146,23 @@ class UserStore:
             self._sync()
             rec = self._u.get(name)
             return bool(rec and rec.get("totp_required"))
+
+    # ---- ключи входа (passkey): сами ключи — в базе; здесь только «предложить создать при входе»
+    def passkey_offer(self, name: str) -> bool:
+        rec = self._u.get(name)
+        return bool(rec and rec.get("passkey_offer"))
+
+    def set_passkey_offer(self, name: str, on: bool) -> None:
+        with self._mu:
+            self._sync()
+            rec = self._u.get(name)
+            if rec is None:
+                raise UserError("нет такого пользователя")
+            if on:
+                rec["passkey_offer"] = True
+            else:
+                rec.pop("passkey_offer", None)
+            self._save()
 
     def totp_check(self, name: str, code) -> bool:
         """Код из приложения подошёл. Один и тот же код дважды не принимается."""

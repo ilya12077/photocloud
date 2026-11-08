@@ -39,6 +39,7 @@ from .ha import HomeAssistant, clean
 from .images import LRUBytes, TooLarge, decode, embedded_heic, embedded_jpeg, finish, read_head, read_limited, render
 from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
+from .passkeys import Passkeys, PasskeyError, rp_for
 from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
 from .storage import RESTORED, RestoreWriter, is_missing, is_read_error, make_storage
@@ -56,6 +57,7 @@ STARTED = time.time()
 STATIC = Path(__file__).parent / "static"
 COOKIE = "__Host-pc_sess" if S.cookie_secure else "pc_sess"
 OAUTH_COOKIE = "__Host-pc_oauth" if S.cookie_secure else "pc_oauth"
+PK_COOKIE = "pc_pk"
 ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
@@ -503,6 +505,86 @@ def start_session(request: Request, resp: Response, u: str, ip: str, how: str, r
     return resp
 
 
+# ---- вход по ключу (passkey). Создать ключ предлагает админ («Пользователи» → Passkey) —
+# пользователь видит предложение после следующего входа. Вход по ключу — без пароля и кода.
+passkeys = Passkeys(db, S.public_name)
+
+
+def _rp(request: Request) -> tuple[str, str]:
+    allowed = set(S.allowed_origins) | ({S.public_url} if S.public_url else set())
+    if not allowed:      # тест без настроек: сам адрес, по которому открыт сайт
+        allowed = {f"{request.url.scheme}://{request.headers.get('host', '')}"}
+    try:
+        return rp_for(request.headers.get("origin", ""), allowed)
+    except PasskeyError:
+        raise HTTPException(403, "origin") from None
+
+
+@app.post("/api/passkey/login/options", dependencies=[Depends(require_csrf)])
+async def passkey_login_options(request: Request):
+    ip = ip_of(request)
+    if wait := limiter.blocked(ip):
+        return no_store(JSONResponse({"error": "locked", "retry": wait}, 429))
+    rp_id, origin = _rp(request)
+    try:
+        opts, ticket = passkeys.login_options(rp_id, origin)
+    except PasskeyError:
+        return _bad("занято, попробуй через минуту", 503)
+    resp = Response(opts, media_type="application/json")
+    resp.set_cookie(PK_COOKIE, ticket, max_age=300, path="/", secure=S.cookie_secure, httponly=True, samesite="strict")
+    return no_store(resp)
+
+
+@app.post("/api/passkey/login", dependencies=[Depends(require_csrf)])
+async def passkey_login(request: Request):
+    ip = ip_of(request)
+    if wait := limiter.blocked(ip):
+        return no_store(JSONResponse({"error": "locked", "retry": wait}, 429))
+    data = await read_json(request, limit=16384)
+    try:
+        u = await run_in_threadpool(passkeys.login, request.cookies.get(PK_COOKIE, ""), data.get("credential"))
+    except PasskeyError as e:
+        log.info("вход по ключу отклонён: %s", e)
+        locked = limiter.fail(ip)
+        audit("login_passkey_failed", "", ip, str(e)[:120])
+        if locked:
+            audit("lockout", "", ip, "5 неудачных входов, блок 15 мин")
+        await asyncio.sleep(0.3)
+        return no_store(JSONResponse({"error": "key"}, 401))
+    role = users.role(u)
+    if role is None:
+        return no_store(JSONResponse({"error": "key"}, 401))
+    limiter.success(ip)
+    audit("login_passkey", u, ip)
+    resp = start_session(request, JSONResponse({"user": u, "role": role}), u, ip, "ключу", data.get("r") is True)
+    resp.delete_cookie(PK_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="strict")
+    return no_store(resp)
+
+
+@app.post("/api/passkey/register/options", dependencies=[Depends(require_csrf)])
+async def passkey_register_options(request: Request, s: Session = Depends(require_user)):
+    rp_id, origin = _rp(request)
+    try:
+        opts, ticket = await run_in_threadpool(passkeys.register_options, s.user, rp_id, origin)
+    except PasskeyError:
+        return _bad("занято, попробуй через минуту", 503)
+    return no_store(JSONResponse({"options": json.loads(opts), "ticket": ticket}))
+
+
+@app.post("/api/passkey/register", dependencies=[Depends(require_csrf)])
+async def passkey_register(request: Request, s: Session = Depends(require_user)):
+    data = await read_json(request, limit=32768)
+    name = data.get("name") if isinstance(data.get("name"), str) else ""
+    try:
+        await run_in_threadpool(passkeys.register, s.user, data.get("ticket", ""), data.get("credential"), name)
+    except PasskeyError as e:
+        log.info("ключ не создан: %s", e)
+        return _bad("не удалось сохранить ключ — попробуй ещё раз")
+    await run_in_threadpool(users.set_passkey_offer, s.user, False)
+    audit("passkey_add", s.user, ip_of(request), name[:60])
+    return no_store(JSONResponse({"ok": True}))
+
+
 @app.get("/api/auth/providers")
 async def auth_providers():
     return no_store(JSONResponse({"google": google is not None}))
@@ -581,7 +663,8 @@ async def me(s: Session = Depends(require_user)):
     return no_store(JSONResponse({"user": s.user, "role": s.role, "name": S.public_name,  # type: ignore[attr-defined]
                                   "sizes": {"s": S.thumb_small_size, "t": S.thumb_size, "m": S.thumb_large_size},
                                   "video": bool(FFMPEG), "transcode": TRANSCODE,
-                                  "can_wake": users.can_wake(s.user), "can_delete": s.role == "admin"}))  # type: ignore[attr-defined]
+                                  "can_wake": users.can_wake(s.user), "can_delete": s.role == "admin",  # type: ignore[attr-defined]
+                                  "passkey_offer": users.passkey_offer(s.user)}))
 
 
 # ---------------------------------------------------------------- ПК и индекс
@@ -2604,7 +2687,8 @@ def _user_arg(name: str) -> str:
 
 @app.get("/api/admin/users")
 async def admin_users(_: Session = Depends(require_admin)):
-    return no_store(JSONResponse({"users": users.list()}))
+    keys = await run_in_threadpool(db.passkey_counts)
+    return no_store(JSONResponse({"users": [{**u, "passkeys": keys.get(u["user"], 0)} for u in users.list()]}))
 
 
 @app.post("/api/admin/users", dependencies=[Depends(require_csrf)])
@@ -2664,6 +2748,25 @@ async def admin_user_wake(request: Request, name: str, s: Session = Depends(requ
     except UserError as e:
         return _bad(str(e))
     audit("user_wake", s.user, ip_of(request), f"{name} -> {'может' if allow else 'не может'} включать ПК")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/users/{name}/passkey", dependencies=[Depends(require_csrf)])
+async def admin_user_passkey(request: Request, name: str, s: Session = Depends(require_admin)):
+    """offer — предложить создать ключ при следующем входе; cancel — не предлагать; delete — удалить его ключи."""
+    name = _user_arg(name)
+    mode = (await read_json(request)).get("mode")
+    if mode not in ("offer", "cancel", "delete"):
+        return _bad("mode: offer, cancel или delete")
+    try:
+        await run_in_threadpool(users.set_passkey_offer, name, mode == "offer")
+    except UserError as e:
+        return _bad(str(e))
+    detail = name
+    if mode == "delete":
+        detail += f", удалено ключей: {await run_in_threadpool(db.passkeys_delete_user, name)}"
+    audit({"offer": "passkey_offer", "cancel": "passkey_cancel", "delete": "passkey_delete"}[mode],
+          s.user, ip_of(request), detail)
     return no_store(JSONResponse({"ok": True}))
 
 
