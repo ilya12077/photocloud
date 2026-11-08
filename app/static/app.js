@@ -548,6 +548,8 @@ function layout() {
   const W = gridW(), cols = Z.cols;
   L.gap = cols >= 7 ? 1 : cols >= 5 ? 2 : 3;
   L.tileH = (W - L.gap * (cols - 1)) / cols;
+  // значки на плитках — в масштабе плитки: полный размер от 160 px, мельче — пропорционально (не меньше 55%)
+  $('grid').style.setProperty('--bs', Math.max(0.55, Math.min(1, L.tileH / 160)).toFixed(3));
   const rowH = L.tileH + L.gap;
   const rows = []; let y = 0;
   const byMonth = st.sort !== 'name';
