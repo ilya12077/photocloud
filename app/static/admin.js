@@ -14,7 +14,7 @@ const EVENTS = {
 const AUDIT = {
   login: 'вход', login_google: 'вход через Google', login_2fa_failed: 'неверный код второго шага',
   '2fa_on': 'включён двухфакторный вход', '2fa_off': 'отключён двухфакторный вход',
-  '2fa_reset': 'сброшен двухфакторный вход', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
+  '2fa_reset': 'сброшено приложение 2FA (настройка заново)', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
   user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', group: 'фото сгруппированы', vthumbs: 'подсчёт эскизов видео', ungroup: 'группа разобрана', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', delete_mark: 'помечены на удаление', delete_unmark: 'снята пометка на удаление', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
@@ -246,14 +246,19 @@ async function loadUsers() {
         c.checked ? 'Может включать ПК' : 'Не может включать ПК').then((x) => { if (!x) c.checked = !c.checked; show(); });
       show(); lab.append(c, txt); wk.append(lab);
     }
-    // двухфакторный вход включает сам пользователь (меню ⋯ в галерее); админ может только сбросить
-    const tf = el('td');
-    if (u.totp) tf.append(el('span', null, 'вкл'), ' ', btn('сбросить', async () => {
-      if (!confirm(`Отключить двухфакторный вход у ${u.user}? Дальше он войдёт только паролем или через Google.`)) return;
-      await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/2fa-reset`, {}), 'Двухфакторный вход отключён');
-      loadUsers();
-    }));
-    else tf.append(el('span', 'dim2', '—'));
+    // двухфакторный вход: включает админ, приложение пользователь настраивает при следующем входе
+    const tf = el('td'), tfa = (mode, msg, ask) => btn(
+      { on: 'включить', reset: 'новый телефон', off: 'выключить' }[mode], async () => {
+        if (ask && !confirm(ask)) return;
+        await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/2fa`, { mode }), msg);
+        loadUsers();
+      }, mode === 'off' ? 'danger' : undefined);
+    if (u.totp === 'on') tf.append(el('span', null, 'вкл'), ' ',
+      tfa('reset', 'При следующем входе — настройка заново', `Сбросить приложение у ${u.user} (потерян или сменён телефон)? При следующем входе он настроит его заново.`),
+      tfa('off', 'Двухфакторный вход выключен', `Выключить двухфакторный вход у ${u.user}? Дальше вход только по паролю (или Google).`));
+    else if (u.totp === 'pending') tf.append(el('span', 'dim2', 'настроит при входе'), ' ',
+      tfa('off', 'Двухфакторный вход выключен'));
+    else tf.append(tfa('on', 'Включено: при следующем входе появится настройка'));
     tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, tf, el('td', null, dt(u.created)), ops);
     return tr;
   }));

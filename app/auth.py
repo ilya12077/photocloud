@@ -88,6 +88,8 @@ class UserStore:
             sec = rec.get("totp")
             if isinstance(sec, str) and totp.SECRET_RE.match(sec):
                 users[name].update(totp=sec, totp_step=int(rec.get("totp_step") or 0))
+            if rec.get("totp_required") or users[name].get("totp"):
+                users[name]["totp_required"] = True
         self._u, self._mtime = users, mtime
 
     def _sync(self) -> None:
@@ -119,18 +121,28 @@ class UserStore:
         return rec["role"] if rec else None
 
     def list(self) -> list[dict]:
+        with self._mu:
+            self._sync()
         return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
                  "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True),
-                 "totp": bool(r.get("totp"))}
+                 "totp": "on" if r.get("totp") else "pending" if r.get("totp_required") else "off"}
                 for n, r in sorted(self._u.items())]
 
-    # ---- двухфакторный вход (TOTP). Потерян телефон — сброс админом или из консоли контейнера:
-    # python -m app 2fa-reset <логин>
+    # ---- двухфакторный вход (TOTP). Включает админ; пользователь настраивает приложение при
+    # следующем входе. Потерян телефон — сброс (в админке или «python -m app 2fa-reset <логин>»):
+    # при следующем входе настройка заново.
     def totp_on(self, name: str) -> bool:
+        """Приложение уже настроено — при входе нужен код."""
         with self._mu:
             self._sync()
             rec = self._u.get(name)
             return bool(rec and rec.get("totp"))
+
+    def totp_required(self, name: str) -> bool:
+        with self._mu:
+            self._sync()
+            rec = self._u.get(name)
+            return bool(rec and rec.get("totp_required"))
 
     def totp_check(self, name: str, code) -> bool:
         """Код из приложения подошёл. Один и тот же код дважды не принимается."""
@@ -148,21 +160,31 @@ class UserStore:
             return True
 
     def totp_enable(self, name: str, secret: str, step: int) -> None:
+        """Пользователь настроил приложение (код подошёл)."""
         with self._mu:
             self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
-            self._u[name].update(totp=secret, totp_step=step)
+            self._u[name].update(totp=secret, totp_step=step, totp_required=True)
             self._save()
 
-    def totp_disable(self, name: str) -> None:
+    def totp_set(self, name: str, mode: str) -> None:
+        """on — требовать (настроит при следующем входе); off — выключить совсем;
+        reset — забыть приложение (новый телефон), при следующем входе настройка заново."""
         with self._mu:
             self._sync()
             rec = self._u.get(name)
             if rec is None:
                 raise UserError("нет такого пользователя")
-            for k in ("totp", "totp_step", "totp_codes"):
-                rec.pop(k, None)
+            if mode == "on":
+                rec["totp_required"] = True
+            elif mode in ("off", "reset"):
+                for k in ("totp", "totp_step", "totp_codes"):
+                    rec.pop(k, None)
+                if mode == "off":
+                    rec.pop("totp_required", None)
+            else:
+                raise UserError("mode: on, off или reset")
             self._save()
 
     def folders(self, name: str):
