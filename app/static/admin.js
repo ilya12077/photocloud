@@ -514,9 +514,6 @@ async function loadSettings() {
   const s = r.settings;
   $('s-name').value = s.public_name;
   $('s-notify').value = s.ha_notify_service;
-  const w = r.wake || {};
-  $('s-wake').value = w.ha_wake_service || '';
-  $('s-wakedata').value = Object.keys(w.ha_wake_data || {}).length ? JSON.stringify(w.ha_wake_data) : '';
   $('s-waket').value = s.wake_timeout; $('s-ttl').value = s.index_ttl; $('s-idle').value = s.session_idle_hours;
   $('s-short').value = s.session_short_minutes;
   $('s-bkstale').value = s.backup_stale_days;

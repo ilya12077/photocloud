@@ -216,7 +216,6 @@ td .gmail { margin-right: 8px; }
 .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .inline input, .inline select, .form input, .form textarea, table select {
   padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); font-size: 14px; }
-.form input[readonly], .form textarea[readonly] { opacity: .6; cursor: default; }
 .form { display: grid; gap: 14px; max-width: 640px; }
 .form label { display: grid; gap: 5px; font-size: 13px; color: var(--dim); }
 .form fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
