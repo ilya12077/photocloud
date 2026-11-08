@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.0.3"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.0.4"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -544,7 +544,7 @@ class App:
         self.b_restore.pack(side="left", padx=(8, 0))
         self.b_unmark = ttk.Button(bar, text="Снять пометку на удаление", command=self.unmark)
         self.b_unmark.pack(side="left", padx=8)
-        ttk.Button(bar, text="Выбрать все проверенные", command=lambda: self._select(True)).pack(side="left")
+        ttk.Button(bar, text="Выбрать все", command=lambda: self._select(True)).pack(side="left")
         ttk.Button(bar, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=8)
         self.summary = ttk.Label(main, text="", padding=(12, 0, 12, 8))
         self.summary.pack(fill="x")
@@ -1004,7 +1004,7 @@ class App:
 
     def _select(self, on: bool) -> None:
         for it in self.items:
-            it["pick"] = on and it["state"] == "ok"
+            it["pick"] = on and it["state"] != "checking"       # кроме ещё не проверенных
         self._layout()
         self._count()
 
