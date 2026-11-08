@@ -219,6 +219,7 @@ td .gmail { margin-right: 8px; }
 .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .inline input, .inline select, .form input, .form textarea, table select {
   padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); font-size: 14px; }
+.form input[readonly], .form textarea[readonly] { opacity: .6; cursor: default; }
 .form { display: grid; gap: 14px; max-width: 640px; }
 .form label { display: grid; gap: 5px; font-size: 13px; color: var(--dim); }
 .form fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
@@ -299,3 +300,20 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .bk-new { margin-top: 12px; padding: 12px; border: 1px solid var(--line, #444); border-radius: 10px; }
 .bk-new input { flex: 1; min-width: 0; }
 .bk-cur { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- двухфакторный вход --- */
+.hint { margin: 0; font-size: 14px; color: var(--dim); }
+.login-card .linkbtn { background: none; color: var(--dim); font-weight: 500; padding: 4px; }
+.login-card .linkbtn:hover { color: var(--fg); }
+.overlay { position: fixed; inset: 0; z-index: 60; background: #0008; display: grid; place-items: center;
+  padding: 16px; overflow: auto; }
+.tfa-card { width: min(400px, 100%); }
+.tfa-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tfa-head h2 { margin: 0; font-size: 18px; }
+.tfa-head .icon { background: none; color: var(--dim); padding: 4px 8px; font-weight: 400; }
+#tfa-body { display: grid; gap: 12px; }
+#tfa-body p { margin: 0; font-size: 14px; }
+.tfa-qr { justify-self: center; width: 200px; height: 200px; image-rendering: pixelated; border-radius: 8px; background: #fff; }
+.tfa-key { font: 600 14px/1.5 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .5px; word-break: break-all;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; user-select: all; }
+.login-card button.danger { background: var(--err); color: #fff; }

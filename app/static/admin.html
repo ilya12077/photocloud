@@ -63,7 +63,7 @@
     </div>
 
     <div data-pane="users" hidden>
-      <table class="list" id="users"><thead><tr><th>Логин</th><th>Роль</th><th>Папки</th><th>Включать ПК</th><th>Google</th><th>Создан</th><th></th></tr></thead><tbody></tbody></table>
+      <table class="list" id="users"><thead><tr><th>Логин</th><th>Роль</th><th>Папки</th><th>Включать ПК</th><th>Google</th><th>2FA</th><th>Создан</th><th></th></tr></thead><tbody></tbody></table>
       <h3>Новый пользователь</h3>
       <form id="add-user" class="inline">
         <input id="nu" placeholder="логин" autocapitalize="off" spellcheck="false" maxlength="32" required>
@@ -119,8 +119,8 @@
         <label>Название<input id="s-name" maxlength="40" required></label>
         <fieldset><legend>Уведомления на телефон</legend><div id="s-events" class="checks"></div></fieldset>
         <label>Сервис уведомлений HA — сервис (notify.mobile_app_…) или сущность, где он записан (input_text.…)<input id="s-notify" placeholder="notify.mobile_app_… или input_text.…" spellcheck="false"></label>
-        <label>Сервис пробуждения ПК<input id="s-wake" placeholder="script.…" spellcheck="false"></label>
-        <label>Данные для сервиса пробуждения (JSON)<textarea id="s-wakedata" rows="2" spellcheck="false"></textarea></label>
+        <label>Сервис пробуждения ПК — меняется только в .env (HA_WAKE_SERVICE: script.…, button.press или wake_on_lan.send_magic_packet)<input id="s-wake" readonly spellcheck="false"></label>
+        <label>Данные для сервиса пробуждения — в .env (HA_WAKE_DATA)<textarea id="s-wakedata" rows="2" readonly spellcheck="false"></textarea></label>
         <div class="grid3">
           <label>Ждать пробуждения, с<input id="s-waket" type="number" min="10" max="1800"></label>
           <label>Пересканировать папки, с<input id="s-ttl" type="number" min="30" max="86400"></label>

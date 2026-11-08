@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from argon2 import PasswordHasher
+
+from . import totp
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 _ph = PasswordHasher()
@@ -58,22 +61,44 @@ class UserStore:
     def __init__(self, path: Path):
         self.path = path
         self._u: dict[str, dict] = {}
+        self._mtime = 0
         self._mu = threading.Lock()
-        if path.exists():
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            for name, rec in (raw.get("users") or {}).items():
-                if USER_RE.match(name) and isinstance(rec, dict) and str(rec.get("hash", "")).startswith("$argon2") \
-                        and rec.get("role") in ROLES:
-                    g = rec.get("google")
-                    try:
-                        folders = norm_folders(rec.get("folders"))
-                        exclude = norm_folders(rec.get("exclude")) or []
-                    except UserError:
-                        folders, exclude = [], []   # испорченная запись — безопаснее ничего, чем всё
-                    self._u[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
-                                     "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
-                                     "folders": folders, "exclude": exclude,
-                                     "wake": rec.get("wake", True) is not False}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        mtime = self.path.stat().st_mtime_ns
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        users: dict[str, dict] = {}
+        for name, rec in (raw.get("users") or {}).items():
+            if not (USER_RE.match(name) and isinstance(rec, dict) and str(rec.get("hash", "")).startswith("$argon2")
+                    and rec.get("role") in ROLES):
+                continue
+            g = rec.get("google")
+            try:
+                folders = norm_folders(rec.get("folders"))
+                exclude = norm_folders(rec.get("exclude")) or []
+            except UserError:
+                folders, exclude = [], []   # испорченная запись — безопаснее ничего, чем всё
+            users[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
+                           "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
+                           "folders": folders, "exclude": exclude,
+                           "wake": rec.get("wake", True) is not False}
+            sec = rec.get("totp")
+            if isinstance(sec, str) and totp.SECRET_RE.match(sec):
+                users[name].update(totp=sec, totp_step=int(rec.get("totp_step") or 0))
+        self._u, self._mtime = users, mtime
+
+    def _sync(self) -> None:
+        """users.json поменяли снаружи (например, «python -m app 2fa-reset» из консоли
+        контейнера) — перечитать, иначе следующая запись затёрла бы эту правку."""
+        try:
+            m = self.path.stat().st_mtime_ns
+        except OSError:
+            return
+        if m != self._mtime:
+            self._load()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +109,7 @@ class UserStore:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+        self._mtime = self.path.stat().st_mtime_ns
 
     def empty(self) -> bool:
         return not self._u
@@ -94,8 +120,50 @@ class UserStore:
 
     def list(self) -> list[dict]:
         return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
-                 "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True)}
+                 "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True),
+                 "totp": bool(r.get("totp"))}
                 for n, r in sorted(self._u.items())]
+
+    # ---- двухфакторный вход (TOTP). Потерян телефон — сброс админом или из консоли контейнера:
+    # python -m app 2fa-reset <логин>
+    def totp_on(self, name: str) -> bool:
+        with self._mu:
+            self._sync()
+            rec = self._u.get(name)
+            return bool(rec and rec.get("totp"))
+
+    def totp_check(self, name: str, code) -> bool:
+        """Код из приложения подошёл. Один и тот же код дважды не принимается."""
+        c = totp.norm(code)
+        with self._mu:
+            self._sync()
+            rec = self._u.get(name)
+            if not rec or not rec.get("totp") or not c:
+                return False
+            st = totp.match(rec["totp"], c, rec.get("totp_step", 0))
+            if st is None:
+                return False
+            rec["totp_step"] = st
+            self._save()
+            return True
+
+    def totp_enable(self, name: str, secret: str, step: int) -> None:
+        with self._mu:
+            self._sync()
+            if name not in self._u:
+                raise UserError("нет такого пользователя")
+            self._u[name].update(totp=secret, totp_step=step)
+            self._save()
+
+    def totp_disable(self, name: str) -> None:
+        with self._mu:
+            self._sync()
+            rec = self._u.get(name)
+            if rec is None:
+                raise UserError("нет такого пользователя")
+            for k in ("totp", "totp_step", "totp_codes"):
+                rec.pop(k, None)
+            self._save()
 
     def folders(self, name: str):
         """Доступ пользователя к папкам: None — всё; иначе (разрешённые или None=все, исключённые).
@@ -114,6 +182,7 @@ class UserStore:
 
     def set_wake(self, name: str, allow: bool) -> None:
         with self._mu:
+            self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             self._u[name]["wake"] = bool(allow)
@@ -125,6 +194,7 @@ class UserStore:
         folders = norm_folders(folders)
         exclude = norm_folders(exclude or []) or []
         with self._mu:
+            self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             self._u[name]["folders"] = folders
@@ -144,6 +214,7 @@ class UserStore:
             if not EMAIL_RE.match(email):
                 raise UserError("неверный email")
         with self._mu:
+            self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             if email and any(r.get("google") == email for n, r in self._u.items() if n != name):
@@ -153,6 +224,8 @@ class UserStore:
 
     def verify(self, username: str, password: str) -> str | None:
         """Роль при верном пароле, иначе None. Время ответа не зависит от наличия логина."""
+        with self._mu:
+            self._sync()
         rec = self._u.get(username)
         h = rec["hash"] if rec else _DUMMY_HASH
         try:
@@ -163,8 +236,11 @@ class UserStore:
             return None
         if _ph.check_needs_rehash(h):
             with self._mu:
-                rec["hash"] = _ph.hash(password)
-                self._save()
+                self._sync()
+                cur = self._u.get(username)
+                if cur is not None and cur["hash"] == h:
+                    cur["hash"] = _ph.hash(password)
+                    self._save()
         return rec["role"]
 
     @staticmethod
@@ -180,6 +256,7 @@ class UserStore:
         self._check(name, password, role)
         h = _ph.hash(password)
         with self._mu:
+            self._sync()
             if name in self._u:
                 raise UserError("такой пользователь уже есть")
             self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "exclude": [], "wake": True}
@@ -189,6 +266,7 @@ class UserStore:
         self._check(name, password, None)
         h = _ph.hash(password)
         with self._mu:
+            self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             self._u[name]["hash"] = h
@@ -200,6 +278,7 @@ class UserStore:
     def set_role(self, name: str, role: str) -> None:
         self._check(name, None, role)
         with self._mu:
+            self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             if self._u[name]["role"] == "admin" and role != "admin" and self._admins() == 1:
@@ -209,6 +288,7 @@ class UserStore:
 
     def delete(self, name: str) -> None:
         with self._mu:
+            self._sync()
             if name not in self._u:
                 raise UserError("нет такого пользователя")
             if self._u[name]["role"] == "admin" and self._admins() == 1:
@@ -337,14 +417,32 @@ class SessionStore:
         self._db_del(dead)
 
 
+def ip_key(ip: str) -> str:
+    """Ключ для счёта неудач: IPv4 — сам адрес, IPv6 — его сеть /64 (у одного абонента их миллиарды)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if a.version == 6:
+        if a.ipv4_mapped is not None:
+            return str(a.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{a}/64", strict=False))
+    return str(a)
+
+
 class LoginLimiter:
-    """5 неудач с IP за 15 минут -> блок IP на 15 минут.
-    Плюс глобальный потолок, чтобы распределённый перебор тоже упирался."""
+    """5 неудач с адреса (IPv6 — с сети /64) за 15 минут -> блок на 15 минут.
+    Плюс глобальный потолок против распределённого перебора. Он не действует на адреса,
+    с которых недавно был успешный вход или ходил клиент бэкапа, и на сам клиент бэкапа
+    (там токен, а не пароль) — иначе любой с десятком адресов запер бы вход всем."""
+
+    TRUST_S = 30 * 86400
 
     def __init__(self, per_ip=5, window=900, lock=900, global_max=50):
         self.per_ip, self.window, self.lock_s, self.global_max = per_ip, window, lock, global_max
         self._fails: dict[str, deque] = {}
         self._locked: dict[str, float] = {}
+        self._good: dict[str, float] = {}       # адрес -> время последнего успешного входа
         self._global: deque = deque()
         self._mu = threading.Lock()
 
@@ -352,31 +450,42 @@ class LoginLimiter:
         while dq and now - dq[0] > self.window:
             dq.popleft()
 
-    def blocked(self, ip: str) -> int:
-        """Сколько секунд ещё ждать (0 = можно)."""
+    def _prune(self, now: float) -> None:
+        self._fails = {k: v for k, v in self._fails.items() if v and now - v[-1] < self.window}
+        self._locked = {k: t for k, t in self._locked.items() if t > now}
+        if len(self._good) > 5000:
+            self._good = dict(sorted(self._good.items(), key=lambda kv: kv[1])[-2000:])
+
+    def blocked(self, ip: str, *, global_cap: bool = True) -> int:
+        """Сколько секунд ещё ждать (0 = можно). global_cap=False — только блок самого адреса."""
         now = time.time()
+        k = ip_key(ip)
         with self._mu:
-            until = self._locked.get(ip, 0)
+            until = self._locked.get(k, 0)
             if until > now:
                 return int(until - now) + 1
-            self._locked.pop(ip, None)
+            self._locked.pop(k, None)
+            if not global_cap or now - self._good.get(k, 0) < self.TRUST_S:
+                return 0
             self._trim(self._global, now)
             if len(self._global) >= self.global_max:
                 return int(self.window - (now - self._global[0])) + 1
             return 0
 
     def fail(self, ip: str) -> bool:
-        """Регистрирует неудачу. True, если IP только что заблокирован."""
+        """Регистрирует неудачу. True, если адрес только что заблокирован."""
         now = time.time()
+        k = ip_key(ip)
         with self._mu:
             self._global.append(now)
-            dq = self._fails.setdefault(ip, deque())
+            self._trim(self._global, now)
+            dq = self._fails.setdefault(k, deque())
             self._trim(dq, now)
             dq.append(now)
-            if len(self._fails) > 10000:  # защита памяти
-                self._fails = {k: v for k, v in self._fails.items() if v and now - v[-1] < self.window}
+            if len(self._fails) > 10000 or len(self._locked) > 1000:  # защита памяти
+                self._prune(now)
             if len(dq) >= self.per_ip:
-                self._locked[ip] = now + self.lock_s
+                self._locked[k] = now + self.lock_s
                 dq.clear()
                 return True
             return False
@@ -387,10 +496,14 @@ class LoginLimiter:
             return [{"ip": ip, "left": int(t - now) + 1} for ip, t in self._locked.items() if t > now]
 
     def unlock(self, ip: str) -> None:
+        k = ip_key(ip)
         with self._mu:
-            self._locked.pop(ip, None)
-            self._fails.pop(ip, None)
+            self._locked.pop(k, None)
+            self._fails.pop(k, None)
 
-    def success(self, ip: str) -> None:
+    def success(self, ip: str, at: float | None = None) -> None:
+        """Успешный вход (или запрос клиента бэкапа с верным токеном): адрес «свой»."""
+        k = ip_key(ip)
         with self._mu:
-            self._fails.pop(ip, None)
+            self._fails.pop(k, None)
+            self._good[k] = max(self._good.get(k, 0), at or time.time())
