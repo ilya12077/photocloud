@@ -10,6 +10,8 @@ import time
 
 import httpx
 
+from .config import WAKE_DOMAINS
+
 log = logging.getLogger("photocloud.ha")
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
@@ -43,6 +45,9 @@ class HomeAssistant:
 
     async def call(self, service: str, data: dict) -> bool:
         domain, svc = service.split(".", 1)  # формат проверен в config
+        if domain not in WAKE_DOMAINS and domain != "notify":
+            log.warning("HA %s: этот домен вызывать нельзя", service)
+            return False
         try:
             r = await self._client.post(f"/api/services/{domain}/{svc}", json=data)
         except httpx.HTTPError as e:
@@ -69,7 +74,7 @@ class HomeAssistant:
             r = await self._client.get(f"/api/states/{cfg}")
             if r.status_code == 200:
                 val = str(r.json().get("state", "")).strip().strip("\"'").strip()
-                if _SERVICE_RE.match(val):
+                if _SERVICE_RE.match(val) and val.startswith("notify."):
                     svc = val
                 else:
                     log.warning("в %s не сервис уведомлений (%r) — ожидается notify.…", cfg, val[:60])

@@ -12,7 +12,9 @@ const EVENTS = {
   damaged: 'повреждённые файлы на сервере (найден, восстановлен, исправлен)',
 };
 const AUDIT = {
-  login: 'вход', login_google: 'вход через Google', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
+  login: 'вход', login_google: 'вход через Google', login_2fa_failed: 'неверный код второго шага',
+  '2fa_on': 'включён двухфакторный вход', '2fa_off': 'отключён двухфакторный вход',
+  '2fa_reset': 'сброшен двухфакторный вход', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
   setup_failed: 'неверный токен настройки', user_add: 'добавлен пользователь', user_delete: 'удалён пользователь',
   user_password: 'смена пароля', user_role: 'смена роли', user_google: 'привязка Google', user_folders: 'доступ к папкам', user_wake: 'право включать ПК', group: 'фото сгруппированы', vthumbs: 'подсчёт эскизов видео', ungroup: 'группа разобрана', hide: 'фото скрыты', unhide: 'фото возвращены в галерею', delete_mark: 'помечены на удаление', delete_unmark: 'снята пометка на удаление', info_stop: 'остановлен сбор метаданных', session_revoke: 'сессия закрыта',
@@ -244,7 +246,15 @@ async function loadUsers() {
         c.checked ? 'Может включать ПК' : 'Не может включать ПК').then((x) => { if (!x) c.checked = !c.checked; show(); });
       show(); lab.append(c, txt); wk.append(lab);
     }
-    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, el('td', null, dt(u.created)), ops);
+    // двухфакторный вход включает сам пользователь (меню ⋯ в галерее); админ может только сбросить
+    const tf = el('td');
+    if (u.totp) tf.append(el('span', null, 'вкл'), ' ', btn('сбросить', async () => {
+      if (!confirm(`Отключить двухфакторный вход у ${u.user}? Дальше он войдёт только паролем или через Google.`)) return;
+      await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/2fa-reset`, {}), 'Двухфакторный вход отключён');
+      loadUsers();
+    }));
+    else tf.append(el('span', 'dim2', '—'));
+    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, tf, el('td', null, dt(u.created)), ops);
     return tr;
   }));
 }
@@ -263,7 +273,7 @@ function foldersText(u) {
 async function editFolders(u, tr) {
   if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
-  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 7; row.append(td);
+  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 8; row.append(td);
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
   allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');
@@ -503,8 +513,9 @@ async function loadSettings() {
   const s = r.settings;
   $('s-name').value = s.public_name;
   $('s-notify').value = s.ha_notify_service;
-  $('s-wake').value = s.ha_wake_service;
-  $('s-wakedata').value = Object.keys(s.ha_wake_data || {}).length ? JSON.stringify(s.ha_wake_data) : '';
+  const w = r.wake || {};
+  $('s-wake').value = w.ha_wake_service || '';
+  $('s-wakedata').value = Object.keys(w.ha_wake_data || {}).length ? JSON.stringify(w.ha_wake_data) : '';
   $('s-waket').value = s.wake_timeout; $('s-ttl').value = s.index_ttl; $('s-idle').value = s.session_idle_hours;
   $('s-bkstale').value = s.backup_stale_days;
   $('s-events').replaceChildren(...r.events.map((ev) => {
@@ -515,14 +526,10 @@ async function loadSettings() {
 
 $('settings').addEventListener('submit', async (e) => {
   e.preventDefault();
-  let wakeData = {};
-  if ($('s-wakedata').value.trim()) { try { wakeData = JSON.parse($('s-wakedata').value); } catch (_) { toast('Данные пробуждения: невалидный JSON', true); return; } }
   const body = {
     public_name: $('s-name').value.trim(),
     notify_events: [...$('s-events').querySelectorAll('input:checked')].map((c) => c.value),
     ha_notify_service: $('s-notify').value.trim(),
-    ha_wake_service: $('s-wake').value.trim(),
-    ha_wake_data: wakeData,
     wake_timeout: +$('s-waket').value, index_ttl: +$('s-ttl').value, session_idle_hours: +$('s-idle').value,
     backup_stale_days: +$('s-bkstale').value,
   };

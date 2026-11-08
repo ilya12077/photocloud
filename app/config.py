@@ -102,6 +102,9 @@ def _networks(name: str) -> list[ipaddress._BaseNetwork]:
 
 _SERVICE_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 # уведомления: либо сервис notify.*, либо сущность, в которой записано имя такого сервиса
+# Пробуждение ПК — только эти домены HA. Даже получив админку фотоархива, нельзя заставить его
+# вызвать в HA что-то другое (замок, shell_command, остановку дополнений).
+WAKE_DOMAINS = ("script", "button", "wake_on_lan")
 _NOTIFY_RE = re.compile(r"^(notify|input_text|input_select|sensor|text|select)\.[a-z0-9_]+$")
 
 ALL_NOTIFY_EVENTS = {"login", "login_new_ip", "login_failed", "lockout", "wake", "wake_timeout", "index_error",
@@ -230,16 +233,13 @@ def load() -> Settings:
             raise ConfigError(f"{n.upper()}: формат domain.service")
     if s.ha_notify_service and not _NOTIFY_RE.match(s.ha_notify_service):
         raise ConfigError("HA_NOTIFY_SERVICE: notify.… или сущность с его именем (input_text.…)")
+    s.ha_wake_service = wake_service(s.ha_wake_service, "HA_WAKE_SERVICE")
     raw = _get("HA_WAKE_DATA", "") or ""
     if raw:
         try:
-            s.ha_wake_data = json.loads(raw)
+            s.ha_wake_data = wake_data(json.loads(raw), "HA_WAKE_DATA")
         except json.JSONDecodeError:
             raise ConfigError("HA_WAKE_DATA: невалидный JSON") from None
-        if not isinstance(s.ha_wake_data, dict):
-            raise ConfigError("HA_WAKE_DATA: должен быть JSON-объект")
-    if s.storage == "smb" and not (s.ha_token and s.ha_wake_service):
-        raise ConfigError("нужны HA_TOKEN и HA_WAKE_SERVICE (пробуждение ПК идёт через Home Assistant)")
     ev = _get("NOTIFY_EVENTS", "login_new_ip,login_failed,lockout,wake_timeout,index_error,backup_stale,damaged") or ""
     s.notify_events = _notify_events(e.strip() for e in ev.split(",") if e.strip())
     bad = s.notify_events - ALL_NOTIFY_EVENTS
@@ -307,13 +307,32 @@ def load() -> Settings:
     s.index_ttl = _int("INDEX_TTL", 600, 30, 86400)
     s.backup_stale_days = _int("BACKUP_STALE_DAYS", 7, 0, 365)
     load_overrides(s)   # то, что поменяли в админке, важнее .env
+    if s.storage == "smb" and not (s.ha_token and s.ha_wake_service):
+        raise ConfigError("нужны HA_TOKEN и HA_WAKE_SERVICE (пробуждение ПК идёт через Home Assistant)")
     return s
 
 
+def wake_service(v, name: str) -> str:
+    if not v:
+        return ""
+    if not isinstance(v, str) or not _SERVICE_RE.match(v) or v.split(".", 1)[0] not in WAKE_DOMAINS:
+        raise ConfigError(f"{name}: только script.…, button.press или wake_on_lan.send_magic_packet")
+    return v
+
+
+def wake_data(v, name: str) -> dict:
+    if not isinstance(v, dict) or len(json.dumps(v)) > 2000:
+        raise ConfigError(f"{name}: JSON-объект")
+    return v
+
+
 # ---------------------------------------------------------------- настройки из админки
-# Только то, что безопасно менять на лету. Секреты и пути — в .env.
-EDITABLE = ("public_name", "notify_events", "ha_notify_service", "ha_wake_service", "ha_wake_data",
+# Только то, что безопасно менять на лету. Секреты, пути и сервис пробуждения — в .env.
+EDITABLE = ("public_name", "notify_events", "ha_notify_service",
             "wake_timeout", "index_ttl", "session_idle_hours", "backup_stale_days")
+# Раньше менялись в админке. Если в .env их нет, а в settings.json остались — берём оттуда
+# (с той же проверкой доменов), но поменять через админку больше нельзя.
+LEGACY = ("ha_wake_service", "ha_wake_data")
 
 
 def validate_override(s: Settings, key: str, val):
@@ -326,17 +345,9 @@ def validate_override(s: Settings, key: str, val):
                 or _notify_events(val) - ALL_NOTIFY_EVENTS:
             raise ConfigError("неизвестные события уведомлений")
         return _notify_events(val)
-    if key in ("ha_notify_service", "ha_wake_service"):
-        if not isinstance(val, str) or (val and not _SERVICE_RE.match(val)):
-            raise ConfigError("сервис HA: формат domain.service")
-        if key == "ha_notify_service" and val and not _NOTIFY_RE.match(val):
+    if key == "ha_notify_service":
+        if not isinstance(val, str) or (val and not (_SERVICE_RE.match(val) and _NOTIFY_RE.match(val))):
             raise ConfigError("уведомления: notify.… или сущность с его именем (input_text.…)")
-        if key == "ha_wake_service" and not val and s.storage == "smb":
-            raise ConfigError("сервис пробуждения обязателен")
-        return val
-    if key == "ha_wake_data":
-        if not isinstance(val, dict) or len(json.dumps(val)) > 2000:
-            raise ConfigError("данные пробуждения: JSON-объект")
         return val
     limits = {"wake_timeout": (10, 1800), "index_ttl": (30, 86400), "session_idle_hours": (1, 24 * 90),
               "backup_stale_days": (0, 365)}
@@ -367,11 +378,17 @@ def load_overrides(s: Settings) -> None:
     for k, v in (raw or {}).items():
         if k in EDITABLE:
             setattr(s, k, validate_override(s, k, v))
+    if not s.ha_wake_service and (raw or {}).get("ha_wake_service"):
+        s.ha_wake_service = wake_service(raw["ha_wake_service"], "ha_wake_service в settings.json")
+        if raw.get("ha_wake_data"):
+            s.ha_wake_data = wake_data(raw["ha_wake_data"], "ha_wake_data в settings.json")
 
 
 def save_overrides(s: Settings) -> None:
     path = s.data_dir / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(export_editable(s), ensure_ascii=False, indent=1), encoding="utf-8")
+    out = export_editable(s)
+    out.update({k: getattr(s, k) for k in LEGACY})   # чтобы старая настройка не потерялась
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, path)
