@@ -249,7 +249,7 @@ td .gmail { margin-right: 8px; }
 .nowrap { white-space: nowrap; }
 .dim2 { color: var(--dim); font-size: 13px; }
 .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.inline input, .inline select, .form input, .form textarea, table select {
+.inline input, .inline select, .form input, .form textarea, table select, .ucard select {
   padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); font-size: 14px; }
 .form { display: grid; gap: 14px; max-width: 640px; }
 .form label { display: grid; gap: 5px; font-size: 13px; color: var(--dim); }
@@ -298,6 +298,19 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 
 /* админка: доступ к папкам */
 .fold-edit td { background: var(--surface, #0001); }
+/* пользователи в админке — карточки */
+.ucards { display: grid; gap: 12px; }
+.ucard { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.uhead { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+.uname { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.uhead .ops { margin-left: auto; }
+.ugrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px 24px; }
+.ulab { color: var(--dim); font-size: 12px; margin-bottom: 5px; }
+.uval { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 14px; min-height: 30px; }
+.uval .gmail { overflow-wrap: anywhere; }
+.uval .on { font-weight: 600; }
+.ucard .btn, .ucard select { white-space: nowrap; }
+.ucard .fold-edit { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
 .fold-edit label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 .fold-edit .fold-all { font-weight: 600; margin: 6px 0; }
 .fold-list { columns: 240px; column-gap: 16px; margin: 4px 0 10px; }   /* сверху вниз: подпапки идут под своей папкой */
