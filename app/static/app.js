@@ -62,6 +62,7 @@ async function showLogin(msg) {
   $('login-form').hidden = false; $('tfa-form').hidden = true;
   $('lerr').textContent = msg || '';
   try { const r = await fetch('/api/auth/providers', { cache: 'no-store' }); const p = await r.json(); $('lgoogle').hidden = !p.google; $('lyandex').hidden = !p.yandex; googleHref(); } catch (_) {}
+  pkLoginPrep();
   setTimeout(() => $('lu').focus(), 0);
 }
 
@@ -78,21 +79,48 @@ function pkCred(c) {      // ответ устройства -> JSON для се
   return o;
 }
 $('lkey').hidden = !PK_OK;
-$('lkey').addEventListener('click', async () => {
-  const btn = $('lkey'); btn.disabled = true; $('lerr').textContent = '';
+// Safari (iPhone) разрешает ключ только сразу после нажатия: если перед вызовом ключа ждать ответа
+// сервера, он отказывает. Поэтому вызов от сервера (challenge) готовим заранее, пока открыт вход.
+const PK = { login: null, at: 0, reg: null };
+function pkPrepOpts(opt) {
+  opt.challenge = b64u.dec(opt.challenge);
+  if (opt.user) opt.user.id = b64u.dec(opt.user.id);
+  for (const k of ['allowCredentials', 'excludeCredentials']) if (opt[k]) opt[k] = opt[k].map((c) => ({ ...c, id: b64u.dec(c.id) }));
+  return opt;
+}
+async function pkLoginPrep() {
+  PK.login = null;
+  if (!PK_OK || $('login').hidden) return;
   try {
     const o = await api('/api/passkey/login/options', { method: 'POST', body: {}, allow401: true });
-    if (o.status === 429) { const j = await o.json().catch(() => ({})); $('lerr').textContent = `Слишком много попыток. Подожди ${Math.ceil((j.retry || 900) / 60)} мин.`; return; }
-    if (!o.ok) { $('lerr').textContent = 'Вход по ключу сейчас недоступен (' + o.status + ')'; return; }
-    const opt = await o.json();
-    opt.challenge = b64u.dec(opt.challenge);
-    if (opt.allowCredentials) opt.allowCredentials = opt.allowCredentials.map((c) => ({ ...c, id: b64u.dec(c.id) }));
-    let cred;
-    try { cred = await navigator.credentials.get({ publicKey: opt }); } catch (_) { $('lerr').textContent = 'Вход по ключу отменён'; return; }
+    if (o.ok) { PK.login = pkPrepOpts(await o.json()); PK.at = Date.now(); }
+  } catch (_) {}
+}
+const pkFresh = () => PK.login && Date.now() - PK.at < 4 * 60 * 1000;   // сервер помнит вызов 5 минут
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('login').hidden && !pkFresh()) pkLoginPrep(); });
+$('lkey').addEventListener('click', async () => {
+  const btn = $('lkey'); $('lerr').textContent = '';
+  if (!pkFresh()) {
+    // вызов не готов (сеть) — получить и попросить нажать ещё раз: так Safari не откажет
+    btn.disabled = true; await pkLoginPrep(); btn.disabled = false;
+    if (!PK.login) { $('lerr').textContent = 'Вход по ключу сейчас недоступен'; return; }
+    if (/iPhone|iPad|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document) { $('lerr').textContent = 'Нажми «Войти по ключу» ещё раз'; return; }
+  }
+  const opt = PK.login; PK.login = null;
+  let cred;
+  try { cred = await navigator.credentials.get({ publicKey: opt }); }        // первым делом — сразу после нажатия
+  catch (e) {
+    $('lerr').textContent = e && e.name === 'NotAllowedError' ? 'Вход по ключу отменён (или на этом устройстве нет ключа для сайта)'
+      : 'Вход по ключу не удался' + (e && e.name ? ` (${e.name})` : '');
+    pkLoginPrep(); return;
+  }
+  btn.disabled = true;
+  try {
     const r = await api('/api/passkey/login', { method: 'POST', body: { credential: pkCred(cred), r: $('lr').checked }, allow401: true });
     if (r.ok) { await enter(); return; }
     $('lerr').textContent = r.status === 429 ? 'Слишком много попыток, подожди 15 минут'
       : 'Этот ключ не подошёл (возможно, его удалил администратор)';
+    pkLoginPrep();
   } catch (_) { $('lerr').textContent = 'Сервер недоступен'; }
   finally { btn.disabled = false; }
 });
@@ -101,25 +129,40 @@ $('lkey').addEventListener('click', async () => {
 function pkOffer() {
   if (!PK_OK || !st.me || !st.me.passkey_offer || sessionStorageGet('pk-later')) return;
   $('pk-err').textContent = ''; $('pk-offer').hidden = false;
+  pkRegPrep();
+}
+async function pkRegPrep() {          // как и со входом: всё от сервера — заранее, до нажатия «Создать ключ»
+  PK.reg = null;
+  try {
+    const o = await api('/api/passkey/register/options', { method: 'POST', body: {} });
+    const j = await o.json();
+    if (o.ok) PK.reg = { opt: pkPrepOpts(j.options), ticket: j.ticket, at: Date.now() };
+    else $('pk-err').textContent = j.error || ('Ошибка ' + o.status);
+  } catch (_) { $('pk-err').textContent = 'Сервер недоступен'; }
 }
 function sessionStorageGet(k) { try { return sessionStorage.getItem(k); } catch (_) { return null; } }
 $('pk-later').addEventListener('click', () => { try { sessionStorage.setItem('pk-later', '1'); } catch (_) {} $('pk-offer').hidden = true; });
 $('pk-create').addEventListener('click', async () => {
-  const btn = $('pk-create'); btn.disabled = true; $('pk-err').textContent = '';
+  const btn = $('pk-create'); $('pk-err').textContent = '';
+  if (!PK.reg || Date.now() - PK.reg.at > 4 * 60 * 1000) {
+    btn.disabled = true; await pkRegPrep(); btn.disabled = false;
+    if (PK.reg) $('pk-err').textContent = 'Готово — нажми «Создать ключ» ещё раз';
+    return;
+  }
+  const { opt, ticket } = PK.reg; PK.reg = null;
+  let cred;
+  try { cred = await navigator.credentials.create({ publicKey: opt }); }      // сразу после нажатия
+  catch (e) {
+    $('pk-err').textContent = e && e.name === 'InvalidStateError' ? 'На этом устройстве ключ уже есть'
+      : e && e.name === 'NotAllowedError' ? 'Создание ключа отменено' : 'Не удалось создать ключ' + (e && e.name ? ` (${e.name})` : '');
+    pkRegPrep(); return;
+  }
+  btn.disabled = true;
   try {
-    const o = await api('/api/passkey/register/options', { method: 'POST', body: {} });
-    const j = await o.json();
-    if (!o.ok) { $('pk-err').textContent = j.error || ('Ошибка ' + o.status); return; }
-    const opt = j.options;
-    opt.challenge = b64u.dec(opt.challenge); opt.user.id = b64u.dec(opt.user.id);
-    opt.excludeCredentials = (opt.excludeCredentials || []).map((c) => ({ ...c, id: b64u.dec(c.id) }));
-    let cred;
-    try { cred = await navigator.credentials.create({ publicKey: opt }); }
-    catch (e) { $('pk-err').textContent = e && e.name === 'InvalidStateError' ? 'На этом устройстве ключ уже есть' : 'Создание ключа отменено'; return; }
     const name = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
-    const r = await api('/api/passkey/register', { method: 'POST', body: { ticket: j.ticket, credential: pkCred(cred), name } });
+    const r = await api('/api/passkey/register', { method: 'POST', body: { ticket, credential: pkCred(cred), name } });
     const k = await r.json().catch(() => ({}));
-    if (!r.ok) { $('pk-err').textContent = k.error || ('Ошибка ' + r.status); return; }
+    if (!r.ok) { $('pk-err').textContent = k.error || ('Ошибка ' + r.status); pkRegPrep(); return; }
     st.me.passkey_offer = false; $('pk-offer').hidden = true;
     banner('Ключ входа создан — в следующий раз нажми «Войти по ключу»');
     setTimeout(() => { if (/^Ключ входа создан/.test($('banner-text').textContent)) banner(null); }, 5000);
@@ -612,6 +655,32 @@ function scrollToIndex(i, offset = 0) {
   window.scrollTo(0, gridTop() + r.top - offset - $('banner').offsetHeight - 60);
 }
 
+// Скрыли, сгруппировали, пометили — лента пересобирается, но экран остаётся на месте:
+// запоминаем первое фото у верха экрана, которое никуда не денется (skip — уходящие),
+// и после пересборки ставим его строку на ту же высоту.
+function keepPlace(skip) {
+  if (window.scrollY < 10) return null;                   // в самом верху — и так на месте
+  const vis = topVisibleIndex(); if (!vis) return null;
+  for (let i = Math.max(0, vis.i - Z.cols); i < st.list.length; i++) {
+    const ph = st.list[i];
+    if (skip && skip.has(ph[0])) continue;
+    const r = L.rows[rowOfIndex(i)]; if (!r) return null;
+    const top = gridTop() + r.top - window.scrollY;
+    if (top + r.height < $('banner').offsetHeight + 60) continue;   // строка уже ушла под шапку
+    return { id: ph[0], top };
+  }
+  return null;
+}
+function restorePlace(a) {
+  if (!a || !st.list) return;
+  let i = st.list.findIndex((p) => p[0] === a.id);
+  if (i < 0) { const g = GX.byId.get(a.id); if (g) i = st.list.indexOf(GX.cover.get(g)); }   // ушло в свёрнутую группу
+  if (i < 0) return;
+  const r = L.rows[rowOfIndex(i)]; if (!r) return;
+  window.scrollTo(0, gridTop() + r.top - a.top);
+  draw(true); updateScrub();
+}
+
 function draw(force) {
   if ($('main').hidden || !st.lib) return;
   if (force) gridPrefetchSoon();
@@ -903,10 +972,12 @@ async function selApply(hide) {
   try {
     const r = await api(hide ? '/api/hide' : '/api/unhide', { method: 'POST', body: { ids } });
     if (!r.ok) { banner(`Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
+    const place = keepPlace(new Set(ids));
     selEnd();
     await loadLibrary();
     if (HID) await loadMarks();                               // вернули в галерею — пометка снята
     banner(hide ? `Скрыто: ${n}` : `Возвращено в галерею: ${n}`);
+    restorePlace(place);
     setTimeout(() => { if (/^(Скрыто|Возвращено)/.test($('banner-text').textContent)) banner(null); }, 3000);
   } catch (_) { btn.disabled = false; }
 }
@@ -924,8 +995,10 @@ async function selGroup(make) {
   try {
     const r = await api(make ? '/api/group' : '/api/ungroup', { method: 'POST', body: { ids } });
     if (!r.ok) { const j = await r.json().catch(() => ({})); banner(j.error || `Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
+    const place = keepPlace(make ? new Set(ids.slice(1)) : null);   // обложка (первое) остаётся
     selEnd(); await loadLibrary();
     banner(make ? `Сгруппировано: ${ids.length}` : 'Группа разобрана');
+    restorePlace(place);
     setTimeout(() => { if (/^(Сгруппировано|Группа разобрана)/.test($('banner-text').textContent)) banner(null); }, 3000);
   } catch (_) { btn.disabled = false; }
 }
@@ -956,8 +1029,10 @@ async function selMarkDelete(on) {
   try {
     const r = await api('/api/marks', { method: 'POST', body: { ids, on } });
     if (!r.ok) { const j = await r.json().catch(() => ({})); banner(j.error || `Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
+    const place = keepPlace(on ? new Set(ids) : null);
     selEnd(); await loadMarks(); await loadLibrary();       // помеченные из скрытых пропадают
     banner(on ? `Помечено на удаление: ${n}` : `Пометка снята: ${n}`);
+    restorePlace(place);
     setTimeout(() => { if (/^(Помечено|Пометка)/.test($('banner-text').textContent)) banner(null); }, 3000);
   } catch (_) { btn.disabled = false; }
 }
@@ -996,9 +1071,11 @@ async function selStar(on) {
   try {
     if (!(await setStar(ids, on))) { btn.disabled = false; return; }
     const n = ids.length.toLocaleString('ru');
+    const place = STARRED && !on ? keepPlace(new Set(ids)) : null;
     selEnd();
     if (STARRED) await loadLibrary();                       // убранные из избранного уходят со страницы
     banner(on ? `В избранном: +${n}` : `Убрано из избранного: ${n}`);
+    restorePlace(place);
     setTimeout(() => { if (/избранн/.test($('banner-text').textContent)) banner(null); }, 3000);
   } catch (_) { btn.disabled = false; }
 }
@@ -1276,6 +1353,7 @@ function stopVideo() {
   if (V.hls) { V.hls.destroy(); V.hls = null; }
   if (V.vidPid) { stopServer(V.vidPid); V.vidPid = null; }
   const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true;
+  vzReset();
 }
 
 // HLS: Safari/iOS играют сами, остальным помогает hls.js (грузится только при первом видео)
@@ -1777,7 +1855,9 @@ async function fillInfo() {
   extra.replaceChildren();
   const mp = info.width && info.height ? `${info.width} × ${info.height} (${(info.width * info.height / 1e6).toFixed(1)} Мп)` : '';
   if (mp || info.camera) extra.append(infoRows([['Разрешение', mp], ['Камера', info.camera]]));
-  if (info.hidden_at) extra.append(infoRows([['Скрыто', fmt.format(new Date(info.hidden_at * 1000))]]));
+  // админу — кто и когда скрыл (видит скрытые всех); остальным — когда скрыли сами
+  if (info.hidden_by) extra.append(infoRows([['Скрыто', info.hidden_by.map((h) => `${h.user}, ${fmt.format(new Date(h.at * 1000))}`).join('; ')]]));
+  else if (info.hidden_at) extra.append(infoRows([['Скрыто', fmt.format(new Date(info.hidden_at * 1000))]]));
   if (info.delete_by) extra.append(infoRows([['На удаление', `${info.delete_by}, ${fmt.format(new Date(info.delete_at * 1000))}`]]));
   if (info.lat == null) {
     extra.append(el('h3', null, 'Местоположение'), el('div', 'dim', 'В файле нет координат.'));
@@ -1992,6 +2072,59 @@ stage.addEventListener('touchend', (e) => {
   if (VZ.s > 1 || !DR.axis) { DR.axis = null; return; }   // при увеличении свайпы не листают
   dragEnd(dx, dy, Date.now() - t0);
 }, { passive: true });
+
+// ---- видео: щипок увеличивает, двумя пальцами — двигать; увеличенное — одним пальцем двигать,
+// касание — пауза/воспроизведение. Пока увеличено, системные кнопки плеера спрятаны (иначе
+// они увеличились бы вместе с кадром); вернул масштаб — кнопки на месте.
+const VV = { s: 1, tx: 0, ty: 0, pinch: null, pan: null };
+const vEl = $('v-video');
+function vzApply() {
+  const z = VV.s > 1.01;
+  vEl.style.transformOrigin = '0 0';
+  vEl.style.transform = z ? `translate(${VV.tx}px, ${VV.ty}px) scale(${VV.s})` : '';
+  if (vEl.controls === z) vEl.controls = !z;
+}
+function vzReset() { VV.s = 1; VV.tx = 0; VV.ty = 0; VV.pinch = VV.pan = null; vzApply(); }
+function vzClamp() {
+  const W = vEl.clientWidth, H = vEl.clientHeight;
+  VV.tx = clamp(VV.tx, W * (1 - VV.s), 0); VV.ty = clamp(VV.ty, H * (1 - VV.s), 0);
+}
+vEl.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    e.preventDefault();
+    const [mx, my] = tmid(e.touches);
+    VV.pinch = { d0: tdist(e.touches) || 1, s0: VV.s, mx, my, tx0: VV.tx, ty0: VV.ty }; VV.pan = null;
+  } else if (e.touches.length === 1 && VV.s > 1.01) {
+    const t = e.touches[0]; VV.pan = { x: t.clientX, y: t.clientY, tx0: VV.tx, ty0: VV.ty, moved: false };
+  }
+}, { passive: false });
+vEl.addEventListener('touchmove', (e) => {
+  if (VV.pinch && e.touches.length === 2) {
+    e.preventDefault();
+    const p = VV.pinch, s = clamp(p.s0 * tdist(e.touches) / p.d0, 1, MAX_ZOOM);
+    const [mx, my] = tmid(e.touches);
+    VV.tx = mx - (p.mx - p.tx0) * (s / p.s0); VV.ty = my - (p.my - p.ty0) * (s / p.s0); VV.s = s;
+    vzClamp(); vzApply();
+  } else if (VV.pan && e.touches.length === 1) {
+    e.preventDefault();
+    const t = e.touches[0], dx = t.clientX - VV.pan.x, dy = t.clientY - VV.pan.y;
+    if (Math.abs(dx) + Math.abs(dy) > 8) VV.pan.moved = true;
+    VV.tx = VV.pan.tx0 + dx; VV.ty = VV.pan.ty0 + dy; vzClamp(); vzApply();
+  }
+}, { passive: false });
+vEl.addEventListener('touchend', (e) => {
+  if (VV.pinch && e.touches.length < 2) {
+    VV.pinch = null;
+    if (VV.s < 1.05) vzReset();
+    if (e.touches.length === 1 && VV.s > 1.01) { const t = e.touches[0]; VV.pan = { x: t.clientX, y: t.clientY, tx0: VV.tx, ty0: VV.ty, moved: true }; }
+    return;
+  }
+  if (VV.pan && !e.touches.length) {
+    if (!VV.pan.moved) { if (vEl.paused) vEl.play().catch(() => {}); else vEl.pause(); }   // касание — пауза/пуск
+    VV.pan = null;
+  }
+}, { passive: true });
+vEl.addEventListener('dblclick', (e) => { if (VV.s > 1.01) { e.preventDefault(); vzReset(); } });
 
 // мышь / трекпад
 stage.addEventListener('wheel', (e) => {

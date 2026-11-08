@@ -974,18 +974,29 @@ mine = _Mine()
 _marks: dict[str, tuple[str, float]] = db.marks_load()      # на удаление (админ): путь -> (кто, когда)
 
 
+def _hidden_all() -> dict[str, list[tuple[str, float]]]:
+    """Скрытые у всех пользователей: путь -> [(кто, когда)] (для админа)."""
+    out: dict[str, list[tuple[str, float]]] = {}
+    for user, d in list(mine.hidden.items()):
+        for path, at in list(d.items()):
+            out.setdefault(path, []).append((user, at))
+    return out
+
+
 def _view_for(s: Session, hidden: int, starred: int):
-    """Список пользователя: свои папки без его скрытых; hidden=1 — только его скрытые;
-    starred=1 — только его избранное. Его группы — в списке."""
+    """Список пользователя: свои папки без его скрытых; hidden=1 — только его скрытые
+    (админу — скрытые всех пользователей); starred=1 — только его избранное. Его группы — в списке."""
     u = s.user
     hid = frozenset(mine.hidden.get(u, ()))
     grp = mine.groups.get(u) or None
     key = (u, mine.gen.get(u, 0), "h" if hidden else "s" if starred else "m")
     if hidden:
-        if s.role == "admin" and _marks:  # type: ignore[attr-defined]
-            # помеченные на удаление в скрытых уже не показываем
+        if s.role == "admin":  # type: ignore[attr-defined]
+            # админ видит скрытое всеми; помеченное на удаление уже не показываем
             marks = frozenset(_marks)
-            return library.view(user_folders(s), only=hid - marks, groups=grp, key=key + (marks,))
+            allh = frozenset(_hidden_all())
+            key = (u, tuple(sorted(mine.gen.items())), "H", marks)
+            return library.view(user_folders(s), only=allh - marks, groups=grp, key=key)
         return library.view(user_folders(s), only=hid, groups=grp, key=key)
     if starred:
         return library.view(user_folders(s), hide=hid, only=frozenset(mine.starred.get(u, ())), groups=grp, key=key)
@@ -1061,11 +1072,14 @@ async def unhide_photos(request: Request, s: Session = Depends(require_user)):
     def go() -> None:
         global _marks
         paths = [p.rel for p in ps]
+        drop = set(paths)
+        # админ возвращает в галерею у всех, кто это скрыл; пользователь — только у себя
+        who = [w for w, d in list(mine.hidden.items()) if drop & d.keys()] if admin else [s.user]
         with mine.mu:
-            db.hidden_delete(s.user, paths)
-            cur = {k: v for k, v in mine.hidden.get(s.user, {}).items() if k not in set(paths)}
-            mine.hidden[s.user] = cur
-            mine.changed(s.user)
+            for w in who:
+                db.hidden_delete(w, paths)
+                mine.hidden[w] = {k: v for k, v in mine.hidden.get(w, {}).items() if k not in drop}
+                mine.changed(w)
         if admin:
             db.marks_delete(paths)                    # админ вернул в галерею — удалять уже не нужно
             _marks = db.marks_load()
@@ -1076,7 +1090,7 @@ async def unhide_photos(request: Request, s: Session = Depends(require_user)):
 
 
 # ---------------------------------------------------------------- пометка «удалить окончательно»
-# Только админ и только то, что он сам скрыл. С ПК пока ничего не удаляется: будущий клиент
+# Только админ и только то, что скрыто (у кого угодно — админ видит скрытые всех). С ПК пока ничего не удаляется: будущий клиент
 # на ПК заберёт список, сам проверит (путь, размер, дата, хеш) и удалит. Вернуть фото
 # в галерею или «Не удалять» — снять пометку.
 
@@ -1102,7 +1116,7 @@ async def marks_set(request: Request, s: Session = Depends(require_admin)):
     on = d.get("on")
     if not isinstance(on, bool):
         return _bad("on: true/false")
-    hid = mine.hidden.get(s.user, {})
+    hid = _hidden_all()
     ps = [p for p in ps if p.rel in hid or (p.live and (q := library.get(p.live)) is not None and q.rel in hid)]
     if not ps:
         return _bad("пометить можно только скрытые фото")
@@ -1682,6 +1696,10 @@ async def photo_info(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(r
     hid = mine.hidden.get(s.user, {}).get(p.rel) if p is not None else None
     if hid:                                           # на странице скрытых: когда скрыл
         out["hidden_at"] = int(hid)
+    if p is not None and s.role == "admin":  # type: ignore[attr-defined]
+        by = sorted(((w, at) for w, d in list(mine.hidden.items()) if (at := d.get(p.rel))), key=lambda x: x[1])
+        if by:                                        # админу — кто и когда скрыл
+            out["hidden_by"] = [{"user": w, "at": int(at)} for w, at in by]
     mk = _marks.get(p.rel) if p is not None and s.role == "admin" else None  # type: ignore[attr-defined]
     if mk:
         out["delete_by"], out["delete_at"] = mk[0], int(mk[1])
