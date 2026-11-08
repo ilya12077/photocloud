@@ -3,6 +3,20 @@
 // никакого innerHTML с данными.
 
 const $ = (id) => document.getElementById(id);
+
+// Цвет строки браузера = цвет шапки. Встроенные браузеры (Telegram и т. п.) не понимают theme-color
+// с media="(prefers-color-scheme…)" и оставляют строку прозрачной — ставим один тег без media
+// с текущим цветом темы и меняем его, если тема переключилась.
+(function themeColor() {
+  const dark = window.matchMedia && matchMedia('(prefers-color-scheme: dark)');
+  const set = () => {
+    const c = dark && dark.matches ? '#111214' : '#f6f5f2';
+    document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.remove());
+    const m = document.createElement('meta'); m.name = 'theme-color'; m.content = c; document.head.append(m);
+  };
+  set();
+  if (dark && dark.addEventListener) dark.addEventListener('change', set);
+})();
 const MONTHS = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
 const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 const HEAD_H = 46;          // высота заголовка месяца, px
