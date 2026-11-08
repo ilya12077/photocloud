@@ -41,6 +41,7 @@ from . import transcode, video
 from .google_auth import GoogleAuth, GoogleError
 from .yandex_auth import YandexAuth, YandexError
 from .passkeys import Passkeys, PasskeyError, rp_for
+from .pc import PcAuth, PcError, delete_message
 from .library import Library, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
 from .storage import RESTORED, RestoreWriter, is_missing, is_read_error, make_storage
@@ -1132,6 +1133,201 @@ async def marks_set(request: Request, s: Session = Depends(require_admin)):
     await run_in_threadpool(go)
     audit("delete_mark" if on else "delete_unmark", s.user, ip_of(request), f"{_n(ps)}: {_sample(ps)}")
     return no_store(JSONResponse({"ok": True, "count": _n(ps)}))
+
+
+# ---------------------------------------------------------------- клиент на ПК (удаление в корзину)
+# Подробно о доверии — в pc.py: ключ в TPM, привязка через шару, сессии с HMAC, опасное — с подписью TPM.
+pcauth = PcAuth(db)
+
+
+class _PcViewer:
+    """Для превью: клиент ПК видит помеченные файлы, как админ."""
+    user, role, ip, created, last_seen = "клиент ПК", "admin", "", 0.0, 0.0
+
+
+def _pc_fail(request: Request, what: str, e: Exception, code: int = 401) -> JSONResponse:
+    ip = ip_of(request)
+    if limiter.fail(ip):
+        audit("lockout", "", ip, "клиент ПК: неверные подписи, блок 15 мин")
+    audit("pc_denied", "", ip, f"{what}: {e}")
+    return no_store(JSONResponse({"error": str(e)}, code))
+
+
+async def require_pc(request: Request) -> dict:
+    ip = ip_of(request)
+    if wait := limiter.blocked(ip, global_cap=False):
+        raise HTTPException(429, "locked", headers={"retry-after": str(wait)})
+    cl = request.headers.get("content-length")
+    if cl and (not cl.isdigit() or int(cl) > 512 * 1024):
+        raise HTTPException(413)
+    body = await request.body()
+    q = request.scope.get("query_string", b"").decode("latin-1")
+    h = request.headers
+    try:
+        sess = pcauth.check(h.get("x-pc-sid", ""), h.get("x-pc-ts", ""), h.get("x-pc-ctr", ""), h.get("x-pc-mac", ""),
+                            request.method, request.url.path + ("?" + q if q else ""), body)
+    except PcError as e:
+        if str(e) != "session":                   # истёкшая сессия — обычное дело, не попытка подбора
+            if limiter.fail(ip):
+                audit("lockout", "", ip, "клиент ПК: неверные подписи, блок 15 мин")
+            audit("pc_denied", "", ip, str(e))
+        raise HTTPException(401, "pc " + str(e)) from None
+    request.state.body = body
+    return sess
+
+
+def _pc_json(request: Request) -> dict:
+    try:
+        d = json.loads(request.state.body or b"{}")
+    except ValueError:
+        raise HTTPException(400) from None
+    if not isinstance(d, dict):
+        raise HTTPException(400)
+    return d
+
+
+@app.post("/api/pc/pair/start")
+async def pc_pair_start(request: Request):
+    ip = ip_of(request)
+    if wait := limiter.blocked(ip, global_cap=False):
+        return no_store(JSONResponse({"error": "locked", "retry": wait}, 429))
+    d = await read_json(request)
+    try:
+        nonce = pcauth.pair_start(d.get("pub", ""), d.get("name", ""), d.get("key_type", ""))
+    except PcError as e:
+        return _pc_fail(request, "привязка", e, 403)
+    return no_store(JSONResponse({"nonce": nonce, "file": pcauth.pair_file(nonce), "share": S.smb_share,
+                                  "subdir": S.smb_subdir}))
+
+
+@app.post("/api/pc/pair/finish")
+async def pc_pair_finish(request: Request):
+    ip = ip_of(request)
+    if wait := limiter.blocked(ip, global_cap=False):
+        return no_store(JSONResponse({"error": "locked", "retry": wait}, 429))
+    d = await read_json(request)
+    nonce = d.get("nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise HTTPException(400)
+
+    def read() -> bytes:
+        with storage.open(pcauth.pair_file(nonce)) as f:
+            return f.read(16384)
+    try:
+        content = await run_in_threadpool(read)
+    except (OSError, ValueError) as e:
+        log.info("файл привязки не прочитан: %s", e)
+        return no_store(JSONResponse({"error": "сервер не нашёл файл привязки в шаре — проверь папку архива"}, 409))
+    try:
+        r = await run_in_threadpool(pcauth.pair_finish, nonce, content, ip)
+    except PcError as e:
+        return _pc_fail(request, "привязка", e, 403)
+    audit("pc_pair", "", ip, f"ключ {r['fp']}")
+    bg(ha.notify("lockout", f"Привязан клиент на ПК (ключ {r['fp']}) с {clean(ip)}", dedupe_s=0))
+    return no_store(JSONResponse(r))
+
+
+@app.post("/api/pc/session")
+async def pc_session(request: Request):
+    ip = ip_of(request)
+    if wait := limiter.blocked(ip, global_cap=False):
+        return no_store(JSONResponse({"error": "locked", "retry": wait}, 429))
+    d = await read_json(request)
+    try:
+        r, alarms = await run_in_threadpool(pcauth.session, d.get("id", ""), d.get("eph", ""), d.get("ts"),
+                                            d.get("guid", ""), d.get("sig", ""), ip)
+    except PcError as e:
+        return _pc_fail(request, "сессия", e)
+    limiter.success(ip)
+    if alarms["guid_changed"]:
+        audit("pc_guid_changed", "", ip, "клиент ПК: другой MachineGuid — переустановка Windows или другой ПК?")
+        bg(ha.notify("lockout", f"Клиент на ПК: изменился MachineGuid (с {clean(ip)})", dedupe_s=0))
+    if alarms["ip_changed"]:
+        audit("pc_ip_changed", "", ip, "клиент ПК вышел на связь с нового адреса")
+    return no_store(JSONResponse(r))
+
+
+def _pc_marks() -> list[dict]:
+    out = []
+    for path, key, sha, by, at in db.marks_rows():
+        parts = key.split("\0")
+        try:
+            size, mtime = int(parts[1]), int(parts[2])
+        except (IndexError, ValueError):
+            size, mtime = -1, -1
+        p = _by_rel(path)
+        out.append({"path": path, "size": size, "mtime": mtime, "sha": sha, "by": by, "at": int(at),
+                    "id": p.id if p is not None else None, "video": bool(p and p.video),
+                    "live": bool(p and p.video and p.live)})
+    return out
+
+
+@app.get("/api/pc/marks")
+async def pc_marks(_: dict = Depends(require_pc)):
+    return no_store(JSONResponse({"items": await run_in_threadpool(_pc_marks), "share": S.smb_share,
+                                  "subdir": S.smb_subdir}))
+
+
+@app.get("/api/pc/preview/{pid}")
+async def pc_preview(request: Request, pid: str = PathParam(pattern=ID_RE), _: dict = Depends(require_pc)):
+    p = library.get(pid)
+    if p is None or p.rel not in _marks:        # только помеченные — больше клиенту ничего не нужно
+        raise HTTPException(404)
+    kind = request.query_params.get("k", "m")
+    if kind not in ("s", "m", "p"):
+        raise HTTPException(400)
+    return await rendered(request, kind, pid, _PcViewer())  # type: ignore[arg-type]
+
+
+@app.post("/api/pc/unmark")
+async def pc_unmark(request: Request, _: dict = Depends(require_pc)):
+    paths = _pc_json(request).get("paths")
+    if not isinstance(paths, list) or not all(isinstance(x, str) for x in paths) or len(paths) > 10000:
+        raise HTTPException(400)
+    paths = [x for x in paths if x in _marks]
+
+    def go() -> None:
+        global _marks
+        db.marks_delete(paths)
+        _marks = db.marks_load()
+    await run_in_threadpool(go)
+    audit("delete_unmark", "клиент ПК", ip_of(request), f"{len(paths)}: {', '.join(paths[:3])}")
+    return no_store(JSONResponse({"ok": True, "count": len(paths)}))
+
+
+@app.post("/api/pc/deleted")
+async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
+    """Отчёт клиента: эти файлы ушли в корзину на ПК. Снимает пометки и «скрыто» —
+    только с подписью ключом TPM над точным списком."""
+    d = _pc_json(request)
+    items, ts, sig = d.get("items"), d.get("ts"), d.get("sig", "")
+    if not isinstance(items, list) or not items or len(items) > 10000 or not isinstance(ts, int) \
+            or not all(isinstance(i, dict) and isinstance(i.get("path"), str) for i in items):
+        raise HTTPException(400)
+    if abs(time.time() - ts) > 300:
+        return no_store(JSONResponse({"error": "устаревшая подпись"}, 400))
+    try:
+        pcauth.verify_op(delete_message(sess["sid"], ts, items), sig)
+    except PcError as e:
+        return _pc_fail(request, "удаление", e, 403)
+    paths = [i["path"] for i in items if i["path"] in _marks]
+
+    def go() -> None:
+        global _marks
+        drop = set(paths)
+        db.marks_delete(paths)
+        _marks = db.marks_load()
+        with mine.mu:
+            for w, hd in list(mine.hidden.items()):
+                if drop & hd.keys():
+                    db.hidden_delete(w, paths)
+                    mine.hidden[w] = {k: v for k, v in hd.items() if k not in drop}
+                    mine.changed(w)
+    await run_in_threadpool(go)
+    audit("pc_deleted", "клиент ПК", ip_of(request), f"в корзину на ПК: {len(paths)}: {', '.join(paths[:3])}")
+    if paths:
+        library.start_build(storage, _index_error)   # файлов больше нет — пересобрать список
+    return no_store(JSONResponse({"ok": True, "count": len(paths)}))
 
 
 # ---------------------------------------------------------------- группы (стопки)
@@ -2837,6 +3033,33 @@ async def admin_user_wake(request: Request, name: str, s: Session = Depends(requ
     except UserError as e:
         return _bad(str(e))
     audit("user_wake", s.user, ip_of(request), f"{name} -> {'может' if allow else 'не может'} включать ПК")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.get("/api/admin/pc")
+async def admin_pc(_: Session = Depends(require_admin)):
+    from .pc import b64d, fingerprint
+    c = await run_in_threadpool(db.pc_get)
+    client = None
+    if c:
+        client = {"name": c["name"], "key_type": c["key_type"], "fp": fingerprint(b64d(c["pub"])),
+                  "created": int(c["created"]), "last_seen": int(c["last_seen"]), "last_ip": c["last_ip"]}
+    return no_store(JSONResponse({"client": client, "pair_until": int(pcauth.pair_until), "now": int(time.time()),
+                                  "marks": len(_marks)}))
+
+
+@app.post("/api/admin/pc/pair", dependencies=[Depends(require_csrf)])
+async def admin_pc_pair(request: Request, s: Session = Depends(require_admin)):
+    pcauth.open_window()
+    audit("pc_pair_window", s.user, ip_of(request), "10 минут")
+    return no_store(JSONResponse({"ok": True}))
+
+
+@app.post("/api/admin/pc/unpair", dependencies=[Depends(require_csrf)])
+async def admin_pc_unpair(request: Request, s: Session = Depends(require_admin)):
+    had = await run_in_threadpool(pcauth.unpair)
+    if had:
+        audit("pc_unpair", s.user, ip_of(request))
     return no_store(JSONResponse({"ok": True}))
 
 
