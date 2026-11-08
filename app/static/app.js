@@ -645,6 +645,13 @@ function buildRow(r) {
   if (r.h) {
     const h = el('div', 'mhead', monthName(r.month));
     h.append(el('span', null, r.n.toLocaleString('ru')));
+    // в режиме выбора — кружок: выбрать (или снять) весь месяц сразу
+    h.dataset.start = r.start; h.dataset.n = r.n;
+    const c = el('button', 'mcheck'); c.type = 'button';
+    c.setAttribute('aria-label', 'Выбрать весь месяц'); c.title = 'Выбрать весь месяц';
+    c.addEventListener('click', (e) => { e.stopPropagation(); selMonth(r.start, r.n); });
+    h.prepend(c);
+    if (SEL.on && monthAllSel(r.start, r.n)) h.classList.add('sel');
     h.style.transform = `translateY(${r.top}px)`;
     return h;
   }
@@ -844,6 +851,7 @@ function selUpdate() {
   $('sel-ungroup').hidden = ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
+  for (const h of $('grid').querySelectorAll('.mhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {
@@ -866,6 +874,16 @@ function selClick(i, shift) {
     for (let k = a; k <= b; k++) selMark(k, SEL.anchorOn);
   } else { SEL.anchorOn = !SEL.set.has(ph[0]); selMark(i, SEL.anchorOn); }
   SEL.anchor = i;
+  selUpdate();
+}
+function monthAllSel(start, n) {
+  for (let k = start; k < start + n; k++) if (!st.list[k] || !SEL.set.has(st.list[k][0])) return false;
+  return n > 0;
+}
+function selMonth(start, n) {
+  const on = !monthAllSel(start, n);                        // всё уже выбрано — снять, иначе — выбрать всё
+  for (let k = start; k < start + n; k++) selMark(k, on);
+  SEL.anchor = start + n - 1; SEL.anchorOn = on;
   selUpdate();
 }
 $('menu-select').addEventListener('click', () => selStart());
