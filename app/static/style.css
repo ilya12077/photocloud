@@ -124,7 +124,7 @@ a { color: inherit; text-decoration: none; }
 .tile.marked img { opacity: .45; }
 /* группы: значок «два квадратика» справа снизу; у свёрнутой — с числом фото */
 .gbadge { position: absolute; right: calc(4px * var(--bs, 1)); bottom: calc(4px * var(--bs, 1)); display: flex; align-items: center; gap: calc(2px * var(--bs, 1)); padding: calc(2px * var(--bs, 1)) calc(4px * var(--bs, 1));
-  border-radius: calc(6px * var(--bs, 1)); background: #0008; color: #fff; font-size: calc(11px * var(--bs, 1)); font-weight: 650; line-height: 1; pointer-events: none; opacity: .7; }
+  border-radius: calc(6px * var(--bs, 1)); background: #0008; color: #fff; font-size: calc(11px * var(--bs, 1)); font-weight: 650; line-height: 1; pointer-events: none; }
 .gbadge svg { width: calc(14px * var(--bs, 1)); height: calc(14px * var(--bs, 1)); }
 .tile.grouped .sbadge { right: auto; left: calc(6px * var(--bs, 1)); bottom: calc(3px * var(--bs, 1)); }
 .tile.grouped .vbadge + .sbadge, .tile.grouped:has(.vbadge) .sbadge { left: calc(24px * var(--bs, 1)); }
