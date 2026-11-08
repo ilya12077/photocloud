@@ -20,7 +20,9 @@ except Exception:  # noqa: BLE001
 # поэтому ему можно больше (телефоны снимают по 200 Мп = 16384×12288), остальным — 200 Мп.
 Image.MAX_IMAGE_PIXELS = 1_000_000_000
 MAX_FULL_PIXELS = 200_000_000
-ImageFile.LOAD_TRUNCATED_IMAGES = False
+# Недописанные файлы (оборвалось копирование, часть Google Takeout): показываем то, что есть, —
+# верх кадра, дальше серое. Так же их показывает браузер, если открыть оригинал.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 warnings.simplefilter("error", Image.DecompressionBombWarning)
 
 
