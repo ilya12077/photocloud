@@ -12,7 +12,9 @@ const EVENTS = {
   damaged: 'повреждённые файлы на сервере (найден, восстановлен, исправлен)',
 };
 const AUDIT = {
-  login: 'вход', login_google: 'вход через Google', login_2fa_failed: 'неверный код второго шага',
+  login: 'вход', login_google: 'вход через Google', login_passkey: 'вход по ключу', login_passkey_failed: 'ключ не подошёл',
+  passkey_add: 'создан ключ входа', passkey_offer: 'предложено создать ключ', passkey_cancel: 'ключ больше не предлагается',
+  passkey_delete: 'удалены ключи входа', login_2fa_failed: 'неверный код второго шага',
   '2fa_on': 'включён двухфакторный вход', '2fa_off': 'отключён двухфакторный вход',
   '2fa_reset': 'сброшено приложение 2FA (настройка заново)', login_failed: 'неудачный вход', login_google_denied: 'Google: аккаунт не привязан',
   login_google_failed: 'Google: ошибка', lockout: 'блокировка IP', logout: 'выход', setup: 'первичная настройка',
@@ -261,7 +263,18 @@ async function loadUsers(force) {
     else if (u.totp === 'pending') tf.append(el('span', 'dim2', 'настроит при входе'), ' ',
       tfa('off', 'Двухфакторный вход выключен'));
     else tf.append(tfa('on', 'Включено: при следующем входе появится настройка'));
-    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, tf, el('td', null, dt(u.created)), ops);
+    // ключи входа (passkey): создаёт сам пользователь на своём устройстве, когда админ предложил
+    const pk = el('td'), pka = (mode, text, msg, ask, cls) => btn(text, async () => {
+      if (ask && !confirm(ask)) return;
+      await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/passkey`, { mode }), msg);
+      loadUsers(true);
+    }, cls);
+    if (u.passkeys) pk.append(el('span', null, u.passkeys === 1 ? '1 ключ' : `${u.passkeys} ключ${u.passkeys < 5 ? 'а' : 'ей'}`), ' ');
+    if (u.passkey_offer) pk.append(el('span', 'dim2', 'создаст при входе'), ' ', pka('cancel', 'не предлагать', 'Не предлагать'));
+    else pk.append(pka('offer', u.passkeys ? 'ещё ключ' : 'предложить', 'При следующем входе появится предложение создать ключ'));
+    if (u.passkeys) pk.append(pka('delete', 'удалить ключи', 'Ключи удалены',
+      `Удалить все ключи входа ${u.user}? Войти по ключу он больше не сможет (пароль и Google остаются).`, 'danger'));
+    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, tf, pk, el('td', null, dt(u.created)), ops);
     return tr;
   }));
 }
@@ -280,7 +293,7 @@ function foldersText(u) {
 async function editFolders(u, tr) {
   if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
-  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 8; row.append(td);
+  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 9; row.append(td);
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
   allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');

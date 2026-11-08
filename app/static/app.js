@@ -54,13 +54,75 @@ const LOGIN_ERRORS = {
 };
 
 async function showLogin(msg) {
-  stopPoll(); closeViewer(true);
+  stopPoll(); closeViewer(true); $('pk-offer').hidden = true;
   $('main').hidden = true; $('login').hidden = false;
   $('login-form').hidden = false; $('tfa-form').hidden = true;
   $('lerr').textContent = msg || '';
   try { const r = await fetch('/api/auth/providers', { cache: 'no-store' }); const p = await r.json(); $('lgoogle').hidden = !p.google; googleHref(); } catch (_) {}
   setTimeout(() => $('lu').focus(), 0);
 }
+
+// ---- вход по ключу (passkey, WebAuthn)
+const PK_OK = !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext);
+const b64u = { dec: (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)), (c) => c.charCodeAt(0)).buffer,
+  enc: (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') };
+function pkCred(c) {      // ответ устройства -> JSON для сервера
+  const r = c.response, o = { id: c.id, rawId: b64u.enc(c.rawId), type: c.type, response: { clientDataJSON: b64u.enc(r.clientDataJSON) },
+    authenticatorAttachment: c.authenticatorAttachment || undefined, clientExtensionResults: c.getClientExtensionResults ? c.getClientExtensionResults() : {} };
+  if (r.attestationObject) { o.response.attestationObject = b64u.enc(r.attestationObject); if (r.getTransports) o.response.transports = r.getTransports(); }
+  if (r.authenticatorData) { o.response.authenticatorData = b64u.enc(r.authenticatorData); o.response.signature = b64u.enc(r.signature);
+    if (r.userHandle) o.response.userHandle = b64u.enc(r.userHandle); }
+  return o;
+}
+$('lkey').hidden = !PK_OK;
+$('lkey').addEventListener('click', async () => {
+  const btn = $('lkey'); btn.disabled = true; $('lerr').textContent = '';
+  try {
+    const o = await api('/api/passkey/login/options', { method: 'POST', body: {}, allow401: true });
+    if (o.status === 429) { const j = await o.json().catch(() => ({})); $('lerr').textContent = `Слишком много попыток. Подожди ${Math.ceil((j.retry || 900) / 60)} мин.`; return; }
+    if (!o.ok) { $('lerr').textContent = 'Вход по ключу сейчас недоступен (' + o.status + ')'; return; }
+    const opt = await o.json();
+    opt.challenge = b64u.dec(opt.challenge);
+    if (opt.allowCredentials) opt.allowCredentials = opt.allowCredentials.map((c) => ({ ...c, id: b64u.dec(c.id) }));
+    let cred;
+    try { cred = await navigator.credentials.get({ publicKey: opt }); } catch (_) { $('lerr').textContent = 'Вход по ключу отменён'; return; }
+    const r = await api('/api/passkey/login', { method: 'POST', body: { credential: pkCred(cred), r: $('lr').checked }, allow401: true });
+    if (r.ok) { await enter(); return; }
+    $('lerr').textContent = r.status === 429 ? 'Слишком много попыток, подожди 15 минут'
+      : 'Этот ключ не подошёл (возможно, его удалил администратор)';
+  } catch (_) { $('lerr').textContent = 'Сервер недоступен'; }
+  finally { btn.disabled = false; }
+});
+
+// предложение админа создать ключ на этом устройстве — после входа
+function pkOffer() {
+  if (!PK_OK || !st.me || !st.me.passkey_offer || sessionStorageGet('pk-later')) return;
+  $('pk-err').textContent = ''; $('pk-offer').hidden = false;
+}
+function sessionStorageGet(k) { try { return sessionStorage.getItem(k); } catch (_) { return null; } }
+$('pk-later').addEventListener('click', () => { try { sessionStorage.setItem('pk-later', '1'); } catch (_) {} $('pk-offer').hidden = true; });
+$('pk-create').addEventListener('click', async () => {
+  const btn = $('pk-create'); btn.disabled = true; $('pk-err').textContent = '';
+  try {
+    const o = await api('/api/passkey/register/options', { method: 'POST', body: {} });
+    const j = await o.json();
+    if (!o.ok) { $('pk-err').textContent = j.error || ('Ошибка ' + o.status); return; }
+    const opt = j.options;
+    opt.challenge = b64u.dec(opt.challenge); opt.user.id = b64u.dec(opt.user.id);
+    opt.excludeCredentials = (opt.excludeCredentials || []).map((c) => ({ ...c, id: b64u.dec(c.id) }));
+    let cred;
+    try { cred = await navigator.credentials.create({ publicKey: opt }); }
+    catch (e) { $('pk-err').textContent = e && e.name === 'InvalidStateError' ? 'На этом устройстве ключ уже есть' : 'Создание ключа отменено'; return; }
+    const name = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
+    const r = await api('/api/passkey/register', { method: 'POST', body: { ticket: j.ticket, credential: pkCred(cred), name } });
+    const k = await r.json().catch(() => ({}));
+    if (!r.ok) { $('pk-err').textContent = k.error || ('Ошибка ' + r.status); return; }
+    st.me.passkey_offer = false; $('pk-offer').hidden = true;
+    banner('Ключ входа создан — в следующий раз нажми «Войти по ключу»');
+    setTimeout(() => { if (/^Ключ входа создан/.test($('banner-text').textContent)) banner(null); }, 5000);
+  } catch (_) { $('pk-err').textContent = 'Сервер недоступен'; }
+  finally { btn.disabled = false; }
+});
 
 // «Запомнить вход» действует и на вход через Google
 const googleHref = () => { $('lgoogle').href = '/auth/google' + ($('lr').checked ? '?r=1' : ''); };
@@ -162,6 +224,7 @@ async function enter() {
   }
   loadStars();
   if (HID && me.can_delete) loadMarks();
+  pkOffer();
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();

@@ -21,6 +21,7 @@
     <label>Пароль<input id="lp" name="password" type="password" autocomplete="current-password" maxlength="256" required></label>
     <label class="remember"><input id="lr" type="checkbox"> Запомнить вход</label>
     <button type="submit" id="lbtn">Войти</button>
+    <button type="button" id="lkey" class="key-btn" hidden><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M15 8l2 2"/></svg>Войти по ключу (passkey)</button>
     <a id="lgoogle" class="google-btn" href="/auth/google" hidden><span class="g" aria-hidden="true">G</span>Войти через Google</a>
     <p id="lerr" class="err" role="alert"></p>
   </form>
@@ -37,6 +38,17 @@
     <button type="button" id="tback" class="linkbtn">Войти заново</button>
     <p id="terr" class="err" role="alert"></p>
   </form>
+</section>
+
+<!-- предложение админа: создать ключ входа на этом устройстве -->
+<section id="pk-offer" class="overlay" hidden>
+  <div class="login-card" role="dialog" aria-modal="true" aria-labelledby="pk-h">
+    <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name" id="pk-h">Ключ входа</span></div>
+    <p>Администратор предлагает создать ключ входа (passkey) на этом устройстве. Дальше можно входить отпечатком, лицом или PIN-кодом устройства — без пароля и кода из приложения.</p>
+    <button type="button" id="pk-create">Создать ключ</button>
+    <button type="button" id="pk-later" class="linkbtn">Не сейчас</button>
+    <p id="pk-err" class="err" role="alert"></p>
+  </div>
 </section>
 
 <section id="main" hidden>
