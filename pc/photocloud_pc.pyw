@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.0.0"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.0.1"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -465,13 +465,17 @@ def restart() -> None:
 
 # ======================================================================== окно
 
-CARD_W, THUMB = 236, 220
-BG, CARD, IMGBG, TEXT, DIM = "#ececec", "#ffffff", "#e2e2e2", "#1f1f1f", "#6b6f75"
+CARD_W, THUMB, GAP = 236, 220, 10
+CARD_H = THUMB + 104
+BG, CARD, IMGBG, TEXT, DIM, ACCENT = "#ececec", "#ffffff", "#e2e2e2", "#1f1f1f", "#6b6f75", "#e8a33d"
 STATE = {"ok": ("✔", "#1e9e50"), "changed": ("⚠", "#d9822b"), "missing": ("—", DIM), "bad": ("✖", "#d93b3b"),
          "checking": ("…", DIM)}
 
 
 class App:
+    """Сетка рисуется на одном холсте и только видимая часть: сотни отдельных виджетов и картинок
+    исчерпывают ресурсы окон Windows (пустые карточки, мусор на экране)."""
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.root = tk.Tk()
@@ -479,12 +483,17 @@ class App:
         self.root.geometry("1100x760")
         self.root.minsize(820, 420)
         self.q: queue.Queue = queue.Queue()          # из рабочих потоков — в окно
-        self.pool = concurrent.futures.ThreadPoolExecutor(4)
+        self.check_pool = concurrent.futures.ThreadPoolExecutor(2)   # проверка файлов на диске
+        self.thumb_pool = concurrent.futures.ThreadPoolExecutor(4)   # превью с сервера — отдельно, не тормозит проверку
         self.key = None
         self.api: Api | None = None
         self.items: list[dict] = []
-        self.cards: dict[str, dict] = {}
-        self._imgs: list = []
+        self.index: dict[str, int] = {}
+        self.thumbs: dict[str, bytes] = {}           # путь -> превью (WebP), пока программа открыта
+        self.asked: set[str] = set()                 # превью уже запрошено
+        self.want: set[str] = set()                  # видно сейчас (и экран вокруг)
+        self.drawn: dict[int, object] = {}           # нарисованные карточки -> их картинка
+        self.cols, self.gen, self._pending = 1, 0, False
         self._build()
         self.root.after(100, self._pump)
         self.root.after(200, self.start)
@@ -493,10 +502,10 @@ class App:
     def _build(self) -> None:
         top = ttk.Frame(self.root, padding=(12, 10))
         top.pack(fill="x")
+        self.b_reload = ttk.Button(top, text="Обновить список", command=self.load)
+        self.b_reload.pack(side="right", padx=4)          # сначала кнопка — длинная строка её не вытеснит
         self.status = ttk.Label(top, text="Запуск…")
         self.status.pack(side="left", fill="x", expand=True)
-        self.b_reload = ttk.Button(top, text="Обновить список", command=self.load)
-        self.b_reload.pack(side="right", padx=4)
         bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         bar.pack(fill="x")
         self.b_del = ttk.Button(bar, text="Удалить выбранные в корзину", command=self.delete)
@@ -509,19 +518,30 @@ class App:
         self.summary.pack(fill="x")
         wrap = ttk.Frame(self.root)
         wrap.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(wrap, highlightthickness=0, background=BG)
+        self.canvas = tk.Canvas(wrap, highlightthickness=0, background=BG, yscrollincrement=20)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=sb.set)
+        self.canvas.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self._soon()))
         sb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.grid = tk.Frame(self.canvas, background=BG)
-        self._win = self.canvas.create_window((0, 0), window=self.grid, anchor="nw")
-        self.grid.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self._reflow())
-        self.root.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
-        self.root.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
-        self.root.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
+        self.canvas.bind("<Configure>", lambda e: self._layout())
+        self.canvas.tag_bind("card", "<Button-1>", self._click)
+        self.canvas.tag_bind("img", "<Double-Button-1>", self._dbl)
+        self.root.bind_all("<MouseWheel>", self._wheel)
+        self.root.bind_all("<Button-4>", self._wheel)
+        self.root.bind_all("<Button-5>", self._wheel)
         self._buttons(False)
+
+    def _wheel(self, e) -> None:
+        try:
+            if e.widget.winfo_toplevel() is not self.root:
+                return
+        except (AttributeError, tk.TclError):
+            return
+        if e.num in (4, 5):
+            n = -3 if e.num == 4 else 3
+        else:
+            n = int(-e.delta / 40) or (-1 if e.delta > 0 else 1)
+        self.canvas.yview_scroll(n, "units")
 
     def _buttons(self, on: bool) -> None:
         for b in (self.b_del, self.b_unmark, self.b_reload):
@@ -680,100 +700,148 @@ class App:
         if r.status_code != 200:
             raise ServerError(f"сервер: {_err(r)}")
         items = r.json()["items"]
-        root = Path(self.cfg.root)
         for it in items:
-            it["state"], it["file"], it["note"], it["pick"] = "checking", None, "проверяю…", tk.BooleanVar(value=False)
-        self.items = items
-        self.ui(self._draw)
-        for it in items:
-            self.pool.submit(self._check, root, it)
-            if it.get("id"):
-                self.pool.submit(self._thumb, it)
+            it["state"], it["file"], it["note"], it["pick"] = "checking", None, "проверяю…", False
+        self.ui(lambda: self._show(items))
 
-    def _check(self, root: Path, it: dict) -> None:
+    def _show(self, items: list[dict]) -> None:
+        self.gen += 1
+        self.items, self.index = items, {it["path"]: i for i, it in enumerate(items)}
+        self.asked, self.want = set(), set()
+        self.canvas.yview_moveto(0)
+        self._layout()
+        self._buttons(True)
+        self._count()
+        root, gen = Path(self.cfg.root), self.gen
+        for it in items:
+            self.check_pool.submit(self._check, root, it, gen)
+
+    def _check(self, root: Path, it: dict, gen: int) -> None:
+        if gen != self.gen:
+            return
         try:
             it["state"], it["file"], it["note"] = check_file(root, it)
         except OSError as e:
             it["state"], it["note"] = "bad", f"не читается: {e}"
-        self.ui(lambda: self._paint(it))
+        self.ui(lambda: (self._redraw(it), self._count()))
 
-    def _thumb(self, it: dict) -> None:
+    def _thumb(self, it: dict, gen: int) -> None:
+        path = it["path"]
+        if gen != self.gen or path not in self.want:      # пока ждали очереди, уже пролистали
+            self.asked.discard(path)
+            return
         try:
-            r = self.api.call("GET", f"/api/pc/preview/{it['id']}?k=m")
-            if r.status_code != 200:
-                return
-            im = Image.open(io.BytesIO(r.content))
-            im.thumbnail((THUMB, THUMB))
-            self.ui(lambda: self._set_img(it, im))
+            r = self.api.call("GET", f"/api/pc/preview/{it['id']}?k=s")
+            if r.status_code == 200:
+                self.thumbs[path] = r.content
+            else:
+                it["nothumb"] = True
         except Exception as e:  # noqa: BLE001
-            log.info("превью %s: %s", it["path"], e)
+            log.info("превью %s: %s", path, e)
+            self.asked.discard(path)
+            return
+        self.ui(lambda: self._redraw(it))
 
-    def _draw(self) -> None:
-        for w in self.grid.winfo_children():
-            w.destroy()
-        self.cards, self._imgs = {}, []
+    # ---- сетка на холсте
+    def _layout(self) -> None:
+        w, h = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        self.cols = max(1, (w - GAP) // (CARD_W + GAP))
+        rows = -(-len(self.items) // self.cols)
+        self.canvas.configure(scrollregion=(0, 0, w, max(h, rows * (CARD_H + GAP) + GAP)))
+        self.canvas.delete("all")
+        self.drawn = {}
         if not self.items:
-            tk.Label(self.grid, text="Ничего не помечено на удаление.", fg=DIM, bg=BG,
-                     font=("Segoe UI", 12), pady=40, padx=20).grid(row=0, column=0)
-        for it in self.items:
-            c = tk.Frame(self.grid, bg=CARD, padx=6, pady=6, highlightthickness=1, highlightbackground="#d6d6d6")
-            box = tk.Frame(c, bg=IMGBG, width=THUMB, height=THUMB)       # размер в пикселях, пока превью не пришло
-            box.pack()
-            box.pack_propagate(False)
-            img = tk.Label(box, bg=IMGBG, text="▶ видео" if it["video"] else "…", fg=DIM, cursor="hand2")
-            img.pack(fill="both", expand=True)
-            img.bind("<Double-Button-1>", lambda e, it=it: self._big(it))
-            row = tk.Frame(c, bg=CARD)
-            row.pack(fill="x", pady=(6, 0))
-            chk = tk.Checkbutton(row, variable=it["pick"], bg=CARD, activebackground=CARD,
-                                 command=self._count, selectcolor="#ffffff", fg="#000000")
-            chk.pack(side="left")
-            st = tk.Label(row, text="", bg=CARD, font=("Segoe UI", 11, "bold"))
-            st.pack(side="left")
-            name = it["path"].rsplit("/", 1)[-1]
-            tk.Label(row, text=name if len(name) < 26 else name[:24] + "…", fg=TEXT, bg=CARD,
-                     font=("Segoe UI", 9)).pack(side="left", padx=4)
-            when = datetime.datetime.fromtimestamp(it["mtime"]).strftime("%d.%m.%Y") if it["mtime"] > 0 else "—"
-            info = tk.Label(c, text=f"{human(it['size'])} · {when} · пометил {it['by']}" + (" · ролик живого фото" if it["live"] else ""),
-                            fg=DIM, bg=CARD, font=("Segoe UI", 8), wraplength=CARD_W - 12, justify="left")
-            info.pack(anchor="w")
-            note = tk.Label(c, text="", fg=DIM, bg=CARD, font=("Segoe UI", 8), wraplength=CARD_W - 12, justify="left")
-            note.pack(anchor="w")
-            self.cards[it["path"]] = {"frame": c, "img": img, "chk": chk, "st": st, "note": note}
-            self._paint(it)
-        self._reflow()
-        self._buttons(True)
-        self._count()
-
-    def _reflow(self) -> None:
-        if not self.cards:
+            self.canvas.create_text(w // 2, 60, text="Ничего не помечено на удаление.", fill=DIM, font=("Segoe UI", 12))
             return
-        cols = max(1, self.canvas.winfo_width() // (CARD_W + 10))
-        for i, it in enumerate(self.items):
-            card = self.cards.get(it["path"])
-            if card:
-                card["frame"].grid(row=i // cols, column=i % cols, padx=5, pady=5, sticky="n")
+        self._render()
 
-    def _paint(self, it: dict) -> None:
-        card = self.cards.get(it["path"])
-        if not card:
+    def _soon(self) -> None:
+        if not self._pending:
+            self._pending = True
+            self.root.after_idle(self._render)
+
+    def _render(self) -> None:
+        self._pending = False
+        if not self.items:
             return
+        top, h, rh = self.canvas.canvasy(0), self.canvas.winfo_height(), CARD_H + GAP
+        r0, r1 = max(0, int((top - h) // rh)), int((top + 2 * h) // rh) + 1     # экран и по экрану сверху и снизу
+        want = set(range(r0 * self.cols, min(len(self.items), r1 * self.cols)))
+        for i in [i for i in self.drawn if i not in want]:
+            self.canvas.delete(f"c{i}")
+            del self.drawn[i]
+        for i in sorted(want - self.drawn.keys()):
+            self._card(i)
+        self.want = {self.items[i]["path"] for i in want}
+        v0, v1 = int(top // rh) * self.cols, (int((top + h) // rh) + 1) * self.cols       # сперва видимые
+        for i in sorted(want, key=lambda i: (not v0 <= i < v1, i)):
+            it = self.items[i]
+            if it.get("id") and not it.get("nothumb") and it["path"] not in self.thumbs and it["path"] not in self.asked:
+                self.asked.add(it["path"])
+                self.thumb_pool.submit(self._thumb, it, self.gen)
+
+    def _card(self, i: int) -> None:
+        it, c, t = self.items[i], self.canvas, f"c{i}"
+        x, y = GAP + (i % self.cols) * (CARD_W + GAP), GAP + (i // self.cols) * (CARD_H + GAP)
+        pick = it["pick"]
+        c.create_rectangle(x, y, x + CARD_W, y + CARD_H, fill=CARD, outline=ACCENT if pick else "#d6d6d6",
+                           width=3 if pick else 1, tags=(t, "card"))
+        ix, iy = x + (CARD_W - THUMB) // 2, y + 8
+        c.create_rectangle(ix, iy, ix + THUMB, iy + THUMB, fill=IMGBG, outline="", tags=(t, "card", "img"))
+        ph = None
+        if data := self.thumbs.get(it["path"]):
+            try:
+                im = Image.open(io.BytesIO(data))
+                im.thumbnail((THUMB, THUMB))
+                ph = ImageTk.PhotoImage(im)
+            except Exception:  # noqa: BLE001
+                ph = None
+        if ph is not None:
+            c.create_image(ix + THUMB // 2, iy + THUMB // 2, image=ph, tags=(t, "card", "img"))
+        else:
+            c.create_text(ix + THUMB // 2, iy + THUMB // 2, fill=DIM, font=("Segoe UI", 9), tags=(t, "card", "img"),
+                          text="нет превью" if not it.get("id") or it.get("nothumb") else "▶ видео…" if it["video"] else "…")
+        ty = iy + THUMB + 6
+        c.create_text(x + 8, ty, anchor="nw", text="☑" if pick else "☐", font=("Segoe UI Symbol", 14),
+                      fill=TEXT if it["state"] != "checking" else "#bbbbbb", tags=(t, "card"))
         sym, color = STATE[it["state"]]
-        card["st"].configure(text=sym, fg=color)
-        card["note"].configure(text=it["note"] + (f"\n{it['path']}" if it["state"] != "ok" else ""))
-        ok = it["state"] == "ok"
-        card["chk"].configure(state="normal" if ok or it["state"] == "missing" else "disabled")
-        if not ok and it["state"] != "missing":
-            it["pick"].set(False)
+        c.create_text(x + 32, ty + 3, anchor="nw", text=sym, fill=color, font=("Segoe UI", 11, "bold"), tags=(t, "card"))
+        name = it["path"].rsplit("/", 1)[-1]
+        c.create_text(x + 52, ty + 5, anchor="nw", text=name if len(name) < 26 else name[:24] + "…", fill=TEXT,
+                      font=("Segoe UI", 9), tags=(t, "card"))
+        when = datetime.datetime.fromtimestamp(it["mtime"]).strftime("%d.%m.%Y") if it["mtime"] > 0 else "—"
+        info = f"{human(it['size'])} · {when} · пометил {it['by']}" + (" · ролик живого фото" if it["live"] else "")
+        note = it["note"]
+        if it["state"] != "ok":
+            note += "\n" + (it["path"] if len(it["path"]) <= 70 else "…" + it["path"][-69:])
+        c.create_text(x + 8, ty + 30, anchor="nw", width=CARD_W - 16, text=info + "\n" + note, fill=DIM,
+                      font=("Segoe UI", 8), tags=(t, "card"))
+        self.drawn[i] = ph                          # держим ссылку, иначе картинка пропадёт
+
+    def _redraw(self, it: dict) -> None:
+        i = self.index.get(it["path"])
+        if i is None or self.items[i] is not it or i not in self.drawn:
+            return
+        self.canvas.delete(f"c{i}")
+        self._card(i)
+
+    def _hit(self) -> dict | None:
+        for tag in self.canvas.gettags("current"):
+            if tag.startswith("c") and tag[1:].isdigit() and int(tag[1:]) < len(self.items):
+                return self.items[int(tag[1:])]
+        return None
+
+    def _click(self, _e) -> None:
+        it = self._hit()
+        if it is None or it["state"] == "checking":
+            return
+        it["pick"] = not it["pick"]
+        self._redraw(it)
         self._count()
 
-    def _set_img(self, it: dict, im) -> None:
-        card = self.cards.get(it["path"])
-        if not card:
-            return
-        ph = ImageTk.PhotoImage(im)
-        self._imgs.append(ph)
-        card["img"].configure(image=ph, text="")
+    def _dbl(self, _e) -> None:
+        if (it := self._hit()) is not None:
+            self._big(it)
 
     def _big(self, it: dict) -> None:
         if not it.get("id"):
@@ -792,35 +860,43 @@ class App:
                 im.thumbnail((sw, sh))
 
                 def show():
-                    ph = ImageTk.PhotoImage(im)
-                    self._imgs.append(ph)
-                    lab.configure(image=ph, text="")
+                    try:
+                        ph = ImageTk.PhotoImage(im)
+                        lab.configure(image=ph, text="")
+                        lab.image = ph
+                    except tk.TclError:
+                        pass                        # окно уже закрыли
                 self.ui(show)
         self.bg(get)
 
     def _select(self, on: bool) -> None:
         for it in self.items:
-            it["pick"].set(on and it["state"] == "ok")
+            it["pick"] = on and it["state"] == "ok"
+        self._layout()
         self._count()
 
     def _count(self) -> None:
-        picked = [it for it in self.items if it["pick"].get()]
+        picked = [it for it in self.items if it["pick"]]
         ok = sum(1 for it in self.items if it["state"] == "ok")
-        self.summary.configure(text=f"Помечено: {len(self.items)} · проверены: {ok} · выбрано: {len(picked)} "
-                                    f"({human(sum(max(0, it['size']) for it in picked))})")
+        wait = sum(1 for it in self.items if it["state"] == "checking")
+        self.summary.configure(text=f"Помечено: {len(self.items)} · проверены: {ok}" + (f" · проверяю: {wait}" if wait else "")
+                                    + f" · выбрано: {len(picked)} ({human(sum(max(0, it['size']) for it in picked))})"
+                                    + "\nЩелчок по карточке — выбрать, двойной щелчок по фото — открыть крупно")
         if self.cfg.fp:
             self.say(f"Сервер {self.cfg.server} · ключ {self.cfg.fp}"
                      f"{' (программный, не в TPM)' if self.cfg.key_type == 'software' else ' (TPM)'}\n"
-                     f"Папка архива: {self.cfg.root}")
+                     f"Папка архива: {self.cfg.root if len(self.cfg.root) <= 70 else '…' + self.cfg.root[-69:]}")
 
     # ---- действия
     def delete(self) -> None:
-        picked = [it for it in self.items if it["pick"].get() and it["state"] == "ok"]
+        picked = [it for it in self.items if it["pick"] and it["state"] == "ok"]
+        skip = sum(1 for it in self.items if it["pick"] and it["state"] != "ok")
         if not picked:
             messagebox.showinfo(APP, "Ничего не выбрано (удалить можно только проверенные — с ✔).")
             return
         if not messagebox.askyesno(APP, f"Отправить в корзину {len(picked)} файл(ов), "
-                                        f"{human(sum(it['size'] for it in picked))}?\n\nИз корзины их можно восстановить."):
+                                        f"{human(sum(it['size'] for it in picked))}?\n\nИз корзины их можно восстановить."
+                                        + (f"\n\nНе проверенные ({skip}) удалены не будут." if skip else "")):
             return
         self._buttons(False)
         self.say("Удаляю в корзину…")
@@ -861,7 +937,7 @@ class App:
         self.ui(self.load)
 
     def unmark(self) -> None:
-        picked = [it["path"] for it in self.items if it["pick"].get()]
+        picked = [it["path"] for it in self.items if it["pick"]]
         if not picked:
             messagebox.showinfo(APP, "Ничего не выбрано.")
             return
@@ -878,7 +954,8 @@ class App:
 
     def run(self) -> None:
         self.root.mainloop()
-        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.check_pool.shutdown(wait=False, cancel_futures=True)
+        self.thumb_pool.shutdown(wait=False, cancel_futures=True)
         if self.api:
             self.api.close()
 
