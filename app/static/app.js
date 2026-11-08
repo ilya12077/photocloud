@@ -672,10 +672,13 @@ function buildRow(r) {
     if (HID && MARK.ids.has(ph[0])) { b.classList.add('marked'); b.append(markBadge()); }
     const g = GX.byId.get(ph[0]);
     if (g) {
-      b.classList.add('grouped');
-      const gb = el('span', 'gbadge'); gb.append(GROUP_SVG.cloneNode(true));
-      if (groupCollapsed(ph)) { gb.append(String(GX.of.get(g).length)); b.title = `${ph[2]} — группа из ${GX.of.get(g).length}, нажми, чтобы раскрыть`; }
-      b.append(gb);
+      // значок с числом — только на первом фото группы (и у свёрнутой, и у раскрытой); у остальных — без значка
+      if (GX.cover.get(g) === ph) {
+        b.classList.add('grouped');
+        const gb = el('span', 'gbadge'); gb.append(GROUP_SVG.cloneNode(true), String(GX.of.get(g).length));
+        b.append(gb);
+        if (groupCollapsed(ph)) b.title = `${ph[2]} — группа из ${GX.of.get(g).length}, нажми, чтобы раскрыть`;
+      }
       if (GX.pop.has(ph[0])) { b.classList.add('pop'); b.style.animationDelay = Math.min(300, (i - r.start) * 30) + 'ms'; }
     }
     if (ph[6] & F_VIDEO) b.append(el('span', 'vbadge', '▶'));
