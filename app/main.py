@@ -1285,13 +1285,36 @@ async def pc_unmark(request: Request, _: dict = Depends(require_pc)):
     if not isinstance(paths, list) or not all(isinstance(x, str) for x in paths) or len(paths) > 10000:
         raise HTTPException(400)
     paths = [x for x in paths if x in _marks]
-
-    def go() -> None:
-        global _marks
-        db.marks_delete(paths)
-        _marks = db.marks_load()
-    await run_in_threadpool(go)
+    await run_in_threadpool(_pc_drop, paths, False)
     audit("delete_unmark", "клиент ПК", ip_of(request), f"{len(paths)}: {', '.join(paths[:3])}")
+    return no_store(JSONResponse({"ok": True, "count": len(paths)}))
+
+
+def _pc_drop(paths: list[str], unhide: bool) -> None:
+    """Снять пометку «на удаление»; unhide — ещё и «скрыто» у всех, кто скрыл."""
+    global _marks
+    db.marks_delete(paths)
+    _marks = db.marks_load()
+    if not unhide:
+        return
+    drop = set(paths)
+    with mine.mu:
+        for w, hd in list(mine.hidden.items()):
+            if drop & hd.keys():
+                db.hidden_delete(w, paths)
+                mine.hidden[w] = {k: v for k, v in hd.items() if k not in drop}
+                mine.changed(w)
+
+
+@app.post("/api/pc/restore")
+async def pc_restore(request: Request, _: dict = Depends(require_pc)):
+    """«Вернуть в галерею»: снять пометку и «скрыто» у всех — фото снова в ленте."""
+    paths = _pc_json(request).get("paths")
+    if not isinstance(paths, list) or not all(isinstance(x, str) for x in paths) or len(paths) > 10000:
+        raise HTTPException(400)
+    paths = [x for x in paths if x in _marks]
+    await run_in_threadpool(_pc_drop, paths, True)
+    audit("unhide", "клиент ПК", ip_of(request), f"с пометкой на удаление, {len(paths)}: {', '.join(paths[:3])}")
     return no_store(JSONResponse({"ok": True, "count": len(paths)}))
 
 
@@ -1311,19 +1334,7 @@ async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
     except PcError as e:
         return _pc_fail(request, "удаление", e, 403)
     paths = [i["path"] for i in items if i["path"] in _marks]
-
-    def go() -> None:
-        global _marks
-        drop = set(paths)
-        db.marks_delete(paths)
-        _marks = db.marks_load()
-        with mine.mu:
-            for w, hd in list(mine.hidden.items()):
-                if drop & hd.keys():
-                    db.hidden_delete(w, paths)
-                    mine.hidden[w] = {k: v for k, v in hd.items() if k not in drop}
-                    mine.changed(w)
-    await run_in_threadpool(go)
+    await run_in_threadpool(_pc_drop, paths, True)
     audit("pc_deleted", "клиент ПК", ip_of(request), f"в корзину на ПК: {len(paths)}: {', '.join(paths[:3])}")
     if paths:
         library.start_build(storage, _index_error)   # файлов больше нет — пересобрать список
