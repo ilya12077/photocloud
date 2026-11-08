@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.0.1"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.0.2"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -510,7 +510,9 @@ class App:
         bar.pack(fill="x")
         self.b_del = ttk.Button(bar, text="Удалить выбранные в корзину", command=self.delete)
         self.b_del.pack(side="left")
-        self.b_unmark = ttk.Button(bar, text="Снять пометку с выбранных", command=self.unmark)
+        self.b_restore = ttk.Button(bar, text="Вернуть в галерею", command=self.restore)
+        self.b_restore.pack(side="left", padx=(8, 0))
+        self.b_unmark = ttk.Button(bar, text="Снять пометку на удаление", command=self.unmark)
         self.b_unmark.pack(side="left", padx=8)
         ttk.Button(bar, text="Выбрать все проверенные", command=lambda: self._select(True)).pack(side="left")
         ttk.Button(bar, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=8)
@@ -544,7 +546,7 @@ class App:
         self.canvas.yview_scroll(n, "units")
 
     def _buttons(self, on: bool) -> None:
-        for b in (self.b_del, self.b_unmark, self.b_reload):
+        for b in (self.b_del, self.b_restore, self.b_unmark, self.b_reload):
             b.state(["!disabled"] if on else ["disabled"])
 
     def say(self, text: str) -> None:
@@ -937,16 +939,26 @@ class App:
         self.ui(self.load)
 
     def unmark(self) -> None:
+        self._send("/api/pc/unmark", "Снять пометку «на удаление» с {n} файл(ов)? Файлы останутся на месте "
+                                     "и в скрытых — их можно будет пометить снова.")
+
+    def restore(self) -> None:
+        self._send("/api/pc/restore", "Вернуть {n} файл(ов) в галерею? Снимется пометка «на удаление» и «скрыто» "
+                                      "у всех, кто их скрыл, — фото снова появятся в ленте.")
+
+    def _send(self, url: str, question: str) -> None:
         picked = [it["path"] for it in self.items if it["pick"]]
         if not picked:
             messagebox.showinfo(APP, "Ничего не выбрано.")
             return
-        if not messagebox.askyesno(APP, f"Снять пометку «на удаление» с {len(picked)} файл(ов)? Файлы останутся на месте."):
+        if not messagebox.askyesno(APP, question.format(n=len(picked))):
             return
         self._buttons(False)
 
         def go():
-            r = self.api.call("POST", "/api/pc/unmark", {"paths": picked})
+            r = self.api.call("POST", url, {"paths": picked})
+            if r.status_code == 404:
+                raise ServerError("сервер не знает эту команду — обнови сервер")
             if r.status_code != 200:
                 raise ServerError(_err(r))
             self.ui(self.load)
