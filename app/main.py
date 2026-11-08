@@ -390,20 +390,20 @@ async def login(request: Request):
             bg(ha.notify("lockout", f"IP {clean(ip)} заблокирован на 15 мин после 5 неудачных входов"))
         await asyncio.sleep(0.3)
         return no_store(JSONResponse({"error": "bad"}, 401))
-    if users.totp_on(u):
-        # пароль верный, но нужен код из приложения — сессию дадим после него
+    if users.totp_required(u):
+        # пароль верный, но нужен код из приложения (или его настройка) — сессию дадим после него
         return no_store(_need_2fa(JSONResponse({"need": "totp"}), u, ip, "паролю"))
     limiter.success(ip)
     audit("login", u, ip)
     return no_store(start_session(request, JSONResponse({"user": u, "role": role}), u, ip, "паролю"))
 
 
-# ---- двухфакторный вход: после пароля или Google — код из приложения.
+# ---- двухфакторный вход: включает админ («Пользователи» → 2FA). После пароля или Google —
+# код из приложения; если приложение ещё не настроено — сначала QR-код и первый код.
 # Потерян телефон — админ сбрасывает в «Пользователях» или из консоли: python -m app 2fa-reset <логин>
 TFA_COOKIE = "pc_2fa"
-TFA_TTL = 300
-_tfa: dict[str, dict] = {}          # билет -> {user, ip, how, exp, tries}
-_tfa_setup: dict[str, tuple] = {}   # пользователь -> (секрет, до какого времени)
+TFA_TTL = 600
+_tfa: dict[str, dict] = {}          # билет -> {user, ip, how, exp, tries, setup: новый секрет или ""}
 
 
 def _need_2fa(resp: Response, u: str, ip: str, how: str) -> Response:
@@ -413,11 +413,33 @@ def _need_2fa(resp: Response, u: str, ip: str, how: str) -> Response:
     if len(_tfa) > 1000:
         _tfa.clear()
     ticket = secrets.token_urlsafe(24)
-    _tfa[ticket] = {"user": u, "ip": ip, "how": how, "exp": now + TFA_TTL, "tries": 0}
+    _tfa[ticket] = {"user": u, "ip": ip, "how": how, "exp": now + TFA_TTL, "tries": 0,
+                    "setup": "" if users.totp_on(u) else totp.new_secret()}
     # Lax: после Google браузер приходит к нам переходом с чужого сайта
     resp.set_cookie(TFA_COOKIE, ticket, max_age=TFA_TTL, path="/", secure=S.cookie_secure,
                     httponly=True, samesite="lax")
     return resp
+
+
+def _tfa_ticket(request: Request):
+    ticket = request.cookies.get(TFA_COOKIE, "")
+    t = _tfa.get(ticket)
+    if not t or t["exp"] < time.time() or t["ip"] != ip_of(request):
+        _tfa.pop(ticket, None)
+        return ticket, None
+    return ticket, t
+
+
+@app.get("/api/login/2fa")
+async def login_2fa_state(request: Request):
+    """Что показать на втором шаге: поле для кода или настройку приложения (QR и ключ)."""
+    _, t = _tfa_ticket(request)
+    if t is None:
+        return no_store(JSONResponse({"error": "expired"}, 401))
+    if not t["setup"]:
+        return no_store(JSONResponse({"need": "totp"}))
+    u = totp.uri(t["setup"], t["user"], S.public_name)
+    return no_store(JSONResponse({"need": "setup", "secret": t["setup"], "qr": totp.qr_data_url(u)}))
 
 
 @app.post("/api/login/2fa", dependencies=[Depends(require_csrf)])
@@ -426,14 +448,20 @@ async def login_2fa(request: Request):
     wait = limiter.blocked(ip)
     if wait:
         return no_store(JSONResponse({"error": "locked", "retry": wait}, 429, headers={"retry-after": str(wait)}))
-    ticket = request.cookies.get(TFA_COOKIE, "")
-    t = _tfa.get(ticket)
-    if not t or t["exp"] < time.time() or t["ip"] != ip:
-        _tfa.pop(ticket, None)
+    ticket, t = _tfa_ticket(request)
+    if t is None:
         return no_store(JSONResponse({"error": "expired"}, 401))
     data = await read_json(request)
-    ok = await run_in_threadpool(users.totp_check, t["user"], data.get("code"))
     u = t["user"]
+    if t["setup"]:
+        # первая настройка: код должен совпасть с новым ключом — значит, приложение настроено верно
+        st = totp.match(t["setup"], totp.norm(data.get("code")))
+        ok = st is not None
+        if ok:
+            await run_in_threadpool(users.totp_enable, u, t["setup"], st)
+            audit("2fa_on", u, ip, "приложение настроено")
+    else:
+        ok = await run_in_threadpool(users.totp_check, u, data.get("code"))
     if not ok:
         t["tries"] += 1
         if t["tries"] >= 5:
@@ -456,66 +484,6 @@ async def login_2fa(request: Request):
     resp = start_session(request, JSONResponse({"user": u, "role": role}), u, ip, t["how"])
     resp.delete_cookie(TFA_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
     return no_store(resp)
-
-
-@app.get("/api/2fa")
-async def tfa_state(s: Session = Depends(require_user)):
-    return no_store(JSONResponse({"on": users.totp_on(s.user)}))
-
-
-@app.post("/api/2fa/setup", dependencies=[Depends(require_csrf)])
-async def tfa_setup(s: Session = Depends(require_user)):
-    if users.totp_on(s.user):
-        return _bad("уже включён — сначала отключи")
-    sec = totp.new_secret()
-    _tfa_setup[s.user] = (sec, time.time() + 900)
-    u = totp.uri(sec, s.user, S.public_name)
-    return no_store(JSONResponse({"secret": sec, "uri": u, "qr": totp.qr_data_url(u)}))
-
-
-async def _tfa_code_bad(request: Request, s: Session, code) -> JSONResponse | None:
-    """Проверка кода из приложения в управлении 2FA: None — подошёл.
-    Ошибки считает лимитер — подобрать код с украденной сессией не выйдет."""
-    ip = ip_of(request)
-    if limiter.blocked(ip, global_cap=False):
-        return _bad("слишком много неверных кодов, подожди 15 минут", 429)
-    if not await run_in_threadpool(users.totp_check, s.user, code):
-        limiter.fail(ip)
-        await asyncio.sleep(0.3)
-        return _bad("код не подошёл", 403)
-    return None
-
-
-@app.post("/api/2fa/enable", dependencies=[Depends(require_csrf)])
-async def tfa_enable(request: Request, s: Session = Depends(require_user)):
-    ip = ip_of(request)
-    if limiter.blocked(ip, global_cap=False):
-        return _bad("слишком много попыток, подожди 15 минут", 429)
-    data = await read_json(request)
-    sec, until = _tfa_setup.get(s.user, ("", 0))
-    if not sec or until < time.time():
-        return _bad("начни заново: ключ устарел")
-    st = totp.match(sec, totp.norm(data.get("code")))
-    if st is None:
-        limiter.fail(ip)
-        return _bad("код не подошёл — проверь время на телефоне и введи свежий")
-    _tfa_setup.pop(s.user, None)
-    try:
-        await run_in_threadpool(users.totp_enable, s.user, sec, st)
-    except UserError as e:
-        return _bad(str(e))
-    audit("2fa_on", s.user, ip)
-    return no_store(JSONResponse({"ok": True}))
-
-
-@app.post("/api/2fa/disable", dependencies=[Depends(require_csrf)])
-async def tfa_disable(request: Request, s: Session = Depends(require_user)):
-    data = await read_json(request)
-    if bad := await _tfa_code_bad(request, s, data.get("code")):
-        return bad
-    await run_in_threadpool(users.totp_disable, s.user)
-    audit("2fa_off", s.user, ip_of(request))
-    return no_store(JSONResponse({"ok": True}))
 
 
 def start_session(request: Request, resp: Response, u: str, ip: str, how: str) -> Response:
@@ -583,7 +551,7 @@ async def google_callback(request: Request):
                      dedupe_s=300, key=ip))
         return fail("google-denied")
     u, _role = hit
-    if users.totp_on(u):
+    if users.totp_required(u):
         resp = _need_2fa(RedirectResponse("/#2fa", 303), u, ip, "Google")
         resp.delete_cookie(OAUTH_COOKIE, path="/", secure=S.cookie_secure, httponly=True, samesite="lax")
         return no_store(resp)
@@ -2696,15 +2664,17 @@ async def admin_user_wake(request: Request, name: str, s: Session = Depends(requ
     return no_store(JSONResponse({"ok": True}))
 
 
-@app.post("/api/admin/users/{name}/2fa-reset", dependencies=[Depends(require_csrf)])
-async def admin_user_2fa_reset(request: Request, name: str, s: Session = Depends(require_admin)):
-    """Потерял телефон — админ отключает второй шаг, дальше вход только паролем."""
+@app.post("/api/admin/users/{name}/2fa", dependencies=[Depends(require_csrf)])
+async def admin_user_2fa(request: Request, name: str, s: Session = Depends(require_admin)):
+    """on — требовать (пользователь настроит приложение при следующем входе); reset — новый
+    телефон: настройка заново при следующем входе; off — выключить."""
     name = _user_arg(name)
+    mode = (await read_json(request)).get("mode")
     try:
-        await run_in_threadpool(users.totp_disable, name)
+        await run_in_threadpool(users.totp_set, name, mode)
     except UserError as e:
         return _bad(str(e))
-    audit("2fa_reset", s.user, ip_of(request), name)
+    audit({"on": "2fa_on", "off": "2fa_off", "reset": "2fa_reset"}[mode], s.user, ip_of(request), name)
     return no_store(JSONResponse({"ok": True}))
 
 

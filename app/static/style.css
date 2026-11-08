@@ -305,15 +305,7 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .hint { margin: 0; font-size: 14px; color: var(--dim); }
 .login-card .linkbtn { background: none; color: var(--dim); font-weight: 500; padding: 4px; }
 .login-card .linkbtn:hover { color: var(--fg); }
-.overlay { position: fixed; inset: 0; z-index: 60; background: #0008; display: grid; place-items: center;
-  padding: 16px; overflow: auto; }
-.tfa-card { width: min(400px, 100%); }
-.tfa-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.tfa-head h2 { margin: 0; font-size: 18px; }
-.tfa-head .icon { background: none; color: var(--dim); padding: 4px 8px; font-weight: 400; }
-#tfa-body { display: grid; gap: 12px; }
-#tfa-body p { margin: 0; font-size: 14px; }
+.tfa-setup { display: grid; gap: 10px; }
 .tfa-qr { justify-self: center; width: 200px; height: 200px; image-rendering: pixelated; border-radius: 8px; background: #fff; }
 .tfa-key { font: 600 14px/1.5 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .5px; word-break: break-all;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; user-select: all; }
-.login-card button.danger { background: var(--err); color: #fff; }
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; user-select: all; text-align: center; }

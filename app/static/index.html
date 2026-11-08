@@ -26,21 +26,16 @@
   <!-- второй шаг входа: код из приложения -->
   <form id="tfa-form" class="login-card" autocomplete="off" hidden>
     <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-name">Фотоархив</span></div>
-    <p class="hint">Введи 6 цифр из приложения-аутентификатора.</p>
+    <p class="hint" id="thint">Введи 6 цифр из приложения-аутентификатора.</p>
+    <div id="tsetup" class="tfa-setup" hidden>
+      <img id="tqr" class="tfa-qr" alt="QR-код для приложения">
+      <div id="tkey" class="tfa-key"></div>
+    </div>
     <label>Код<input id="tc" name="otp" autocomplete="one-time-code" inputmode="numeric" maxlength="8" required></label>
     <button type="submit" id="tbtn">Подтвердить</button>
     <button type="button" id="tback" class="linkbtn">Войти заново</button>
     <p id="terr" class="err" role="alert"></p>
   </form>
-</section>
-
-<!-- настройка двухфакторного входа -->
-<section id="tfa" class="overlay" hidden>
-  <div class="login-card tfa-card" role="dialog" aria-modal="true" aria-labelledby="tfa-h">
-    <div class="tfa-head"><h2 id="tfa-h">Двухфакторный вход</h2><button id="tfa-x" class="icon" type="button" aria-label="Закрыть">✕</button></div>
-    <div id="tfa-body"></div>
-    <p id="tfa-err" class="err" role="alert"></p>
-  </div>
 </section>
 
 <section id="main" hidden>
@@ -64,7 +59,6 @@
             <a class="mi" id="menu-hidden" href="/hidden" hidden>Скрытые фото</a>
             <a class="mi" id="menu-all" href="/" hidden>Все фото</a>
             <a class="mi" id="admin-link" href="/admin" hidden>Админка</a>
-            <button class="mi" id="menu-2fa" type="button">Двухфакторный вход</button>
             <button class="mi" id="logout" type="button">Выйти</button>
           </div>
         </div>

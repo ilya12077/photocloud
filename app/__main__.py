@@ -1,6 +1,6 @@
 """Запуск: python -m app  (настройки — из .env рядом с проектом).
-Из консоли контейнера: python -m app 2fa-reset <логин> — отключить двухфакторный вход
-(потерян телефон); работающий сервер подхватит изменение сам."""
+Из консоли контейнера: python -m app 2fa-reset <логин> — потерян телефон (при следующем входе
+настройка заново), python -m app 2fa-off <логин> — выключить; работающий сервер подхватит сам."""
 import os
 import shutil
 import sys
@@ -30,21 +30,26 @@ def main() -> None:
 
 def command(s, args: list[str]) -> int:
     from .auth import UserError, UserStore
-    if args[0] == "2fa-reset" and len(args) == 2:
+    modes = {"2fa-reset": ("reset", "сброшен: при следующем входе — настройка приложения заново"),
+             "2fa-off": ("off", "выключен: вход по паролю (или Google)")}
+    if args[0] in modes and len(args) == 2:
+        mode, done = modes[args[0]]
         users = UserStore(s.data_dir / "users.json")
-        if not users.totp_on(args[1]):
+        if not users.totp_required(args[1]):
             print(f"У «{args[1]}» двухфакторный вход не включён (или нет такого пользователя)")
             return 1
         try:
-            users.totp_disable(args[1])
+            users.totp_set(args[1], mode)
         except UserError as e:
             print(e, file=sys.stderr)
             return 1
         from .logs import Audit
-        Audit(s.data_dir / "audit.log")("2fa_reset", "консоль", "", args[1])
-        print(f"Двухфакторный вход у «{args[1]}» отключён — вход по паролю (или Google)")
+        Audit(s.data_dir / "audit.log")("2fa_" + mode, "консоль", "", args[1])
+        print(f"Двухфакторный вход у «{args[1]}» {done}")
         return 0
-    print("Команды:\n  python -m app 2fa-reset <логин>   отключить двухфакторный вход", file=sys.stderr)
+    print("Команды:\n"
+          "  python -m app 2fa-reset <логин>   новый телефон: при следующем входе — настройка заново\n"
+          "  python -m app 2fa-off <логин>     выключить двухфакторный вход", file=sys.stderr)
     return 2
 
 

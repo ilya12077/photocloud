@@ -53,7 +53,7 @@ const LOGIN_ERRORS = {
 };
 
 async function showLogin(msg) {
-  stopPoll(); closeViewer(true); tfaClose();
+  stopPoll(); closeViewer(true);
   $('main').hidden = true; $('login').hidden = false;
   $('login-form').hidden = false; $('tfa-form').hidden = true;
   $('lerr').textContent = msg || '';
@@ -82,10 +82,24 @@ $('login-form').addEventListener('submit', async (e) => {
 });
 
 // второй шаг входа
-function showTfaStep(msg) {
+async function showTfaStep(msg) {
   $('main').hidden = true; $('login').hidden = false;
   $('login-form').hidden = true; $('tfa-form').hidden = false;
-  $('tc').value = ''; $('terr').textContent = msg || '';
+  $('tc').value = ''; $('terr').textContent = msg || ''; $('tsetup').hidden = true;
+  $('thint').textContent = 'Введи 6 цифр из приложения-аутентификатора.';
+  // админ включил двухфакторный вход, а приложение ещё не настроено — показать QR-код и ключ
+  try {
+    const r = await fetch('/api/login/2fa', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) { showLogin('Время на ввод кода вышло — войди заново'); return; }
+    if (j.need === 'setup') {
+      $('thint').textContent = 'Администратор включил двухфакторный вход. Добавь аккаунт в приложение '
+        + '(Google Authenticator, Яндекс Ключ…): отсканируй QR-код или введи ключ вручную — и введи 6 цифр, которые оно покажет.';
+      $('tqr').hidden = !j.qr; if (j.qr) $('tqr').src = j.qr;
+      $('tkey').textContent = j.secret.replace(/(.{4})/g, '$1 ').trim();
+      $('tsetup').hidden = false;
+    }
+  } catch (_) {}
   setTimeout(() => $('tc').focus(), 0);
 }
 $('tback').addEventListener('click', () => showLogin());
@@ -107,65 +121,6 @@ $('tfa-form').addEventListener('submit', async (e) => {
   } catch (_) { $('terr').textContent = 'Сервер недоступен'; }
   finally { btn.disabled = false; }
 });
-
-// настройка двухфакторного входа (у каждого пользователя своя)
-function tfaClose() { $('tfa').hidden = true; $('tfa-body').replaceChildren(); }
-async function tfaPost(path, body) {
-  const r = await api(path, { method: 'POST', body: body || {} });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) { $('tfa-err').textContent = j.error || ('Ошибка ' + r.status); return null; }
-  $('tfa-err').textContent = ''; return j;
-}
-function tfaBtn(text, cls, onClick) {
-  const b = el('button', cls || null, text); b.type = 'button';
-  b.onclick = async () => { b.disabled = true; try { await onClick(); } finally { b.disabled = false; } };
-  return b;
-}
-function tfaInput(label) {
-  const l = el('label', null, label), i = el('input');
-  i.autocomplete = 'one-time-code'; i.maxLength = 20; i.spellcheck = false; i.autocapitalize = 'off';
-  l.append(i); return [l, i];
-}
-async function tfaOpen() {
-  hideMenu();
-  $('tfa').hidden = false; $('tfa-err').textContent = '';
-  const r = await api('/api/2fa'); const s = await r.json();
-  s.on ? tfaShowOn(s) : tfaShowOff();
-}
-function tfaShowOff() {
-  $('tfa-body').replaceChildren(
-    el('p', null, 'Кроме пароля (или Google) вход будет спрашивать 6-значный код из приложения на телефоне: Google Authenticator, Яндекс Ключ, Microsoft Authenticator и т. п.'),
-    tfaBtn('Включить', null, tfaSetup));
-}
-async function tfaSetup() {
-  const j = await tfaPost('/api/2fa/setup'); if (!j) return;
-  const body = $('tfa-body'); body.replaceChildren();
-  body.append(el('p', null, j.qr ? '1. Отсканируй QR-код в приложении (или введи ключ вручную):' : '1. Добавь в приложение ключ:'));
-  if (j.qr) { const img = el('img', 'tfa-qr'); img.src = j.qr; img.alt = 'QR-код для приложения'; body.append(img); }
-  body.append(el('div', 'tfa-key', j.secret.replace(/(.{4})/g, '$1 ').trim()));
-  const [lab, inp] = tfaInput('2. Введи код, который показывает приложение');
-  const ok = tfaBtn('Подтвердить', null, async () => {
-    const r = await tfaPost('/api/2fa/enable', { code: inp.value }); if (r) tfaShowOn(true);
-  });
-  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') ok.click(); });
-  body.append(lab, ok); setTimeout(() => inp.focus(), 0);
-}
-function tfaShowOn(fresh) {
-  const [lab, inp] = tfaInput('Код из приложения');
-  const off = tfaBtn('Отключить', 'danger', async () => {
-    if (!confirm('Отключить двухфакторный вход? Дальше вход будет только по паролю (или через Google).')) return;
-    const r = await tfaPost('/api/2fa/disable', { code: inp.value }); if (r) tfaShowOff();
-  });
-  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') off.click(); });
-  $('tfa-body').replaceChildren(
-    el('p', null, fresh === true ? 'Готово, двухфакторный вход включён: после пароля (или Google) будет спрашиваться код из приложения.' : 'Включён.'),
-    el('p', 'hint', 'Если телефон потерян — администратор отключит двухфакторный вход в админке (или из консоли контейнера).'),
-    lab, off);
-  if (fresh !== true) setTimeout(() => inp.focus(), 0);
-}
-$('menu-2fa').addEventListener('click', () => tfaOpen());
-$('tfa-x').addEventListener('click', tfaClose);
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('tfa').hidden) { e.stopPropagation(); tfaClose(); } }, true);
 
 $('logout').addEventListener('click', async () => {
   try { await api('/api/logout', { method: 'POST' }); } catch (_) {}
