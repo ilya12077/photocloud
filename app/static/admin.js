@@ -227,27 +227,27 @@ async function loadUsers(force) {
   if (!force && POLL && (document.querySelector('#users .fold-edit') || (document.activeElement && document.activeElement.closest('#users')))) return;
   const r = await act(() => api('/api/admin/users')); if (!r) return;
   if (unchanged('users', r) && !force) return;
-  const tb = $('users').tBodies[0];
-  tb.replaceChildren(...r.users.map((u) => {
-    const tr = el('tr');
+  // карточка на пользователя: сверху логин, роль, дата и действия; ниже — настройки входа и доступа
+  const field = (label, val) => { const f = el('div', 'ufield'); f.append(el('div', 'ulab', label), val); return f; };
+  $('users').replaceChildren(...r.users.map((u) => {
+    const card = el('div', 'ucard');
     const role = el('select'); for (const [v, t] of [['user', 'пользователь'], ['admin', 'администратор']]) { const o = el('option', null, t); o.value = v; role.append(o); }
     role.value = u.role;
     role.onchange = () => act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/role`, { role: role.value }), 'Роль изменена').then((x) => { if (!x) role.value = u.role; });
     // внешние аккаунты для входа: Google и Яндекс ID — по email аккаунта
     const ext = (kind, title) => {
-      const td = el('td'), cur = u[kind];
-      td.append(el('span', 'gmail', cur || '—'), btn(cur ? 'изменить' : 'привязать', async () => {
+      const v = el('div', 'uval'), cur = u[kind];
+      v.append(el('span', cur ? 'gmail' : 'dim2', cur || 'не привязан'), btn(cur ? 'изменить' : 'привязать', async () => {
         const email = prompt(`Email аккаунта ${title} (пусто — отвязать):`, cur || '');
         if (email === null) return;
         await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/${kind}`, { email: email.trim() || null }),
           email.trim() ? `${title}: привязан` : `${title}: отвязан`);
         loadUsers(true);
       }));
-      return td;
+      return v;
     };
-    const g = ext('google', 'Google'), ya = ext('yandex', 'Яндекс ID');
-    const ops = el('td', 'ops');
-    ops.append(btn('пароль', async () => {
+    const ops = el('div', 'ops');
+    ops.append(btn('сменить пароль', async () => {
       const p = prompt(`Новый пароль для ${u.user} (от 8 символов). Все его сессии будут закрыты.`);
       if (p) act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/password`, { p }), 'Пароль изменён');
     }), btn('удалить', async () => {
@@ -255,16 +255,14 @@ async function loadUsers(force) {
       await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/delete`, {}), 'Пользователь удалён');
       loadUsers(true);
     }, 'danger'));
-    const tdRole = el('td'); tdRole.append(role);
+    const head = el('div', 'uhead');
+    head.append(el('span', 'uname', u.user), role, el('span', 'dim2', 'создан ' + dt(u.created)), ops);
     // папки: админ видит всё; пользователю — все или только выбранные (с подпапками)
-    const fd = el('td');
+    const fd = el('div', 'uval');
     if (u.role === 'admin') fd.append(el('span', 'dim2', 'все (админ)'));
-    else {
-      fd.append(el('span', null, foldersText(u)), ' ',
-        btn('изменить', () => editFolders(u, tr)));
-    }
+    else fd.append(el('span', null, foldersText(u)), btn('изменить', () => editFolders(u, card)));
     // может ли включать компьютер кнопкой «Запустить компьютер» (админ — всегда)
-    const wk = el('td');
+    const wk = el('div', 'uval');
     if (u.role === 'admin') wk.append(el('span', 'dim2', 'да (админ)'));
     else {
       const lab = el('label', 'wake-chk'), c = el('input'), txt = el('span');
@@ -275,31 +273,33 @@ async function loadUsers(force) {
       show(); lab.append(c, txt); wk.append(lab);
     }
     // двухфакторный вход: включает админ, приложение пользователь настраивает при следующем входе
-    const tf = el('td'), tfa = (mode, msg, ask) => btn(
+    const tf = el('div', 'uval'), tfa = (mode, msg, ask) => btn(
       { on: 'включить', reset: 'новый телефон', off: 'выключить' }[mode], async () => {
         if (ask && !confirm(ask)) return;
         await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/2fa`, { mode }), msg);
         loadUsers(true);
       }, mode === 'off' ? 'danger' : undefined);
-    if (u.totp === 'on') tf.append(el('span', null, 'вкл'), ' ',
+    if (u.totp === 'on') tf.append(el('span', 'on', 'включён'),
       tfa('reset', 'При следующем входе — настройка заново', `Сбросить приложение у ${u.user} (потерян или сменён телефон)? При следующем входе он настроит его заново.`),
       tfa('off', 'Двухфакторный вход выключен', `Выключить двухфакторный вход у ${u.user}? Дальше вход по паролю — без кода (через Google — как обычно).`));
-    else if (u.totp === 'pending') tf.append(el('span', 'dim2', 'настроит при входе'), ' ',
-      tfa('off', 'Двухфакторный вход выключен'));
-    else tf.append(tfa('on', 'Включено: при следующем входе появится настройка'));
+    else if (u.totp === 'pending') tf.append(el('span', 'dim2', 'настроит при входе'), tfa('off', 'Двухфакторный вход выключен'));
+    else tf.append(el('span', 'dim2', 'выключен'), tfa('on', 'Включено: при следующем входе появится настройка'));
     // ключи входа (passkey): создаёт сам пользователь на своём устройстве, когда админ предложил
-    const pk = el('td'), pka = (mode, text, msg, ask, cls) => btn(text, async () => {
+    const pk = el('div', 'uval'), pka = (mode, text, msg, ask, cls) => btn(text, async () => {
       if (ask && !confirm(ask)) return;
       await act(() => api(`/api/admin/users/${encodeURIComponent(u.user)}/passkey`, { mode }), msg);
       loadUsers(true);
     }, cls);
-    if (u.passkeys) pk.append(el('span', null, u.passkeys === 1 ? '1 ключ' : `${u.passkeys} ключ${u.passkeys < 5 ? 'а' : 'ей'}`), ' ');
-    if (u.passkey_offer) pk.append(el('span', 'dim2', 'создаст при входе'), ' ', pka('cancel', 'не предлагать', 'Не предлагать'));
-    else pk.append(pka('offer', u.passkeys ? 'ещё ключ' : 'предложить', 'При следующем входе появится предложение создать ключ'));
-    if (u.passkeys) pk.append(pka('delete', 'удалить ключи', 'Ключи удалены',
+    pk.append(u.passkeys ? el('span', 'on', u.passkeys === 1 ? '1 ключ' : `${u.passkeys} ключ${u.passkeys < 5 ? 'а' : 'ей'}`) : el('span', 'dim2', 'нет'));
+    if (u.passkey_offer) pk.append(el('span', 'dim2', 'создаст при входе'), pka('cancel', 'не предлагать', 'Не предлагать'));
+    else pk.append(pka('offer', u.passkeys ? 'добавить' : 'предложить', 'При следующем входе появится предложение создать ключ'));
+    if (u.passkeys) pk.append(pka('delete', 'удалить все', 'Ключи удалены',
       `Удалить все ключи входа ${u.user}? Войти по ключу он больше не сможет (пароль и Google остаются).`, 'danger'));
-    tr.append(el('td', 'mono', u.user), tdRole, fd, wk, g, ya, tf, pk, el('td', null, dt(u.created)), ops);
-    return tr;
+    const grid = el('div', 'ugrid');
+    grid.append(field('Папки', fd), field('Включать ПК', wk), field('Google', ext('google', 'Google')),
+      field('Яндекс ID', ext('yandex', 'Яндекс ID')), field('Двухфакторный вход', tf), field('Ключи входа (passkey)', pk));
+    card.append(head, grid);
+    return card;
   }));
 }
 
@@ -314,10 +314,10 @@ function foldersText(u) {
 
 // Галочки — просто удобство: отметил папку — отметились и вложенные (их можно снять),
 // снял — снялись. При сохранении из галочек получается «разрешённые + скрытые внутри».
-async function editFolders(u, tr) {
-  if (tr.nextElementSibling && tr.nextElementSibling.classList.contains('fold-edit')) { tr.nextElementSibling.remove(); return; }
+async function editFolders(u, card) {
+  const open = card.querySelector('.fold-edit'); if (open) { open.remove(); return; }
   if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
-  const row = el('tr', 'fold-edit'), td = el('td'); td.colSpan = 10; row.append(td);
+  const row = el('div', 'fold-edit'), td = row;
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
   allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');
@@ -355,7 +355,7 @@ async function editFolders(u, tr) {
   td.append(el('div', 'dim2', 'Отмеченная папка открыта вместе со всеми подпапками, кроме снятых. «Все папки» — всё, и новые папки тоже. Файлы прямо в корне — только при «все папки».'),
     all, box, summary);
   const bar = el('div', 'fold-btns'); bar.append(save, btn('отмена', () => row.remove())); td.append(bar);
-  tr.after(row);
+  card.append(row);
 }
 
 $('add-user').addEventListener('submit', async (e) => {
