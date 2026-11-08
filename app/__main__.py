@@ -31,7 +31,7 @@ def main() -> None:
 def command(s, args: list[str]) -> int:
     from .auth import UserError, UserStore
     modes = {"2fa-reset": ("reset", "сброшен: при следующем входе — настройка приложения заново"),
-             "2fa-off": ("off", "выключен: вход по паролю (или Google)")}
+             "2fa-off": ("off", "выключен: вход только по паролю")}
     if args[0] in modes and len(args) == 2:
         mode, done = modes[args[0]]
         users = UserStore(s.data_dir / "users.json")

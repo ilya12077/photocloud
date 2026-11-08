@@ -26,7 +26,6 @@ _DUMMY_HASH = _ph.hash(secrets.token_urlsafe(16))
 
 USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 ROLES = ("admin", "user")
-EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$")
 MIN_PASSWORD = 8
 
 
@@ -75,14 +74,12 @@ class UserStore:
             if not (USER_RE.match(name) and isinstance(rec, dict) and str(rec.get("hash", "")).startswith("$argon2")
                     and rec.get("role") in ROLES):
                 continue
-            g = rec.get("google")
             try:
                 folders = norm_folders(rec.get("folders"))
                 exclude = norm_folders(rec.get("exclude")) or []
             except UserError:
                 folders, exclude = [], []   # испорченная запись — безопаснее ничего, чем всё
             users[name] = {"hash": rec["hash"], "role": rec["role"], "created": float(rec.get("created", 0)),
-                           "google": g.lower() if isinstance(g, str) and EMAIL_RE.match(g) else None,
                            "folders": folders, "exclude": exclude,
                            "wake": rec.get("wake", True) is not False}
             sec = rec.get("totp")
@@ -123,7 +120,7 @@ class UserStore:
     def list(self) -> list[dict]:
         with self._mu:
             self._sync()
-        return [{"user": n, "role": r["role"], "created": int(r["created"]), "google": r.get("google"),
+        return [{"user": n, "role": r["role"], "created": int(r["created"]),
                  "folders": r.get("folders"), "exclude": r.get("exclude") or [], "wake": r.get("wake", True),
                  "totp": "on" if r.get("totp") else "pending" if r.get("totp_required") else "off"}
                 for n, r in sorted(self._u.items())]
@@ -223,27 +220,6 @@ class UserStore:
             self._u[name]["exclude"] = exclude
             self._save()
 
-    def by_google(self, email: str) -> tuple[str, str] | None:
-        email = email.lower()
-        for n, r in self._u.items():
-            if r.get("google") == email:
-                return n, r["role"]
-        return None
-
-    def set_google(self, name: str, email: str | None) -> None:
-        if email:
-            email = email.strip().lower()
-            if not EMAIL_RE.match(email):
-                raise UserError("неверный email")
-        with self._mu:
-            self._sync()
-            if name not in self._u:
-                raise UserError("нет такого пользователя")
-            if email and any(r.get("google") == email for n, r in self._u.items() if n != name):
-                raise UserError("этот Google-аккаунт уже привязан к другому пользователю")
-            self._u[name]["google"] = email or None
-            self._save()
-
     def verify(self, username: str, password: str) -> str | None:
         """Роль при верном пароле, иначе None. Время ответа не зависит от наличия логина."""
         with self._mu:
@@ -281,7 +257,7 @@ class UserStore:
             self._sync()
             if name in self._u:
                 raise UserError("такой пользователь уже есть")
-            self._u[name] = {"hash": h, "role": role, "created": time.time(), "google": None, "folders": None, "exclude": [], "wake": True}
+            self._u[name] = {"hash": h, "role": role, "created": time.time(), "folders": None, "exclude": [], "wake": True}
             self._save()
 
     def set_password(self, name: str, password: str) -> None:
