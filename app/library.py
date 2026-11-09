@@ -17,6 +17,7 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import meta
 from .storage import PLAYABLE_EXT, VIDEO_EXT
@@ -226,6 +227,7 @@ class Library:
         # фаза 3: подробности (камера, размеры, GPS) для панели «Подробнее» -> в базу
         self.info_reader = None       # p -> dict; задаёт main (читает файл с ПК)
         self.thumbstore = None        # эскизы фото в базе (ThumbStore); задаёт main
+        self.snapshot: Path | None = None   # последний список файлов на диске; задаёт main
         self.on_built = None          # () -> None; после каждого сканирования (main: повреждённые файлы)
         self.info_total = self.info_done = 0
         self.info_state = ""          # "" | running | stopped | done
@@ -310,6 +312,77 @@ class Library:
                 n += 1
         return n
 
+    def _scan(self, entries) -> tuple[list[Photo], list[str]]:
+        """(путь, размер, mtime) -> фото и папки; даты съёмки — из базы."""
+        folders: dict[str, int] = {"": 0}
+        folder_list = [""]
+        photos: list[Photo] = []
+        seen: set[str] = set()
+        for rel, size, mtime in entries:
+            folder, _, name = rel.rpartition("/")
+            if folder not in folders:
+                parts = folder.split("/")
+                for i in range(1, len(parts) + 1):
+                    f = "/".join(parts[:i])
+                    if f not in folders:
+                        folders[f] = len(folder_list)
+                        folder_list.append(f)
+            pid, salt = photo_id(rel), 0
+            while pid in seen:   # коллизия 48-битного хэша: редкость, но файлы не путаем
+                salt += 1
+                pid = photo_id(rel, salt)
+            seen.add(pid)
+            p = Photo(pid, rel, folders[folder], name, size, mtime, os.path.splitext(name)[1].lower())
+            p.named = meta.name_date(name, self.tz) or 0.0
+            p.year = meta.folder_year(rel) or 0
+            if p.year:
+                p.year_ts = datetime.datetime(p.year, 1, 1, 12, tzinfo=self.tz).timestamp()
+            c = self.cache.get(p.cache_key())
+            if c:
+                p.taken = c
+            photos.append(p)
+            self.progress = len(photos)
+        return photos, folder_list
+
+    # ------------------------------------------------------------ снимок списка на диске
+    # После перезапуска сервера с выключенным ПК лента сразу показывает последний список
+    # (эскизы — из базы); когда ПК включится, список пересоберётся как обычно.
+
+    def _save_snapshot(self, photos: list[Photo]) -> None:
+        if self.snapshot is None:
+            return
+        try:
+            data = json.dumps({"v": 1, "at": time.time(), "files": [[p.rel, p.size, p.mtime] for p in photos]},
+                              ensure_ascii=False, separators=(",", ":")).encode()
+            tmp = self.snapshot.with_name(self.snapshot.name + ".tmp")
+            tmp.write_bytes(gzip.compress(data, 6))
+            os.replace(tmp, self.snapshot)
+        except Exception as e:  # noqa: BLE001 — не записали: в следующий раз
+            log.warning("снимок списка не записан: %s", e)
+
+    def load_snapshot(self) -> bool:
+        """При запуске: показать последний список, пока ПК не просканирован. Список считается
+        устаревшим (stale) — при первом же включении ПК соберётся заново."""
+        if self.snapshot is None or self.state != "empty":
+            return False
+        try:
+            d = json.loads(gzip.decompress(self.snapshot.read_bytes()))
+            entries = [(str(r), int(sz), float(mt)) for r, sz, mt in d["files"]]
+        except FileNotFoundError:
+            return False
+        except Exception as e:  # noqa: BLE001
+            log.warning("снимок списка не читается: %s", e)
+            return False
+        photos, folder_list = self._scan(entries)
+        with self._lock:
+            if self.state != "empty":       # сканирование уже успело — оно свежее
+                return False
+            self._publish(photos, folder_list)
+            self.built_at, self.attempted_at, self.state = float(d.get("at") or 0), 0.0, "ready"
+        log.info("список из снимка: %d файлов (от %s)", len(photos),
+                 time.strftime("%d.%m.%Y %H:%M", time.localtime(self.built_at)))
+        return True
+
     def _publish(self, photos: list[Photo], folder_list: list[str]) -> None:
         self.pair_live(photos)
         everything = photos
@@ -384,35 +457,9 @@ class Library:
         self.meta_total = self.meta_done = 0
         t0 = self.attempted_at = time.time()
         try:
-            folders: dict[str, int] = {"": 0}
-            folder_list = [""]
-            photos: list[Photo] = []
-            seen: set[str] = set()
-            for rel, size, mtime in storage.walk():
-                folder, _, name = rel.rpartition("/")
-                if folder not in folders:
-                    parts = folder.split("/")
-                    for i in range(1, len(parts) + 1):
-                        f = "/".join(parts[:i])
-                        if f not in folders:
-                            folders[f] = len(folder_list)
-                            folder_list.append(f)
-                pid, salt = photo_id(rel), 0
-                while pid in seen:   # коллизия 48-битного хэша: редкость, но файлы не путаем
-                    salt += 1
-                    pid = photo_id(rel, salt)
-                seen.add(pid)
-                p = Photo(pid, rel, folders[folder], name, size, mtime, os.path.splitext(name)[1].lower())
-                p.named = meta.name_date(name, self.tz) or 0.0
-                p.year = meta.folder_year(rel) or 0
-                if p.year:
-                    p.year_ts = datetime.datetime(p.year, 1, 1, 12, tzinfo=self.tz).timestamp()
-                c = self.cache.get(p.cache_key())
-                if c:
-                    p.taken = c
-                photos.append(p)
-                self.progress = len(photos)
+            photos, folder_list = self._scan(storage.walk())
             self._publish(photos, folder_list)
+            self._save_snapshot(photos)
             self.skipped = getattr(storage, "skipped", 0)
             self.built_at, self.state, self.error = time.time(), "ready", ""
             log.info("индекс: %d файлов, %d папок за %.1fс, живых фото: %d", len(photos), len(folder_list),

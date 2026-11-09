@@ -213,6 +213,7 @@ async def lifespan(_app):
     global loop
     loop = asyncio.get_running_loop()
     log.info("Photocloud %s", config.app_version())
+    await run_in_threadpool(library.load_snapshot)     # ПК может быть выключен — показать последний список
     bg(_pc_watch())
     if FFMPEG:
         log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
@@ -1805,6 +1806,7 @@ def _info_from_file(p) -> dict:
 
 library.info_reader = _info_from_file      # фоновый сбор подробностей после сканирования
 library.thumbstore = pthumbs               # после сканирования — убрать эскизы пропавших файлов
+library.snapshot = S.data_dir / "index.json.gz"   # последний список — показать после перезапуска без ПК
 
 
 # ---- эскизы фото в базе (240 и 400): при просмотре — сами, «Посчитать эскизы фото» — все заранее
