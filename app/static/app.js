@@ -1467,6 +1467,9 @@ function show(i) {
   hi.classList.remove('ok'); hi.removeAttribute('src');
   if (shownBlob) { URL.revokeObjectURL(shownBlob); shownBlob = ''; }
   low.style.visibility = ''; low.src = imgUrl(thumbKind(), ph);     // уже в кэше браузера — мгновенно
+  // ПК выключен — лучше эскиза ничего не придёт: показываем его чётким, без размытия и загрузки
+  const pcOff = st.pc === 'down';
+  low.classList.toggle('sharp', pcOff);
   if (isVideo) {
     const v = $('v-video'); v.hidden = false; v.poster = imgUrl('m', ph);
     low.style.visibility = 'hidden'; $('v-spin').hidden = true;
@@ -1479,7 +1482,7 @@ function show(i) {
     //   3) полная версия 2048 — сервер готовит её заранее вместе с быстрой, из того же декода;
     //   4) соседние фото (быстрые версии).
     // Начали увеличивать — всё недогруженное обрывается и сразу грузится оригинал (goOriginal).
-    $('v-spin').hidden = false;
+    $('v-spin').hidden = pcOff;
     const full = previewKind();
     loadStep(ph, tok, 'q', `&n=${full}`).then(() => {
       if (tok !== V.token) return;
