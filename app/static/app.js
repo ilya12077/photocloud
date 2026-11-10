@@ -71,7 +71,7 @@ const LOGIN_ERRORS = {
 };
 
 async function showLogin(msg) {
-  stopPoll(); closeViewer(true); $('pk-offer').hidden = true;
+  stopPoll(); closeViewer(true); $('pk-offer').hidden = true; PK.auto = false;
   $('main').hidden = true; $('login').hidden = false;
   $('login-form').hidden = false; $('tfa-form').hidden = true;
   $('lerr').textContent = msg || '';
@@ -95,20 +95,65 @@ function pkCred(c) {      // ответ устройства -> JSON для се
 $('lkey').hidden = !PK_OK;
 // Safari (iPhone) разрешает ключ только сразу после нажатия: если перед вызовом ключа ждать ответа
 // сервера, он отказывает. Поэтому вызов от сервера (challenge) готовим заранее, пока открыт вход.
-const PK = { login: null, at: 0, reg: null };
+const PK = { login: null, at: 0, reg: null, cond: null, auto: false };
+// на этом устройстве уже входили по ключу (или создали его) — при входе предлагаем ключ сразу.
+// Значение — «Запомнить вход» с того раза: окно ключа появится раньше, чем успеешь нажать галочку.
+const PK_HAS = 'pc.pk';
+const pkHas = () => { try { return localStorage.getItem(PK_HAS); } catch (_) { return null; } };
+const pkSet = (v) => { try { if (v) localStorage.setItem(PK_HAS, v); else localStorage.removeItem(PK_HAS); } catch (_) {} };
+const pkStopCond = () => { if (PK.cond) { PK.cond.abort(); PK.cond = null; } };
 function pkPrepOpts(opt) {
   opt.challenge = b64u.dec(opt.challenge);
   if (opt.user) opt.user.id = b64u.dec(opt.user.id);
   for (const k of ['allowCredentials', 'excludeCredentials']) if (opt[k]) opt[k] = opt[k].map((c) => ({ ...c, id: b64u.dec(c.id) }));
   return opt;
 }
-async function pkLoginPrep() {
+async function pkLoginPrep(auto = true) {
+  pkStopCond();                // новый вызов от сервера — старый (в подсказке поля) уже не подойдёт
   PK.login = null;
   if (!PK_OK || $('login').hidden) return;
   try {
     const o = await api('/api/passkey/login/options', { method: 'POST', body: {}, allow401: true });
     if (o.ok) { PK.login = pkPrepOpts(await o.json()); PK.at = Date.now(); }
   } catch (_) {}
+  if (auto) pkAuto();
+}
+
+// Без нажатия: 1) ключ на устройстве есть — сразу окно ключа (раз за показ входа; Safari на
+// iPhone без нажатия не даёт — тогда тихо дальше); 2) ключ — в подсказке поля «Логин»
+// (на iPhone — над клавиатурой), если браузер так умеет.
+async function pkAuto() {
+  if (!PK.login || $('login').hidden || PK.cond) return;
+  const has = pkHas();
+  if (has && !PK.auto) {
+    PK.auto = true;
+    const opt = PK.login; PK.login = null;
+    let cred = null;
+    try { cred = await navigator.credentials.get({ publicKey: opt }); } catch (_) {}   // отменили — без ошибки
+    if (cred) { pkFinish(cred, has === 'r'); return; }
+    pkLoginPrep(); return;
+  }
+  let ok = false;
+  try { ok = !!(PublicKeyCredential.isConditionalMediationAvailable && await PublicKeyCredential.isConditionalMediationAvailable()); } catch (_) {}
+  if (!ok || !PK.login || PK.cond) return;
+  const ctl = new AbortController(); PK.cond = ctl;
+  let cred = null;
+  try { cred = await navigator.credentials.get({ publicKey: PK.login, mediation: 'conditional', signal: ctl.signal }); } catch (_) {}
+  if (PK.cond === ctl) PK.cond = null;
+  if (cred) { PK.login = null; pkFinish(cred, $('lr').checked); }
+}
+
+async function pkFinish(cred, remember) {
+  const btn = $('lkey'); btn.disabled = true; $('lerr').textContent = '';
+  try {
+    const r = await api('/api/passkey/login', { method: 'POST', body: { credential: pkCred(cred), r: remember }, allow401: true });
+    if (r.ok) { pkSet(remember ? 'r' : '1'); await enter(); return; }
+    if (r.status !== 429) pkSet(null);           // ключ удалили — больше не предлагаем сразу
+    $('lerr').textContent = r.status === 429 ? 'Слишком много попыток, подожди 15 минут'
+      : 'Этот ключ не подошёл (возможно, его удалил администратор)';
+    pkLoginPrep();
+  } catch (_) { $('lerr').textContent = 'Сервер недоступен'; }
+  finally { btn.disabled = false; }
 }
 const pkFresh = () => PK.login && Date.now() - PK.at < 4 * 60 * 1000;   // сервер помнит вызов 5 минут
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('login').hidden && !pkFresh()) pkLoginPrep(); });
@@ -116,10 +161,11 @@ $('lkey').addEventListener('click', async () => {
   const btn = $('lkey'); $('lerr').textContent = '';
   if (!pkFresh()) {
     // вызов не готов (сеть) — получить и попросить нажать ещё раз: так Safari не откажет
-    btn.disabled = true; await pkLoginPrep(); btn.disabled = false;
+    btn.disabled = true; await pkLoginPrep(false); btn.disabled = false;
     if (!PK.login) { $('lerr').textContent = 'Вход по ключу сейчас недоступен'; return; }
     if (/iPhone|iPad|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document) { $('lerr').textContent = 'Нажми «Войти по ключу» ещё раз'; return; }
   }
+  pkStopCond();                                                              // ключ в подсказке поля — убрать
   const opt = PK.login; PK.login = null;
   let cred;
   try { cred = await navigator.credentials.get({ publicKey: opt }); }        // первым делом — сразу после нажатия
@@ -128,15 +174,7 @@ $('lkey').addEventListener('click', async () => {
       : 'Вход по ключу не удался' + (e && e.name ? ` (${e.name})` : '');
     pkLoginPrep(); return;
   }
-  btn.disabled = true;
-  try {
-    const r = await api('/api/passkey/login', { method: 'POST', body: { credential: pkCred(cred), r: $('lr').checked }, allow401: true });
-    if (r.ok) { await enter(); return; }
-    $('lerr').textContent = r.status === 429 ? 'Слишком много попыток, подожди 15 минут'
-      : 'Этот ключ не подошёл (возможно, его удалил администратор)';
-    pkLoginPrep();
-  } catch (_) { $('lerr').textContent = 'Сервер недоступен'; }
-  finally { btn.disabled = false; }
+  pkFinish(cred, $('lr').checked);
 });
 
 // предложение админа создать ключ на этом устройстве — после входа
@@ -178,7 +216,8 @@ $('pk-create').addEventListener('click', async () => {
     const k = await r.json().catch(() => ({}));
     if (!r.ok) { $('pk-err').textContent = k.error || ('Ошибка ' + r.status); pkRegPrep(); return; }
     st.me.passkey_offer = false; $('pk-offer').hidden = true;
-    banner('Ключ входа создан — в следующий раз нажми «Войти по ключу»');
+    if (!pkHas()) pkSet('1');
+    banner('Ключ входа создан — в следующий раз он предложится сам');
     setTimeout(() => { if (/^Ключ входа создан/.test($('banner-text').textContent)) banner(null); }, 5000);
   } catch (_) { $('pk-err').textContent = 'Сервер недоступен'; }
   finally { btn.disabled = false; }
@@ -255,7 +294,7 @@ $('tfa-form').addEventListener('submit', async (e) => {
 $('logout').addEventListener('click', async () => {
   try { await api('/api/logout', { method: 'POST' }); } catch (_) {}
   st.lib = null; clearGrid(); $('folders').replaceChildren(); hideMenu();
-  showLogin();
+  showLogin(); PK.auto = true;          // вышел сам — окно ключа сразу не открываем (кнопка и подсказка остаются)
 });
 
 async function enter() {
