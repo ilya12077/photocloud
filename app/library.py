@@ -221,6 +221,7 @@ class Library:
         self.error = ""
         self.built_at = 0.0
         self.attempted_at = 0.0
+        self.retry_at = 0.0           # после временного обрыва SMB повторить через 30 с
         self.progress = 0
         self.meta_total = 0           # сколько файлов надо дочитать
         self.meta_done = 0
@@ -275,6 +276,8 @@ class Library:
     def stale(self, ttl: int) -> bool:
         if self.busy():
             return False
+        if self.retry_at:
+            return time.time() >= self.retry_at
         if self.state == "empty":
             return True
         age = time.time() - self.attempted_at
@@ -452,6 +455,7 @@ class Library:
     # ------------------------------------------------------------ сборка
 
     def _build(self, storage, on_error) -> None:
+        from .storage import is_connection_error
         prev_state = self.state
         self.state, self.progress = "building", 0
         self.meta_total = self.meta_done = 0
@@ -462,14 +466,24 @@ class Library:
             self._save_snapshot(photos)
             self.skipped = getattr(storage, "skipped", 0)
             self.built_at, self.state, self.error = time.time(), "ready", ""
+            self.retry_at = 0.0
             log.info("индекс: %d файлов, %d папок за %.1fс, живых фото: %d", len(photos), len(folder_list),
                      time.time() - t0, sum(1 for p in photos if p.live and not p.video))
         except Exception as e:  # noqa: BLE001
-            log.exception("ошибка индексации")
-            self.error = type(e).__name__
-            self.state = "ready" if prev_state == "ready" and self.by_id else "error"
-            if on_error:
-                on_error(self.error)
+            if is_connection_error(e):
+                # ПК уснул/выключился во время обхода. Сохраняем прежний индекс,
+                # не шлём ложную тревогу об ошибке и пробуем снова позднее.
+                log.info("индексация отложена: временный обрыв SMB (%s)", type(e).__name__)
+                self.error = ""
+                self.state = "ready" if self.by_id else "empty"
+                self.retry_at = time.time() + 30
+            else:
+                log.exception("ошибка индексации")
+                self.error = type(e).__name__
+                self.state = "ready" if prev_state == "ready" and self.by_id else "error"
+                self.retry_at = 0.0
+                if on_error:
+                    on_error(self.error)
             return
 
         # ---- фаза 2: даты съёмки

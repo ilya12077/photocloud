@@ -26,6 +26,12 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v3
       
+      - name: Check syntax and offline regression tests
+        run: |
+          python -m compileall -q app
+          node --check app/static/app.js
+          python -m unittest discover -s tests -v
+
       - name: Log in to Docker Hub
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
         with:

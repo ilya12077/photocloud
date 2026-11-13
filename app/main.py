@@ -1568,6 +1568,36 @@ class Perf:
                 "requests": total, "workers": S.workers, "inflight": len(inflight), "waiting": sched.waiting + sched_video.waiting}
 
 
+async def _offline_thumbnail(p, kind: str) -> Response | None:
+    """Без ПК используем сохранённый меньший эскиз, если крупного нет.
+
+    Не кэшируем ответ как полноценный t/m: после включения ПК нормальное
+    разрешение снова доступно по тому же URL.
+    """
+    if kind not in ("t", "m"):
+        return None
+    kinds = ("t", "s") if kind == "m" else ("s",)
+    for smaller in kinds:
+        key = (smaller, p.id, p.mtime, p.size)
+        data = thumb_cache.get(key)
+        if data is None:
+            try:
+                if p.video:
+                    if smaller != "s":
+                        continue
+                    data = await run_in_threadpool(db.vthumb_get, p.cache_key(), S.image_format)
+                else:
+                    data = await run_in_threadpool(pthumbs.get, p.cache_key(), _pkind(smaller))
+            except Exception as e:  # noqa: BLE001
+                log.warning("офлайн-эскиз не читается (%s)", type(e).__name__)
+                continue
+        if data is not None:
+            return Response(data, media_type="image/webp" if S.image_format == "webp" else "image/jpeg",
+                            headers={"cache-control": "private, no-store",
+                                     "x-photocloud-fallback": smaller})
+    return None
+
+
 async def rendered(request: Request, kind: str, pid: str, s: Session) -> Response:
     p = library.get(pid)
     if not visible(s, p):
@@ -1623,7 +1653,10 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
                 except ClientGone:
                     continue   # тот, кто генерировал, ушёл — попробуем сами
             if not await PC.is_up():
-                # ПК выключен: отвечаем сразу, а не ждём таймаутов SMB на каждой плитке
+                # Крупный эскиз может отсутствовать, но маленький уже сохранён.
+                fallback = await _offline_thumbnail(p, kind)
+                if fallback is not None:
+                    return fallback
                 raise HTTPException(503, "pc")
             fut = loop.create_future()
             fut.add_done_callback(lambda f: f.cancelled() or f.exception())
@@ -1637,9 +1670,10 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
                 except Gone:
                     raise ClientGone from None
                 if not await PC.is_up():
-                    # ПК выключился, пока запрос стоял в очереди
+                    # ПК выключился в очереди: обработчик ConnectionError отдаст
+                    # сохранённый маленький эскиз, если он есть.
                     lane.release()
-                    raise HTTPException(503, "pc")
+                    raise ConnectionError("pc down")
                 try:
                     tm = {"queue": (time.perf_counter() - tq) * 1000}
                     t0 = time.perf_counter()
@@ -1692,6 +1726,9 @@ async def rendered(request: Request, kind: str, pid: str, s: Session) -> Respons
         if e.__cause__ is not None and is_missing(e.__cause__):
             raise _gone(p) from None             # эскиз удалённого файла: 404, а не «ПК выключен»
         PC.suspect()
+        fallback = await _offline_thumbnail(p, kind)
+        if fallback is not None:
+            return fallback
         raise HTTPException(503, "pc") from None
     except video.NoVideo:
         # только звук: в ленте такого файла больше не будет
