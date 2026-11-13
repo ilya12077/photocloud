@@ -20,9 +20,9 @@ def production_function(path, name, owner=None, globals_=None):
     if owner:
         body = next(n for n in body if isinstance(n, ast.ClassDef) and n.name == owner).body
     node = next(n for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
-    code = compile(ast.Module(body=[ast.ImportFrom(module="__future__",
-                           names=[ast.alias(name="annotations")], level=0), node], type_ignores=[]),
-                   path, "exec")
+    module = ast.Module(body=[ast.ImportFrom(module="__future__",
+                           names=[ast.alias(name="annotations")], level=0), node], type_ignores=[])
+    code = compile(ast.fix_missing_locations(module), path, "exec")
     scope = dict(globals_ or {})
     exec(code, scope)
     return scope[name]
