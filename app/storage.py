@@ -43,6 +43,9 @@ _RECONNECT_NT = {
     0xC000013C,  # STATUS_REMOTE_DISCONNECT
     0xC0000241,  # STATUS_CONNECTION_ABORTED
     0xC0000236,  # STATUS_CONNECTION_REFUSED
+    0xC00000B5,  # STATUS_IO_TIMEOUT
+    0xC00000C4,  # STATUS_UNEXPECTED_NETWORK_ERROR
+    0xC00000D6,  # STATUS_VIRTUAL_CIRCUIT_CLOSED
 }
 NT_REQUEST_NOT_ACCEPTED = 0xC00000D0   # Windows: исчерпан лимит входящих SMB-подключений
 
@@ -52,6 +55,13 @@ def _ntstatus(e: BaseException) -> int | None:
     if v is None and e.__cause__ is not None:
         v = getattr(e.__cause__, "status", None)
     return v
+
+
+def is_connection_error(e: BaseException) -> bool:
+    """Разрыв SMB/сети: не ошибка содержимого архива и не повод сбрасывать индекс."""
+    return (isinstance(e, (ConnectionError, TimeoutError))
+            or _ntstatus(e) in _RECONNECT_NT
+            or (isinstance(e, ValueError) and isinstance(e.__cause__, OSError)))
 
 
 def _not_connection_error(e: BaseException) -> bool:
@@ -392,10 +402,14 @@ class SMBStorage:
                 raise
             if isinstance(e, GateBusy) or _not_connection_error(e) or _is_credit_error(e):
                 raise
-            # переподключаемся не чаще раза в 10 с и одним потоком: остальные просто повторяют
-            if time.time() - self._reset_at > 10:
-                log.info("SMB: переподключение (%s)", type(e).__name__)
-                self._reset_locked()
+            # При NETWORK_NAME_DELETED прежний tree/session handle невалиден.
+            # Если соединение недавно сбрасывали, не повторяем запрос по тому же
+            # сломанному подключению и не создаём шторм SMB-сессий.
+            delay = 2 if _ntstatus(e) in _RECONNECT_NT else 10
+            if time.time() - self._reset_at <= delay:
+                raise
+            log.info("SMB: переподключение (%s)", type(e).__name__)
+            self._reset_locked()
             self._session()
             return fn()
 

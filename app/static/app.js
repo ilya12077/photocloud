@@ -331,7 +331,11 @@ async function enter() {
   readRoute(); initZoom();
   poll();
   const early = await st.libPromise; st.libPromise = null;
-  if (early && early.ok && !st.lib) await loadLibrary(early);
+  // Если ранний запрос не удался, пробуем снова сразу, не дожидаясь опроса статуса.
+  if (!st.lib) {
+    try { await loadLibrary(early && early.ok ? early : undefined); }
+    catch (e) { if (e.message === 'auth') throw e; }
+  }
 }
 
 // ================================================================== меню / настройки клиента
@@ -499,6 +503,9 @@ async function loadLibraryInner(pre) {
   st.parent = parent;
   if (!st.folderIdx.has(st.folder)) st.folder = '';
   render();
+  // После первого layout браузер может уточнить положение сетки под папками.
+  // Повторно запрашиваем видимые плитки без необходимости обновлять страницу.
+  requestAnimationFrame(() => { if (st.lib === lib && !$('main').hidden) draw(false); });
   if ($('banner-text').textContent.startsWith('Загружаю')) banner(null);
   if (!st.placed) { st.placed = true; restorePlace(loadPlace()); }   // первая загрузка — туда, где был
 }
