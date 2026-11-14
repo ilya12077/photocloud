@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.6"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.7"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -420,7 +420,7 @@ class State:
         self.path = d / "state.db"
         self.con = sqlite3.connect(lp(self.path), check_same_thread=False, isolation_level=None, timeout=10)
         self.con.execute("PRAGMA journal_mode=WAL")
-        self.con.execute("PRAGMA synchronous=NORMAL")
+        self.con.execute("PRAGMA synchronous=FULL")
         self.con.execute("""CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
             sha TEXT NOT NULL, copied REAL NOT NULL) WITHOUT ROWID""")
@@ -431,7 +431,18 @@ class State:
         if "verified" not in cols:            # когда копию последний раз сверяли с хешем (клиент 1.2+)
             self.con.execute("ALTER TABLE files ADD COLUMN verified REAL NOT NULL DEFAULT 0")
             self.con.execute("UPDATE files SET verified = copied")
+        self.con.execute("CREATE TABLE IF NOT EXISTS pending_files(path TEXT PRIMARY KEY)")
         self.mu = threading.Lock()
+
+    def pending(self):
+        with self.mu:
+            return [p for (p,) in self.con.execute("SELECT path FROM pending_files")]
+
+    def journal(self, paths, done=False):
+        sql = "DELETE FROM pending_files WHERE path=?" if done else "INSERT OR IGNORE INTO pending_files VALUES(?)"
+        with self.mu, self.con:
+            self.con.execute("BEGIN")
+            self.con.executemany(sql, [(p,) for p in paths])
 
     def get(self, path: str) -> tuple[int, int, str] | None:
         with self.mu:
@@ -451,7 +462,7 @@ class State:
 
     def put_many(self, rows) -> None:
         """rows: (path, size, mtime, sha, ts)"""
-        with self.mu:
+        with self.mu, self.con:
             self.con.execute("BEGIN")
             self.con.executemany(self._PUT, [(*r, r[4]) for r in rows])
             self.con.execute("COMMIT")
@@ -840,6 +851,20 @@ class Engine(threading.Thread):
             self.db.kv_set("rebuild_pending", 1)       # пересчёт уже скопированного — в цикле, с паузой
         return True
 
+    def _recover_pending(self):
+        with self._fmu:
+            for path in self.db.pending():
+                file = self._arch(path)
+                try:
+                    st_file = os.stat(lp(file))
+                    digest = self._sha(file)
+                except FileNotFoundError:
+                    self.db.drop(path)
+                else:
+                    self.db.put(path, st_file.st_size, int(st_file.st_mtime), digest)
+                self.db.journal([path], done=True)
+                self._idle = False
+
     def _loop_once(self) -> None:
         if self._reload and not self._open():
             self._sleep(3600)
@@ -855,6 +880,7 @@ class Engine(threading.Thread):
         if self.db.kv_get("rebuild_pending"):
             self._rebuild_db()
             self.db.kv_set("rebuild_pending", None)
+        self._recover_pending()
         st = self.api.status()
         self._set(server=st.get("server", ""))
         self._restore_n = int(st.get("restore") or 0)          # файлы на ПК, которые просят восстановить
@@ -942,12 +968,16 @@ class Engine(threading.Thread):
             if self._halted():
                 raise Stop()
             with self._fmu:
+                self.db.journal([src, dst])
                 self._move(src, files[dst])
+                self.db.journal([src, dst], done=True)
         for src, dst in copies:
             if self._halted():
                 raise Stop()
             with self._fmu:
+                self.db.journal([dst])
                 self._copy_local(src, files[dst])
+                self.db.journal([dst], done=True)
         if not m.get("complete"):
             confirmed = set(m.get("confirmed_deleted", ()))
             deletes = [p for p in deletes if p in confirmed]
@@ -1482,11 +1512,13 @@ class Engine(threading.Thread):
             a = self._arch(p)
             with self._fmu:
                 try:
+                    self.db.journal([p])
                     dst = self._aside(a, DELETED, p) if os.path.exists(lp(a)) else None
                 except OSError as e:
                     self._error(p, f"не перенести в «{DELETED}»: {e}")
                     continue
                 self.db.drop(p)
+                self.db.journal([p], done=True)
             self.db.event("delete", p, str(dst or ""))
             self._note(f"удалён на компьютере → «{DELETED}»", "delete", p)
             self._prune_dirs(a.parent)
@@ -1538,12 +1570,14 @@ class Engine(threading.Thread):
         os.makedirs(lp(b.parent), exist_ok=True)
         replaced = False
         with self._fmu:
+            self.db.journal([rel])
             if os.path.exists(lp(b)):
                 self._aside(b, VERSIONS, rel)
                 replaced = True
             os.replace(lp(tmp), lp(b))
             self._set_mtime(b, mtime)
             self.db.put(rel, size, mtime, sha)
+            self.db.journal([rel], done=True)
         self.db.event("update" if replaced else "copy", rel, str(size))
         self._inc(copied=1, copied_bytes=size)
         if replaced:

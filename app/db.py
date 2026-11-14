@@ -297,6 +297,19 @@ class DB:
         self.many("INSERT OR REPLACE INTO delete_marks (path, key, sha, by, at) VALUES (?, ?, ?, ?, ?)",
                   [(p, k, h, by, now) for p, k, h in rows])
 
+    def clear_marks(self, paths, unhide):
+        rows = [(p,) for p in paths]
+        with self.mu:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                self.con.executemany("DELETE FROM delete_marks WHERE path=?", rows)
+                if unhide:
+                    self.con.executemany("DELETE FROM user_hidden WHERE path=?", rows)
+                self.con.execute("COMMIT")
+            except BaseException:
+                self.con.execute("ROLLBACK")
+                raise
+
     def marks_delete(self, paths: list[str]) -> None:
         self.many("DELETE FROM delete_marks WHERE path = ?", [(p,) for p in paths])
 

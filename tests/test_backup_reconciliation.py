@@ -63,3 +63,25 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(journal(restarted), [item])
             load(restarted)
             self.assertEqual(journal(restarted), [])
+
+    def test_disk_move_committed_before_database_recovers_offline(self):
+        import hashlib
+        import threading
+        import os
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            old, new = root / "a", root / "b"
+            old.write_bytes(b"photo")
+            old.rename(new)
+            engine = Mock()
+            engine._fmu = threading.Lock()
+            engine._arch.side_effect = lambda p: root / p
+            engine._sha.side_effect = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+            engine.db.pending.return_value = ["a", "b"]
+            recover = production_function("backup/photocloud_backup.pyw", "_recover_pending", "Engine",
+                                          dict(os=os, lp=str))
+            recover(engine)
+            engine.db.drop.assert_called_once_with("a")
+            engine.db.put.assert_called_once_with("b", 5, int(new.stat().st_mtime), engine._sha(new))
+            self.assertEqual(engine.db.journal.call_count, 2)

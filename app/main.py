@@ -1083,7 +1083,6 @@ async def unhide_photos(request: Request, s: Session = Depends(require_user)):
         who = [w for w, d in list(mine.hidden.items()) if drop & d.keys()] if admin else [s.user]
         with mine.mu:
             for w in who:
-                db.hidden_delete(w, paths)
                 mine.hidden[w] = {k: v for k, v in mine.hidden.get(w, {}).items() if k not in drop}
                 mine.changed(w)
         if admin:
@@ -1298,15 +1297,14 @@ async def pc_unmark(request: Request, _: dict = Depends(require_pc)):
 def _pc_drop(paths: list[str], unhide: bool) -> None:
     """Снять пометку «на удаление»; unhide — ещё и «скрыто» у всех, кто скрыл."""
     global _marks
-    db.marks_delete(paths)
-    _marks = db.marks_load()
-    if not unhide:
-        return
     drop = set(paths)
     with mine.mu:
+        db.clear_marks(paths, unhide)
+        _marks = db.marks_load()
+        if not unhide:
+            return
         for w, hd in list(mine.hidden.items()):
             if drop & hd.keys():
-                db.hidden_delete(w, paths)
                 mine.hidden[w] = {k: v for k, v in hd.items() if k not in drop}
                 mine.changed(w)
 
@@ -2215,7 +2213,7 @@ def _damaged_state(path: str, state: str, note: str = "", restored: str | None =
             d["restored"] = restored
         db.damaged_put(d)
         if state not in ("found", "nosource"):       # недокачанная копия больше не нужна
-            (RESTORE_TMP / (d["sha_good"] + ".part")).unlink(missing_ok=True)
+            _part_path(d).unlink(missing_ok=True)
         _bump_list()
         return d
 
@@ -2629,7 +2627,8 @@ def _restore_item(t, path: str) -> dict:
 
 
 def _part_path(d: dict) -> Path:
-    return RESTORE_TMP / (d["sha_good"] + ".part")
+    key = hashlib.sha256((d["path"] + chr(0) + d["sha_good"]).encode()).hexdigest()
+    return RESTORE_TMP / (key + ".part")
 
 
 @app.get("/api/backup/restore")
@@ -2649,6 +2648,17 @@ async def backup_restore_put(request: Request, path: str = "", offset: int = -1,
     """Кусок правильной копии. Принимается только для файла, который сервер сам пометил
     испорченным, только по порядку и не больше записанного размера; целиком — только если
     хеш равен правильному. Путь записи на ПК берётся из базы, не от клиента."""
+    async with _restore_locks[int.from_bytes(hashlib.sha256(path.encode()).digest()[:2], "big") % len(_restore_locks)]:
+        await run_in_threadpool(_restore_item, t, path)
+        if path in _writing:
+            return no_store(JSONResponse({"done": True, "writing": True}))
+        return await _accept_restore_chunk(request, path, offset, t)
+
+
+_restore_locks = [asyncio.Lock() for _ in range(64)]
+
+
+async def _accept_restore_chunk(request, path, offset, t):
     d = await run_in_threadpool(_restore_item, t, path)
     part = _part_path(d)
     have = part.stat().st_size if part.exists() else 0
@@ -2706,10 +2716,11 @@ async def _restore_write(path: str, part: Path, d: dict, client: str, user: str,
         log.warning("восстановление %s: запись на ПК не удалась: %s", path, e)
         await run_in_threadpool(_damaged_state, path, "found", f"запись в Restored не удалась: {type(e).__name__}")
         return
+    else:
+        await run_in_threadpool(_damaged_state, path, "restored", "", where)
+        part.unlink(missing_ok=True)
     finally:
         _writing.discard(path)
-    part.unlink(missing_ok=True)
-    await run_in_threadpool(_damaged_state, path, "restored", "", where)
     log.info("восстановлен %s → %s/%s (копия от «%s»)", path, RESTORED, where, client)
     audit("damaged_restored", user, ip, f"{path} → {RESTORED}/{where}, копия от «{client}»")
     _notify("damaged", f"Восстановлена правильная копия «{clean(path, 120)}» → {RESTORED}\\{clean(where, 120)}. "
