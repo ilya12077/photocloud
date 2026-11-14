@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class StartupTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows desktop agent is tested on the required Windows runner")
     def test_paired_agent_loads_marks(self):
         import httpx
         import tkinter as tk

@@ -37,12 +37,26 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v3
       
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Check syntax and offline regression tests
         run: |
-          python -m pip install httpx
+          python -m pip install -r app/requirements.txt
           python -m compileall -q app
           node --check app/static/app.js
           python -m unittest discover -s tests -v
+
+      - name: Start PhotoCloud and check HTTP responses
+        run: |
+          mkdir -p "$RUNNER_TEMP/photos"
+          export STORAGE=local LOCAL_ROOT="$RUNNER_TEMP/photos" DATA_DIR="$RUNNER_TEMP/photocloud-data" REQUIRE_PROXY=false
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 18099 > "$RUNNER_TEMP/server.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          curl --retry 20 --retry-connrefused --retry-delay 1 -fsS http://127.0.0.1:18099/admin -o "$RUNNER_TEMP/admin.html" || { tail -30 "$RUNNER_TEMP/server.log" | sed '/setup=/d'; exit 1; }
+          grep -q 'id="bk-tokens"' "$RUNNER_TEMP/admin.html"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18099/api/pc/marks)" = 401
 
       - name: Log in to Docker Hub
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
