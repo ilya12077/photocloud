@@ -64,6 +64,7 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
+db.run("CREATE TABLE IF NOT EXISTS backup_deleted(path TEXT PRIMARY KEY, at REAL NOT NULL)")
 pthumbs = ThumbStore(S.data_dir / "thumbs.db")      # эскизы фото 240/400 — отдельный файл
 library = Library(S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
@@ -1336,6 +1337,9 @@ async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
     except PcError as e:
         return _pc_fail(request, "удаление", e, 403)
     paths = [i["path"] for i in items if i["path"] in _marks]
+    if paths:
+        await run_in_threadpool(db.many, "INSERT OR REPLACE INTO backup_deleted(path, at) VALUES(?, ?)",
+                                [(path, time.time()) for path in paths])
     await run_in_threadpool(_pc_drop, paths, True)
     audit("pc_deleted", "клиент ПК", ip_of(request), f"в корзину на ПК: {len(paths)}: {', '.join(paths[:3])}")
     if paths:
@@ -2450,8 +2454,10 @@ async def backup_manifest(request: Request, damaged: int = 0, t=Depends(require_
     n_hashes = await run_in_threadpool(db.hashes_count)
     gen = await run_in_threadpool(db.kv_get, "hash_gen")       # растёт, когда проверка нашла изменённый файл
     ver = library.version
+    deleted = dict(await run_in_threadpool(db.run, "SELECT path, at FROM backup_deleted WHERE at >= ?", (library.built_at,)))
+    complete = bool(ver) and library.state == "ready" and not library.skipped and not library.error
     modern = damaged == 1
-    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{gen}|{access!r}|{library.skipped}|{int(modern)}".encode(),
+    tag = hashlib.blake2b(f"{ver}|{n_hashes}|{gen}|{access!r}|{complete}|{sorted(deleted)}|{int(modern)}".encode(),
                           digest_size=10).hexdigest()
     etag = f'"{tag}"'
     if ver and request.headers.get("if-none-match") == etag:
@@ -2462,7 +2468,7 @@ async def backup_manifest(request: Request, damaged: int = 0, t=Depends(require_
     def build() -> bytes:
         files, bad = [], []
         for p in library.by_id.values():
-            if not folder_ok(p.rel, access):
+            if p.rel in deleted or not folder_ok(p.rel, access):
                 continue
             sha = hashes.get(p.cache_key())          # у испорченного — прежний, правильный хеш
             if p.rel in bad_all:
@@ -2471,7 +2477,7 @@ async def backup_manifest(request: Request, damaged: int = 0, t=Depends(require_
                     sha = None
             files.append([p.rel, p.size, int(p.mtime), int(p.date), sha])
         out = {"v": tag, "index_version": ver,
-               "complete": bool(ver) and library.state == "ready" and not library.skipped and not library.error,
+               "complete": complete, "confirmed_deleted": sorted(p for p in deleted if folder_ok(p, access)),
                "files": files}
         if modern:
             out["damaged"] = sorted(bad)

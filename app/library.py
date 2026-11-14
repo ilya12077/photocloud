@@ -355,7 +355,7 @@ class Library:
         if self.snapshot is None:
             return
         try:
-            data = json.dumps({"v": 1, "at": time.time(), "files": [[p.rel, p.size, p.mtime] for p in photos]},
+            data = json.dumps({"v": 2, "at": self.attempted_at, "skipped": self.skipped, "files": [[p.rel, p.size, p.mtime] for p in photos]},
                               ensure_ascii=False, separators=(",", ":")).encode()
             tmp = self.snapshot.with_name(self.snapshot.name + ".tmp")
             tmp.write_bytes(gzip.compress(data, 6))
@@ -380,6 +380,7 @@ class Library:
         with self._lock:
             if self.state != "empty":       # сканирование уже успело — оно свежее
                 return False
+            self.skipped = int(d.get("skipped", 1))
             self._publish(photos, folder_list)
             self.built_at, self.attempted_at, self.state = float(d.get("at") or 0), 0.0, "ready"
         log.info("список из снимка: %d файлов (от %s)", len(photos),
@@ -463,9 +464,9 @@ class Library:
         try:
             photos, folder_list = self._scan(storage.walk())
             self._publish(photos, folder_list)
-            self._save_snapshot(photos)
             self.skipped = getattr(storage, "skipped", 0)
-            self.built_at, self.state, self.error = time.time(), "ready", ""
+            self._save_snapshot(photos)
+            self.built_at, self.state, self.error = t0, "ready", ""
             self.retry_at = 0.0
             log.info("индекс: %d файлов, %d папок за %.1fс, живых фото: %d", len(photos), len(folder_list),
                      time.time() - t0, sum(1 for p in photos if p.live and not p.video))

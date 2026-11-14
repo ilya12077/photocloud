@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.4"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.5"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -864,18 +864,12 @@ class Engine(threading.Thread):
         if self._want_wake and st["pc"] == "up":
             self._note("«Разбудить ПК»: компьютер уже включён")
         self._want_wake = False
-        if st["pc"] != "up":
-            waking = st["pc"] == "waking"
-            self._set(state="pc_off", text="Компьютер просыпается…" if waking else "Компьютер выключен",
-                      detail="Копирование продолжится, когда он включится", current="", speed=0.0)
-            self._report("pc_off")
-            more = self._verify_slice()        # проверке копий ПК не нужен — можно и сейчас
-            self._sleep(0 if more else (15 if waking else PC_OFF_EVERY))
-            return
-        self._woke = True              # ПК уже включён — будить при запуске не нужно
-        if self._pass():
+        online = st["pc"] == "up"
+        if online:
+            self._woke = True
+        if self._pass(online):
             # всё скопировано — в свободное время проверяем уже скопированное (кусками по 20 с)
-            more = self._verify_slice() if self.st["state"] in ("done", "waiting") else False
+            more = self._verify_slice() if self.st["state"] in ("done", "waiting", "pc_off", "confirm") else False
             self._sleep(0 if (more or self._want_sync) else IDLE_EVERY)
         self._want_sync = False
 
@@ -896,7 +890,7 @@ class Engine(threading.Thread):
 
     # ------------------------------------------------------------ проход
 
-    def _pass(self) -> bool:
+    def _pass(self, online=True) -> bool:
         """True — всё, что можно, сделано (дальше ждём новое); False — сразу следующий проход
         (прервали по времени, выключился ПК, обрыв связи)."""
         m, etag = self.api.manifest(self._etag)
@@ -915,6 +909,9 @@ class Engine(threading.Thread):
             self._manifest, self._etag = m, etag
         m = self._manifest
         self._idle = False
+        if not m.get("index_version"):
+            self._set(state="waiting", text="Жду индекс сервера", detail="")
+            return True
         bad = set(m.get("damaged") or ())                # испорчены на сервере — их не качаем
         # путь -> [путь, размер, mtime, дата, sha, испорчен]
         files = {f[0]: [*f[:5], int(f[0] in bad)] for f in m["files"]}
@@ -946,7 +943,16 @@ class Engine(threading.Thread):
                 raise Stop()
             with self._fmu:
                 self._copy_local(src, files[dst])
-        self._deletes(deletes, local, complete=m.get("complete", False))
+        if not m.get("complete"):
+            confirmed = set(m.get("confirmed_deleted", ()))
+            deletes = [p for p in deletes if p in confirmed]
+        self._deletes(deletes, local, complete=True)
+        if not online and (downloads or waiting or self._restore_n):
+            if not self.st.get("pending_delete"):
+                self._set(state="pc_off", text="Компьютер выключен",
+                          detail="Локальная сверка завершена. Для оставшихся операций нужен ПК.", current="", speed=0.0)
+            self._report(self.st["state"])
+            return True
 
         t0 = time.monotonic()
         downloads.sort(key=lambda p: files[p][3], reverse=True)      # сначала новые снимки
