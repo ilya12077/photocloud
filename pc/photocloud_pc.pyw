@@ -75,12 +75,16 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.0.4"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.0.5"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
 IS_WIN = sys.platform == "win32"
 log = logging.getLogger("pcclient")
+
+
+import sqlite3
+from contextlib import closing
 
 
 def app_dir() -> Path:
@@ -833,6 +837,21 @@ class App:
         if r.status_code != 200:
             raise ServerError(f"сервер: {_err(r)}")
         items = r.json()["items"]
+        marks = {it["path"]: it for it in items}
+        root = Path(self.cfg.root)
+        if self.cfg.root and root.is_dir():
+            for item in self._pending():
+                current = marks.get(item["path"])
+                if current is None or any(current.get(k) != item.get(k) for k in ("at", "size", "mtime", "sha")):
+                    self._journal([item], remove=True)
+                    continue
+                state, _, _ = check_file(root, item)
+                if state == "missing":
+                    if self._report([item]) == 1:
+                        self._journal([item], remove=True)
+                        items.remove(current)
+                elif state in ("ok", "changed"):
+                    self._journal([item], remove=True)
         for it in items:
             it["state"], it["file"], it["note"], it["pick"] = "checking", None, "проверяю…", False
         self.ui(lambda: self._show(items))
@@ -1057,6 +1076,7 @@ class App:
                 else:
                     failed.append((it["path"], "изменился после проверки"))
             if ready:
+                self._journal([it for it, _ in ready])
                 err = to_recycle_bin([p for _it, p in ready])
                 gone = []
                 for it, p in ready:
@@ -1069,7 +1089,10 @@ class App:
                 if gone:
                     done += len(gone)
                     try:
-                        reported += self._report(gone)
+                        accepted = self._report(gone)
+                        reported += accepted
+                        if accepted == len(gone):
+                            self._journal(gone, remove=True)
                     except Exception as e:  # noqa: BLE001
                         rep_err = str(e)
                         log.error("отчёт об удалении не принят: %s", e)
@@ -1081,7 +1104,7 @@ class App:
             msg += f" Сервер отметил: {reported}."
         if rep_err:
             msg += f"\n\nСервер не принял отчёт ({rep_err}) — у удалённых останется пометка, в списке они будут " \
-                   "«файла уже нет»: выбери их и «Снять пометку на удаление»."
+                   "«файла уже нет». Клиент повторит сверку при загрузке списка."
         if failed:
             msg += f"\n\nНе удалены ({len(failed)}):\n" + "\n".join(f"{p} — {why}" for p, why in failed[:15])
         log.info("удаление: %s", msg.replace("\n", " "))
@@ -1094,8 +1117,23 @@ class App:
             self.load()
         self.ui(finish)
 
+    def _journal(self, items=(), remove=False):
+        scope = json.dumps([self.cfg.server, self.cfg.client_id, self.cfg.root])
+        with closing(sqlite3.connect(app_dir() / "deletions.db")) as con, con:
+            con.execute("CREATE TABLE IF NOT EXISTS pending(scope TEXT, path TEXT, item TEXT, PRIMARY KEY(scope,path))")
+            for it in items:
+                if remove:
+                    con.execute("DELETE FROM pending WHERE scope=? AND path=?", (scope, it["path"]))
+                else:
+                    data = {k: it.get(k) for k in ("path", "size", "mtime", "sha", "at")}
+                    con.execute("INSERT OR REPLACE INTO pending VALUES(?,?,?)", (scope, it["path"], json.dumps(data)))
+            return [json.loads(row[0]) for row in con.execute("SELECT item FROM pending WHERE scope=?", (scope,))]
+
+    def _pending(self):
+        return self._journal()
+
     def _report(self, gone: list[dict]) -> int:
-        items = [{"path": it["path"], "sha": it.get("sha"), "size": it["size"]} for it in gone]
+        items = [{"path": it["path"], "sha": it.get("sha"), "size": it["size"], "at": it["at"], "mtime": it["mtime"]} for it in gone]
         ts = int(time.time())
         with self.api.mu:
             if not self.api.sid or time.time() > self.api.exp - 60:

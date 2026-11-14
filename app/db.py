@@ -381,6 +381,31 @@ class DB:
         self.run("UPDATE pc_client SET revoked = 1 WHERE revoked = 0")
         return had
 
+    def finish_deletions(self, items):
+        """Record confirmed deletions and clear their marks in one transaction."""
+        paths = []
+        with self.mu:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                for it in items:
+                    path = it["path"]
+                    mark = self.con.execute("SELECT key, sha, at FROM delete_marks WHERE path=?", (path,)).fetchone()
+                    if not mark:
+                        continue
+                    _, size, mtime = mark[0].split(chr(0))
+                    if (it.get("size") != int(size) or it.get("sha") != mark[1]
+                            or it.get("at", mark[2]) != mark[2] or it.get("mtime", int(mtime)) != int(mtime)):
+                        continue
+                    self.con.execute("INSERT OR REPLACE INTO backup_deleted VALUES(?,?)", (path, time.time()))
+                    self.con.execute("DELETE FROM delete_marks WHERE path=?", (path,))
+                    self.con.execute("DELETE FROM user_hidden WHERE path=?", (path,))
+                    paths.append(path)
+                self.con.execute("COMMIT")
+            except BaseException:
+                self.con.execute("ROLLBACK")
+                raise
+        return paths
+
     def marks_rows(self) -> list[tuple]:
         """Пометки целиком: (путь, ключ файла, sha, кто, когда)."""
         return self.run("SELECT path, key, sha, by, at FROM delete_marks ORDER BY at")

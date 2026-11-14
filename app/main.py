@@ -274,7 +274,7 @@ def visible(s: Session, p) -> bool:
     """Файл p в папках, доступных пользователю. Все запросы по id проходят через это:
     чужой id отвечает 404 — так же, как несуществующий. (Скрытое у каждого своё: свои скрытые
     пользователь видит на /hidden, на других оно не влияет.)"""
-    return p is not None and folder_ok(p.rel, user_folders(s))
+    return p is not None and _deleted_times.get(p.rel, -1) < library.built_at and folder_ok(p.rel, user_folders(s))
 
 
 async def require_admin(s: Session = Depends(require_user)) -> Session:
@@ -975,6 +975,7 @@ class _Mine:
 
 
 mine = _Mine()
+_deleted_times = dict(db.run("SELECT path, at FROM backup_deleted"))
 _marks: dict[str, tuple[str, float]] = db.marks_load()      # на удаление (админ): путь -> (кто, когда)
 
 
@@ -992,19 +993,20 @@ def _view_for(s: Session, hidden: int, starred: int):
     (админу — скрытые всех пользователей); starred=1 — только его избранное. Его группы — в списке."""
     u = s.user
     hid = frozenset(mine.hidden.get(u, ()))
+    gone = frozenset(p for p, at in _deleted_times.items() if at >= library.built_at)
     grp = mine.groups.get(u) or None
-    key = (u, mine.gen.get(u, 0), "h" if hidden else "s" if starred else "m")
+    key = (u, gone, mine.gen.get(u, 0), "h" if hidden else "s" if starred else "m")
     if hidden:
         if s.role == "admin":  # type: ignore[attr-defined]
             # админ видит скрытое всеми; помеченное на удаление уже не показываем
             marks = frozenset(_marks)
             allh = frozenset(_hidden_all())
-            key = (u, tuple(sorted(mine.gen.items())), "H", marks)
-            return library.view(user_folders(s), only=allh - marks, groups=grp, key=key)
-        return library.view(user_folders(s), only=hid, groups=grp, key=key)
+            key = (u, tuple(sorted(mine.gen.items())), "H", marks, gone)
+            return library.view(user_folders(s), only=allh - marks - gone, groups=grp, key=key)
+        return library.view(user_folders(s), only=hid - gone, groups=grp, key=key)
     if starred:
-        return library.view(user_folders(s), hide=hid, only=frozenset(mine.starred.get(u, ())), groups=grp, key=key)
-    return library.view(user_folders(s), hide=hid, groups=grp, key=key)
+        return library.view(user_folders(s), hide=hid | gone, only=frozenset(mine.starred.get(u, ())), groups=grp, key=key)
+    return library.view(user_folders(s), hide=hid | gone, groups=grp, key=key)
 
 
 @app.get("/api/library")
@@ -1259,7 +1261,7 @@ def _pc_marks() -> list[dict]:
         except (IndexError, ValueError):
             size, mtime = -1, -1
         p = _by_rel(path)
-        out.append({"path": path, "size": size, "mtime": mtime, "sha": sha, "by": by, "at": int(at),
+        out.append({"path": path, "size": size, "mtime": mtime, "sha": sha, "by": by, "at": at,
                     "id": p.id if p is not None else None, "video": bool(p and p.video),
                     "live": bool(p and p.video and p.live)})
     return out
@@ -1336,11 +1338,19 @@ async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
         pcauth.verify_op(delete_message(sess["sid"], ts, items), sig)
     except PcError as e:
         return _pc_fail(request, "удаление", e, 403)
-    paths = [i["path"] for i in items if i["path"] in _marks]
-    if paths:
-        await run_in_threadpool(db.many, "INSERT OR REPLACE INTO backup_deleted(path, at) VALUES(?, ?)",
-                                [(path, time.time()) for path in paths])
-    await run_in_threadpool(_pc_drop, paths, True)
+    def finish():
+        global _marks, _deleted_times
+        with mine.mu:
+            paths = db.finish_deletions(items)
+            _deleted_times = dict(db.run("SELECT path, at FROM backup_deleted"))
+            _marks = db.marks_load()
+            for user, hidden in list(mine.hidden.items()):
+                if hidden.keys() & set(paths):
+                    mine.hidden[user] = {p: at for p, at in hidden.items() if p not in paths}
+                    mine.changed(user)
+            return paths
+
+    paths = await run_in_threadpool(finish)
     audit("pc_deleted", "клиент ПК", ip_of(request), f"в корзину на ПК: {len(paths)}: {', '.join(paths[:3])}")
     if paths:
         library.start_build(storage, _index_error)   # файлов больше нет — пересобрать список
