@@ -64,6 +64,8 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
+db.run("CREATE TABLE IF NOT EXISTS archive_events(id TEXT PRIMARY KEY, at REAL, kind TEXT, src TEXT, dst TEXT, received REAL)")
+db.run("CREATE INDEX IF NOT EXISTS archive_events_received ON archive_events(received)")
 db.run("CREATE TABLE IF NOT EXISTS backup_deleted(path TEXT PRIMARY KEY, at REAL NOT NULL)")
 pthumbs = ThumbStore(S.data_dir / "thumbs.db")      # эскизы фото 240/400 — отдельный файл
 library = Library(S.tz, S.meta_threads, db)
@@ -868,7 +870,8 @@ async def _pc_watch() -> None:
             up = await PC.is_up()
             if up:
                 PC.wake_at = 0
-                if PC.revived or library.stale(S.index_ttl):
+                dirty = db.run("SELECT 1 FROM archive_events WHERE received > ? LIMIT 1", (library.built_at,))
+                if PC.revived or dirty or library.stale(S.index_ttl):
                     if library.start_build(storage, _index_error):
                         PC.revived = False
             elif PC.wake_at and pc_state(False) == "down" and not PC.wake_notified:
@@ -1264,6 +1267,26 @@ def _pc_marks() -> list[dict]:
                     "id": p.id if p is not None else None, "video": bool(p and p.video),
                     "live": bool(p and p.video and p.live)})
     return out
+
+
+@app.post("/api/pc/changes")
+async def pc_changes(request: Request, _: dict = Depends(require_pc)):
+    events = _pc_json(request).get("events")
+    if not isinstance(events, list) or not 0 < len(events) <= 32:
+        raise HTTPException(400)
+    now = time.time()
+    rows = []
+    for event in events:
+        if not isinstance(event, list) or len(event) != 5:
+            raise HTTPException(400)
+        ident, at, kind, src, dst = event
+        if (not isinstance(ident, str) or not re.fullmatch("[0-9a-f]{32}", ident)
+                or not isinstance(at, (int, float)) or kind not in ("startup", "created", "deleted", "modified", "moved")
+                or not all(isinstance(p, str) and len(p) <= 32767 for p in (src, dst))):
+            raise HTTPException(400)
+        rows.append((ident, at, kind, src, dst, now))
+    await run_in_threadpool(db.many, "INSERT OR IGNORE INTO archive_events VALUES(?,?,?,?,?,?)", rows)
+    return no_store(JSONResponse({"ok": True}))
 
 
 @app.get("/api/pc/marks")
@@ -2464,6 +2487,8 @@ async def backup_manifest(request: Request, damaged: int = 0, t=Depends(require_
     ver = library.version
     deleted = dict(await run_in_threadpool(db.run, "SELECT path, at FROM backup_deleted WHERE at >= ?", (library.built_at,)))
     complete = bool(ver) and library.state == "ready" and not library.skipped and not library.error
+    if complete:
+        complete = not db.run("SELECT 1 FROM archive_events WHERE received > ? LIMIT 1", (library.built_at,))
     modern = damaged == 1
     tag = hashlib.blake2b(f"{ver}|{n_hashes}|{gen}|{access!r}|{complete}|{sorted(deleted)}|{int(modern)}".encode(),
                           digest_size=10).hexdigest()

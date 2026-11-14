@@ -75,8 +75,8 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.0.5"           # по этой строке программа сравнивает себя с версией на GitHub
-DEPS = (("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
+VERSION = "1.1.0"           # по этой строке программа сравнивает себя с версией на GitHub
+DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
 IS_WIN = sys.platform == "win32"
@@ -489,6 +489,70 @@ STATE = {"ok": ("✔", "#1e9e50"), "changed": ("⚠", "#d9822b"), "missing": ("�
          "checking": ("…", DIM)}
 
 
+def watch_archive(app):
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+    import uuid
+
+    cfg = app.cfg
+    root = Path(cfg.root).resolve()
+    scope = json.dumps([cfg.server, cfg.client_id, str(root)])
+    path = app_dir() / "archive-events.db"
+
+    def connect():
+        con = sqlite3.connect(path, timeout=30)
+        con.execute("PRAGMA synchronous=FULL")
+        return con
+
+    def record(kind, src="", dst=""):
+        with closing(connect()) as con, con:
+            con.execute("INSERT INTO events VALUES(?,?,?,?,?,?)",
+                        (scope, uuid.uuid4().hex, time.time(), kind, src, dst))
+
+    class Changes(FileSystemEventHandler):
+        def on_any_event(self, event):
+            if event.event_type not in ("created", "deleted", "modified", "moved"):
+                return
+            def relative(value):
+                if not value:
+                    return ""
+                try:
+                    rel = Path(value).relative_to(root)
+                except ValueError:
+                    return ""
+                if not rel.parts or rel.parts[0].lower() == "restored" or any(p.startswith(".") for p in rel.parts):
+                    return ""
+                return rel.as_posix()
+            src, dst = relative(event.src_path), relative(getattr(event, "dest_path", ""))
+            if (src or dst) and not (event.is_directory and event.event_type == "modified"):
+                record(event.event_type, src, dst)
+
+    with closing(connect()) as con, con:
+        con.execute("CREATE TABLE IF NOT EXISTS events(scope TEXT,id TEXT PRIMARY KEY,at REAL,kind TEXT,src TEXT,dst TEXT)")
+    observer = Observer()
+    observer.schedule(Changes(), str(root), recursive=True)
+    observer.start()
+    try:
+        record("startup")
+        while (cfg.server, cfg.client_id, cfg.root) == app._watch_scope and Path(cfg.root).resolve() == root:
+            with closing(connect()) as con:
+                rows = con.execute("SELECT id,at,kind,src,dst FROM events WHERE scope=? ORDER BY rowid LIMIT 32",
+                                   (scope,)).fetchall()
+            if rows:
+                try:
+                    response = app.api.call("POST", "/api/pc/changes", {"events": rows})
+                    response.raise_for_status()
+                    with closing(connect()) as con, con:
+                        con.executemany("DELETE FROM events WHERE scope=? AND id=?", [(scope, r[0]) for r in rows])
+                    continue
+                except Exception as exc:
+                    log.debug("журнал архива: повтор после ошибки %s", type(exc).__name__)
+            time.sleep(3)
+    finally:
+        observer.stop()
+        observer.join()
+
+
 class App:
     """Сетка рисуется на одном холсте и только видимая часть: сотни отдельных виджетов и картинок
     исчерпывают ресурсы окон Windows (пустые карточки, мусор на экране)."""
@@ -517,6 +581,17 @@ class App:
         log.addHandler(h)
         self.root.after(100, self._pump)
         self.root.after(200, self.start)
+        self._watch_worker = None
+        self._watch_scope = None
+        self.root.after(1000, self._start_watch)
+
+    def _start_watch(self):
+        if self.api and self.cfg.client_id and self.cfg.root and Path(self.cfg.root).is_dir():
+            if not self._watch_worker or not self._watch_worker.is_alive():
+                self._watch_scope = (self.cfg.server, self.cfg.client_id, self.cfg.root)
+                self._watch_worker = threading.Thread(target=watch_archive, args=(self,), daemon=True)
+                self._watch_worker.start()
+        self.root.after(3000, self._start_watch)
 
     # ---- разметка
     def _build(self) -> None:

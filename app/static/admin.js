@@ -453,17 +453,19 @@ async function loadPc() {
   const r = await act(() => api('/api/admin/pc')); if (!r) return;
   if (unchanged('pc', r)) return;
   const c = r.client, left = Math.max(0, r.pair_until - r.now);
-  const cards = [['Клиент на ПК', c ? `${c.name || 'привязан'} · ключ ${c.key_type === 'tpm' ? 'в TPM' : c.key_type === 'software' ? 'программный (без TPM)' : '—'}` : 'не привязан'],
-    ['Отпечаток ключа', c ? c.fp.replace(/:/g, ':\u200b') : '—'], ['На связи', c && c.last_seen ? `${ago(c.last_seen)} · ${c.last_ip}` : '—'],
-    ['На удаление', String(r.marks)]];
-  if (left > 0) cards.unshift(['Окно привязки', `открыто ещё ${Math.ceil(left / 60)} мин — запусти программу на ПК`]);
-  $('pc-cards').replaceChildren(...cards.map(([k, val]) => { const d = el('div', 'card'); d.append(el('div', 'k', k), el('div', 'v', val)); return d; }));
+  const row = el('tr');
+  const key = el('td', null, c ? (c.key_type === 'tpm' ? 'TPM' : 'Программный ключ') : '—');
+  if (c) key.append(el('div', 'dim2', c.fp));
+  row.append(el('td', null, c ? c.name || 'Основной ПК' : 'Агент не привязан'), key,
+    el('td', null, c && c.last_seen ? ago(c.last_seen) + ' · ' + c.last_ip : '—'), el('td', null, String(r.marks)));
+  $('pc-agent').tBodies[0].replaceChildren(row);
+  $('pc-pair-window').textContent = left ? 'Окно привязки открыто ещё ' + Math.ceil(left / 60) + ' мин' : '';
   $('pc-unpair').hidden = !c;
   $('pc-pair').textContent = c ? 'Привязать заново' : 'Привязать';
 }
 $('pc-pair').onclick = () => act(() => api('/api/admin/pc/pair', {}), 'Окно привязки открыто на 10 минут').then(loadPc);
 $('pc-unpair').onclick = async () => {
-  if (!confirm('Отвязать клиент на ПК? Его ключ перестанет действовать; чтобы снова удалять, привяжи заново.')) return;
+  if (!confirm('Отвязать агент основного ПК? Его ключ перестанет действовать; чтобы снова удалять, привяжи заново.')) return;
   await act(() => api('/api/admin/pc/unpair', {}), 'Клиент отвязан'); loadPc();
 };
 
@@ -475,7 +477,7 @@ async function loadBackup() {
   const hRun = r.hashes.state === 'running', vRun = v.state === 'running';
   const hText = !r.tokens.length ? 'не считаются — нет клиентов' : hashText(r.hashes, r.unhashed, r.files);
   const cards = [['Хеши файлов', hText],
-    ['Проверка хешей', !r.tokens.length ? 'не нужна — нет клиентов' : verifyText(v)], ['Клиентов', String(r.tokens.length)]];
+    ['Проверка хешей', !r.tokens.length ? 'не нужна — нет клиентов' : verifyText(v)], ['Хранилищ копий', String(r.tokens.length)]];
   $('bk-cards').replaceChildren(...cards.map(([k, val]) => { const c = el('div', 'card'); c.append(el('div', 'k', k), el('div', 'v', val)); return c; }));
   $('bk-hash-start').hidden = hRun || vRun || !r.unhashed || !r.tokens.length;
   $('bk-hash-stop').hidden = !hRun;
@@ -488,7 +490,7 @@ async function loadBackup() {
     if (cur && r.users.includes(cur)) sel.value = cur;
   }
   const tb = $('bk-tokens').tBodies[0];
-  if (!r.tokens.length) { const tr = el('tr'); const td = el('td', 'dim2', 'клиентов пока нет'); td.colSpan = 8; tr.append(td); tb.replaceChildren(tr); return; }
+  if (!r.tokens.length) { const tr = el('tr'); const td = el('td', 'dim2', 'хранилища пока не подключены'); td.colSpan = 8; tr.append(td); tb.replaceChildren(tr); return; }
   tb.replaceChildren(...r.tokens.map((t) => {
     const tr = el('tr'), rp = t.report || {}, ops = el('td', 'ops');
     ops.append(btn('отозвать', async () => {
