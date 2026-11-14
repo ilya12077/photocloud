@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.5"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.6"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -858,7 +858,7 @@ class Engine(threading.Thread):
         st = self.api.status()
         self._set(server=st.get("server", ""))
         self._restore_n = int(st.get("restore") or 0)          # файлы на ПК, которые просят восстановить
-        if st["pc"] != "up" and ((self.cfg.wake_on_start and not self._woke) or self._want_wake):
+        if st["pc"] != "up" and self._want_wake:
             self._wake(st)
             return
         if self._want_wake and st["pc"] == "up":
@@ -867,7 +867,11 @@ class Engine(threading.Thread):
         online = st["pc"] == "up"
         if online:
             self._woke = True
+        self._needs_pc = False
         if self._pass(online):
+            if self._needs_pc and self.cfg.wake_on_start and not self._woke:
+                self._wake(st)
+                return
             # всё скопировано — в свободное время проверяем уже скопированное (кусками по 20 с)
             more = self._verify_slice() if self.st["state"] in ("done", "waiting", "pc_off", "confirm") else False
             self._sleep(0 if (more or self._want_sync) else IDLE_EVERY)
@@ -910,6 +914,7 @@ class Engine(threading.Thread):
         m = self._manifest
         self._idle = False
         if not m.get("index_version"):
+            self._needs_pc = not online
             self._set(state="waiting", text="Жду индекс сервера", detail="")
             return True
         bad = set(m.get("damaged") or ())                # испорчены на сервере — их не качаем
@@ -921,7 +926,7 @@ class Engine(threading.Thread):
             local, extras = self._verify_local(self.db.files(), files)
         else:
             local, extras = self.db.files(), []          # в остальное время — по своей базе, без обхода папки
-        plan = self._plan(files, local)
+        plan = self._plan(files, local, m.get("complete", False), set(m.get("confirmed_deleted", ())))
         moves, copies, downloads, deletes, waiting = plan
         deletes = deletes + [p for p in extras if p not in set(deletes)]   # посторонние файлы в Архиве — тоже прочь
         total_bytes = sum(f[1] for f in files.values())
@@ -948,6 +953,7 @@ class Engine(threading.Thread):
             deletes = [p for p in deletes if p in confirmed]
         self._deletes(deletes, local, complete=True)
         if not online and (downloads or waiting or self._restore_n):
+            self._needs_pc = True
             if not self.st.get("pending_delete"):
                 self._set(state="pc_off", text="Компьютер выключен",
                           detail="Локальная сверка завершена. Для оставшихся операций нужен ПК.", current="", speed=0.0)
@@ -1153,7 +1159,7 @@ class Engine(threading.Thread):
                     self.db.event("restore", rel, "передана серверу")
                     return
 
-    def _plan(self, files: dict, local: dict):
+    def _plan(self, files: dict, local: dict, complete=True, confirmed=frozenset()):
         missing = {p: v for p, v in local.items() if p not in files}
         by_sha_missing: dict[str, list[str]] = {}
         for p, (_s, _m, h) in missing.items():
@@ -1161,6 +1167,7 @@ class Engine(threading.Thread):
         by_sha_have = {h: p for p, (_s, _m, h) in local.items() if p in files}
         moves, copies, downloads, waiting = [], [], [], 0
         damaged = self._damaged_skip = []
+        unresolved_sizes = {f[1] for p, f in files.items() if not f[4] and p not in local}
         for p, f in files.items():
             sha = f[4]
             if not sha:
@@ -1172,7 +1179,12 @@ class Engine(threading.Thread):
                     self._touch(p, f)
                 continue
             if not have and by_sha_missing.get(sha):
-                moves.append((by_sha_missing[sha].pop(), p))      # переименован / перенесён
+                src = by_sha_missing[sha][-1]
+                if complete or src in confirmed:
+                    moves.append((by_sha_missing[sha].pop(), p))
+                    by_sha_have[sha] = p
+                else:
+                    copies.append((src, p))      # переименован / перенесён
                 continue
             if not have and sha in by_sha_have:
                 copies.append((by_sha_have[sha], p))              # такой же файл уже есть рядом
@@ -1182,7 +1194,7 @@ class Engine(threading.Thread):
                 continue
             downloads.append(p)
         used = {src for src, _ in moves}
-        deletes = [p for p in missing if p not in used]
+        deletes = [p for p in missing if p not in used and (p in confirmed or missing[p][0] not in unresolved_sizes)]
         return moves, copies, downloads, deletes, waiting
 
     def _scan_archive(self) -> dict[str, tuple[int, int]]:
