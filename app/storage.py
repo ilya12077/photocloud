@@ -5,6 +5,7 @@
 по построению; проверки здесь — второй рубеж."""
 from __future__ import annotations
 
+import uuid
 import errno
 import logging
 import os
@@ -543,22 +544,23 @@ class RestoreWriter:
                     return "/".join(parts)
                 continue
             self._mkdirs(root, parts[:-1])
-            # пишем сразу под итоговым именем («xb» — только новый файл, существующий не затрёт);
-            # не получилось или после записи хеш не тот — свою недописанную копию убираем
-            done = False
+            tmp = dst + "." + uuid.uuid4().hex + ".photocloud-part"
+            created = False
             try:
-                with open(src, "rb") as a, smb.open_file(dst, mode="xb", **kw) as b:
+                with open(src, "rb") as a, smb.open_file(tmp, mode="xb", **kw) as b:
+                    created = True
                     for chunk in iter(lambda: a.read(self.CHUNK), b""):
                         b.write(chunk)
-                smb.utime(dst, times=(mtime, mtime), **kw)
-                if self._sha_smb(dst) != sha:
+                smb.utime(tmp, times=(mtime, mtime), **kw)
+                if self._sha_smb(tmp) != sha:
                     raise OSError("восстановленная копия не совпала по хешу после записи")
-                done = True
+                smb.rename(tmp, dst, **kw)
+                created = False
             finally:
-                if not done:
+                if created:
                     try:
-                        smb.remove(dst, **kw)
-                    except Exception:  # noqa: BLE001
+                        smb.remove(tmp, **kw)
+                    except OSError:
                         pass
             return "/".join(parts)
         raise OSError("слишком много копий с таким именем в Restored")
