@@ -51,7 +51,8 @@ class ReconciliationTests(unittest.TestCase):
             journal(SimpleNamespace(cfg=cfg), [item])
             restarted = Mock()
             restarted.cfg = cfg
-            restarted._pending.side_effect = lambda: journal(restarted)
+            restarted._pending = False
+            restarted._pending_deletions.side_effect = lambda: journal(restarted)
             restarted._journal.side_effect = lambda *a, **k: journal(restarted, *a, **k)
             restarted.api.call.return_value.status_code = 200
             restarted.api.call.return_value.json.side_effect = lambda: {"items": [item.copy()]}

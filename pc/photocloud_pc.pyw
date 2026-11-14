@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.1.0"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.1.1"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -915,7 +915,7 @@ class App:
         marks = {it["path"]: it for it in items}
         root = Path(self.cfg.root)
         if self.cfg.root and root.is_dir():
-            for item in self._pending():
+            for item in self._pending_deletions():
                 current = marks.get(item["path"])
                 if current is None or any(current.get(k) != item.get(k) for k in ("at", "size", "mtime", "sha")):
                     self._journal([item], remove=True)
@@ -1204,7 +1204,7 @@ class App:
                     con.execute("INSERT OR REPLACE INTO pending VALUES(?,?,?)", (scope, it["path"], json.dumps(data)))
             return [json.loads(row[0]) for row in con.execute("SELECT item FROM pending WHERE scope=?", (scope,))]
 
-    def _pending(self):
+    def _pending_deletions(self):
         return self._journal()
 
     def _report(self, gone: list[dict]) -> int:
