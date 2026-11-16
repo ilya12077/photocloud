@@ -945,7 +945,8 @@ async def _wake(user: str, message: str, detail: str = "") -> Response:
 async def reindex(_: Session = Depends(require_admin)):
     if not await PC.is_up():
         raise HTTPException(409, "pc down")
-    library.start_build(storage, _index_error)
+    if not library.start_build(storage, _index_error):
+        raise HTTPException(409, "Сканирование уже выполняется")
     return no_store(JSONResponse({"ok": True}))
 
 
