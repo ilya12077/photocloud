@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.1.1"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.0"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -436,6 +436,120 @@ def check_file(root: Path, item: dict) -> tuple[str, Path | None, str]:
     return "ok", p, "проверен: размер и дата (хеша на сервере нет)"
 
 
+def restore_path(root: Path, rel: str, restored: bool = False) -> Path:
+    """Reject Windows aliases, links/junctions and all service subtrees as originals."""
+    import stat
+    parts = safe_rel(rel)
+    if not restored and parts[0].lower() in ("restored", ".photocloud"):
+        raise ValueError("служебная папка не может быть оригиналом")
+    p = root.absolute()
+    for part in (["Restored"] if restored else []) + parts:
+        if (part.endswith((".", " ")) or any(ord(c) < 32 for c in part)
+                or any(c in part for c in '<>"|?*')
+                or part.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"}
+                or re.fullmatch(r"(?i)(COM|LPT)[0-9¹²³](?:\..*)?", part)):
+            raise ValueError("недопустимое имя Windows")
+        st = p.lstat()
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
+            raise ValueError("ссылки и точки повторного анализа запрещены")
+        p /= part
+    st = p.lstat()
+    if not stat.S_ISREG(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400 or st.st_nlink != 1:
+        raise ValueError("нужен обычный файл без ссылок")
+    if root.resolve() not in p.resolve().parents:
+        raise ValueError("путь вне архива")
+    return p
+
+
+def restore_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def apply_restored(root: Path, item: dict) -> bool:
+    """Apply one fresh server record. A repeated run is safe after a lost HTTP reply.
+
+    Restored is untrusted. Copy to a private sibling, hash THAT copy, then replace.
+    Keep the damaged original in a private recovery directory outside the share.
+    Archive directory ACLs must exclude untrusted local writers.
+    """
+    import tempfile
+    good, bad = item.get("sha_good"), item.get("sha_bad")
+    if not isinstance(good, str) or not re.fullmatch("[0-9a-f]{64}", good):
+        raise ValueError("нет эталонного SHA-256")
+    dst = restore_path(root, item["path"])
+    before = dst.stat()
+    actual = restore_digest(dst)
+    if actual == good:
+        return False  # replacement succeeded previously; only server acknowledgement remains
+    if not isinstance(bad, str) or not re.fullmatch("[0-9a-f]{64}", bad) or actual != bad:
+        raise ValueError("оригинал изменён либо нет хеша повреждённого файла; замена запрещена")
+    if before.st_size != item["size"] or int(before.st_mtime) != int(item["mtime"]):
+        raise ValueError("размер или дата оригинала изменились")
+    src = restore_path(root, item["restored"], restored=True)
+    recovery = app_dir() / "replaced-originals"
+    recovery.mkdir(parents=True, exist_ok=True)
+    # Exclusive temporary files: never follow an attacker-prepared target.
+    stage = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="original-", suffix=".bak", dir=recovery, delete=False) as out:
+            backup_name = out.name
+            with dst.open("rb") as inp:
+                shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        with tempfile.NamedTemporaryFile(prefix=".photocloud-restore-", suffix=".tmp", dir=dst.parent, delete=False) as out:
+            stage = Path(out.name)
+            with src.open("rb") as inp:
+                remaining = item["size"]
+                while remaining:
+                    chunk = inp.read(min(4 * 1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("восстановленная копия короче ожидаемого")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+                if inp.read(1):
+                    raise ValueError("восстановленная копия длиннее ожидаемого")
+            out.flush()
+            os.fsync(out.fileno())
+        if restore_digest(stage) != good or stage.stat().st_size != item["size"]:
+            raise ValueError("SHA-256 восстановленной копии не совпадает")
+        if restore_digest(Path(backup_name)) != bad:
+            raise ValueError("оригинал изменился при сохранении резервной копии")
+        # Revalidate ancestors and original immediately before the atomic replacement.
+        restore_path(root, item["restored"], restored=True)
+        restore_path(root, item["path"])
+        now = dst.stat()
+        if (now.st_dev, now.st_ino, now.st_size, now.st_mtime_ns, now.st_ctime_ns) != (
+                before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+        ) or restore_digest(dst) != bad:
+            raise ValueError("оригинал изменился во время проверки")
+        os.utime(stage, (item["mtime"], item["mtime"]))
+        with stage.open("r+b") as f:
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        os.replace(stage, dst)
+        if os.name != "nt":
+            fd = os.open(dst.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        log.info("восстановлен %s; прежний оригинал: %s", item["path"], backup_name)
+        return True
+    finally:
+        if stage is not None:
+            stage.unlink(missing_ok=True)
+
+
 # ======================================================================== обновление с GitHub
 # Как у клиента бэкапа: последний коммит master, оттуда pc/photocloud_pc.pyw; если VERSION новее —
 # файл проверяется (компилируется), подменяет этот, программа перезапускается.
@@ -621,6 +735,8 @@ class App:
         self.b_del.pack(side="left")
         self.b_restore = ttk.Button(bar, text="Вернуть в галерею", command=self.restore)
         self.b_restore.pack(side="left", padx=(8, 0))
+        self.b_apply = ttk.Button(top, text="Применить восстановленные копии", command=self.apply_restores)
+        self.b_apply.pack(side="right", padx=4)
         self.b_unmark = ttk.Button(bar, text="Снять пометку на удаление", command=self.unmark)
         self.b_unmark.pack(side="left", padx=8)
         ttk.Button(bar, text="Выбрать все", command=lambda: self._select(True)).pack(side="left")
@@ -745,7 +861,7 @@ class App:
         self.canvas.yview_scroll(n, "units")
 
     def _buttons(self, on: bool) -> None:
-        for b in (self.b_del, self.b_restore, self.b_unmark, self.b_reload):
+        for b in (self.b_del, self.b_restore, self.b_unmark, self.b_reload, self.b_apply):
             b.state(["!disabled"] if on else ["disabled"])
 
     def say(self, text: str) -> None:
@@ -1246,6 +1362,46 @@ class App:
         self._send("/api/pc/unmark", "Снять пометку «на удаление» с {n} файл(ов)? Файлы останутся на месте "
                                      "и в скрытых — их можно будет пометить снова.")
 
+    def apply_restores(self) -> None:
+        if self.busy:
+            return
+        if not self.api or not self.cfg.root:
+            messagebox.showerror(APP, "Сначала привяжи клиент и укажи папку архива.")
+            return
+        from urllib.parse import urlsplit
+        url = urlsplit(self.cfg.server)
+        if url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("127.0.0.1", "::1", "localhost")):
+            messagebox.showerror(APP, "Для замены файлов нужен HTTPS с проверенным сертификатом сервера.")
+            return
+        self.busy = True
+        self._buttons(False)
+        def go():
+            def request(method, path, body=None):
+                r = self.api.call(method, path, body)
+                if r.status_code != 200:
+                    raise ServerError(_err(r))
+                return r.json()
+            items = request("GET", "/api/pc/restored")["items"]
+            done, errors = 0, []
+            for it in items:
+                try:
+                    body = {"path": it["path"], "revision": it["revision"]}
+                    fresh = request("POST", "/api/pc/restored/check", body)
+                    apply_restored(Path(self.cfg.root), fresh)
+                    request("POST", "/api/pc/restored/complete", body)
+                    done += 1
+                except Exception as e:
+                    log.exception("применение восстановленной копии %s", it.get("path"))
+                    errors.append(f"{it.get('path')}: {e}")
+            def show():
+                self.busy = False
+                self._buttons(True)
+                messagebox.showinfo(APP, f"Подтверждено сервером: {done} из {len(items)}.\n"
+                    + ("\n".join(errors[:10]) if errors else "")
+                    + ("\nПри обрыве связи нажми кнопку повторно: уже исправленные файлы не перезаписываются." if errors else ""))
+            self.ui(show)
+        self.bg(go)
+
     def restore(self) -> None:
         self._send("/api/pc/restore", "Вернуть {n} файл(ов) в галерею? Снимется пометка «на удаление» и «скрыто» "
                                       "у всех, кто их скрыл, — фото снова появятся в ленте.")
@@ -1276,7 +1432,7 @@ class App:
 
     def save_settings(self) -> None:
         if self.busy:
-            messagebox.showinfo(APP, "Дождись окончания удаления.")
+            messagebox.showinfo(APP, "Дождись окончания операции.")
             return
         srv = self.v_server.get().strip().rstrip("/")
         if not valid_server(srv):

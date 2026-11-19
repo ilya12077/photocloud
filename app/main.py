@@ -1296,6 +1296,71 @@ async def pc_marks(_: dict = Depends(require_pc)):
                                   "subdir": S.smb_subdir}))
 
 
+def _pc_restored_item(d: dict) -> dict:
+    fields = ("path", "restored", "size", "mtime", "sha_good", "sha_bad", "key", "updated")
+    item = {k: d[k] for k in fields}
+    item["revision"] = hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()
+    return item
+
+
+@app.get("/api/pc/restored")
+async def pc_restored(_: dict = Depends(require_pc)):
+    def listing():
+        with _dmg_mu:
+            return [_pc_restored_item(d) for d in db.damaged_list(active_only=True)
+                    if d["state"] == "restored" and d["restored"]]
+    return no_store(JSONResponse({"items": await run_in_threadpool(listing)}))
+
+
+@app.post("/api/pc/restored/check")
+async def pc_restored_check(request: Request, _: dict = Depends(require_pc)):
+    body = _pc_json(request)
+    path, revision = body.get("path"), body.get("revision")
+    if not isinstance(path, str) or not isinstance(revision, str):
+        raise HTTPException(400)
+    def check():
+        with _dmg_mu:
+            d = db.damaged_get(path)
+            if not d or d["state"] != "restored" or _pc_restored_item(d)["revision"] != revision:
+                raise HTTPException(409, "запись восстановления изменилась; обнови список")
+            return _pc_restored_item(d)
+    return no_store(JSONResponse(await run_in_threadpool(check)))
+
+
+@app.post("/api/pc/restored/complete")
+async def pc_restored_complete(request: Request, _: dict = Depends(require_pc)):
+    body = _pc_json(request)
+    path, revision = body.get("path"), body.get("revision")
+    if not isinstance(path, str) or not isinstance(revision, str):
+        raise HTTPException(400)
+    def complete():
+        with _dmg_mu:
+            d = db.damaged_get(path)
+            if not d or d["state"] not in ("restored", "fixed"):
+                raise HTTPException(409)
+            if d["state"] == "fixed":
+                return
+            if _pc_restored_item(d)["revision"] != revision:
+                raise HTTPException(409)
+        # Never trust the agent's success report alone. Read the actual original.
+        h = hashlib.sha256()
+        with storage.open(path) as f:
+            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                h.update(chunk)
+        if h.hexdigest() != d["sha_good"]:
+            raise HTTPException(409, "оригинал ещё не совпадает с эталонным хешем")
+        with _dmg_mu:
+            current = db.damaged_get(path)
+            if not current or current["state"] != "restored" or _pc_restored_item(current)["revision"] != revision:
+                raise HTTPException(409)
+            current.update(state="fixed", note="проверено сервером после замены клиентом ПК", updated=time.time())
+            db.damaged_put(current)
+            _bump_list()
+        audit("damaged_fixed", "клиент ПК", ip_of(request), path)
+    await on_pc(complete, timeout=300)
+    return no_store(JSONResponse({"ok": True}))
+
+
 @app.get("/api/pc/preview/{pid}")
 async def pc_preview(request: Request, pid: str = PathParam(pattern=ID_RE), _: dict = Depends(require_pc)):
     p = library.get(pid)
@@ -2750,7 +2815,7 @@ async def _restore_write(path: str, part: Path, d: dict, client: str, user: str,
     log.info("восстановлен %s → %s/%s (копия от «%s»)", path, RESTORED, where, client)
     audit("damaged_restored", user, ip, f"{path} → {RESTORED}/{where}, копия от «{client}»")
     _notify("damaged", f"Восстановлена правильная копия «{clean(path, 120)}» → {RESTORED}\\{clean(where, 120)}. "
-                       f"Перенеси её на место оригинала с заменой.")
+                       f"В клиенте ПК нажми «Применить восстановленные копии» для проверенной замены оригинала.")
 
 
 @app.post("/api/backup/restore/nosource")
