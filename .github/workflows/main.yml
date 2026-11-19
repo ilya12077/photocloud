@@ -28,6 +28,7 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install httpx pillow cryptography watchdog
       - run: python -m unittest discover -s tests -p test_pc_startup.py -v
+      - run: python -m unittest discover -s tests -p test_backup_pipe.py -v
 
   push_to_registry:
     needs: windows_agent

@@ -1,0 +1,18 @@
+name: Windows backup named pipes
+on:
+  push:
+    paths:
+      - backup/photocloud_backup.pyw
+      - tests/test_backup_pipe.py
+      - .github/workflows/backup-pipe-tests.yml
+jobs:
+  named_pipes:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install httpx pillow
+      - run: python -m unittest discover -s tests -p test_backup_pipe.py -v

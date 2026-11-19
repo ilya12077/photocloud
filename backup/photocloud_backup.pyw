@@ -76,7 +76,7 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
-VERSION = "1.4.7"           # по этой строке клиент сравнивает себя с версией на GitHub
+VERSION = "1.4.8"           # по этой строке клиент сравнивает себя с версией на GitHub
 AUTOSTART_DELAY = 30        # с: пауза перед стартом при автозапуске (--tray)
 DEPS = (("httpx", "httpx>=0.27"), ("pystray", "pystray>=0.19"), ("PIL", "pillow>=10"))
 log = logging.getLogger("pcbackup")
@@ -262,24 +262,224 @@ def open_folder(p: str) -> None:
         subprocess.Popen(["xdg-open", p])
 
 
+class WindowsInstance:
+    """Local, logon-scoped pipe. Only a four-byte 'show' command is accepted."""
+
+    def __init__(self, on_show):
+        import ctypes as c
+        from ctypes import wintypes as w
+        self.c, self.w = c, w
+        self.k = c.WinDLL('kernel32', use_last_error=True)
+        self.a = c.WinDLL('advapi32', use_last_error=True)
+        self.stop = threading.Event()
+        self.thread = None
+        self.handle = self.mutex = None
+        self.on_show = on_show
+        class SA(c.Structure):
+            _fields_ = [('length', w.DWORD), ('descriptor', c.c_void_p), ('inherit', w.BOOL)]
+        class OVERLAPPED(c.Structure):
+            _fields_ = [('Internal', c.c_size_t), ('InternalHigh', c.c_size_t),
+                        ('Offset', w.DWORD), ('OffsetHigh', w.DWORD), ('hEvent', w.HANDLE)]
+        class SID_ATTR(c.Structure):
+            _fields_ = [('Sid', c.c_void_p), ('Attributes', w.DWORD)]
+        class GROUPS(c.Structure):
+            _fields_ = [('count', w.DWORD), ('groups', SID_ATTR * 1)]
+        self.SA, self.OV = SA, OVERLAPPED
+        signatures = {
+            'GetCurrentProcess': (w.HANDLE, []),
+            'CreateMutexW': (w.HANDLE, [c.c_void_p, w.BOOL, w.LPCWSTR]),
+            'CloseHandle': (w.BOOL, [w.HANDLE]),
+            'LocalFree': (c.c_void_p, [c.c_void_p]),
+            'CreateNamedPipeW': (w.HANDLE, [w.LPCWSTR, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, c.c_void_p]),
+            'CreateFileW': (w.HANDLE, [w.LPCWSTR, w.DWORD, w.DWORD, c.c_void_p, w.DWORD, w.DWORD, w.HANDLE]),
+            'CreateEventW': (w.HANDLE, [c.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]),
+            'ConnectNamedPipe': (w.BOOL, [w.HANDLE, c.c_void_p]),
+            'DisconnectNamedPipe': (w.BOOL, [w.HANDLE]),
+            'ReadFile': (w.BOOL, [w.HANDLE, c.c_void_p, w.DWORD, c.c_void_p, c.c_void_p]),
+            'WriteFile': (w.BOOL, [w.HANDLE, c.c_void_p, w.DWORD, c.c_void_p, c.c_void_p]),
+            'WaitForSingleObject': (w.DWORD, [w.HANDLE, w.DWORD]),
+            'GetOverlappedResult': (w.BOOL, [w.HANDLE, c.c_void_p, c.c_void_p, w.BOOL]),
+            'CancelIoEx': (w.BOOL, [w.HANDLE, c.c_void_p]),
+        }
+        for name, (restype, args) in signatures.items():
+            fn = getattr(self.k, name)
+            fn.restype, fn.argtypes = restype, args
+        for name, args in {
+            'OpenProcessToken': [w.HANDLE, w.DWORD, c.c_void_p],
+            'GetTokenInformation': [w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.c_void_p],
+            'ConvertSidToStringSidW': [c.c_void_p, c.c_void_p],
+            'ConvertStringSecurityDescriptorToSecurityDescriptorW': [w.LPCWSTR, w.DWORD, c.c_void_p, c.c_void_p],
+        }.items():
+            fn = getattr(self.a, name)
+            fn.restype, fn.argtypes = w.BOOL, args
+        token, size = w.HANDLE(), w.DWORD()
+        if not self.a.OpenProcessToken(self.k.GetCurrentProcess(), 8, c.byref(token)):
+            raise c.WinError(c.get_last_error())
+        try:
+            self.a.GetTokenInformation(token, 28, None, 0, c.byref(size))  # TokenLogonSid
+            buf = c.create_string_buffer(size.value)
+            if not self.a.GetTokenInformation(token, 28, buf, size, c.byref(size)):
+                raise c.WinError(c.get_last_error())
+            groups = c.cast(buf, c.POINTER(GROUPS)).contents
+            if groups.count != 1:
+                raise OSError('не удалось определить сеанс входа Windows')
+            sid = w.LPWSTR()
+            if not self.a.ConvertSidToStringSidW(groups.groups[0].Sid, c.byref(sid)):
+                raise c.WinError(c.get_last_error())
+            try:
+                self.sid = sid.value
+            finally:
+                self.k.LocalFree(c.cast(sid, c.c_void_p))
+        finally:
+            self.k.CloseHandle(token)
+        self.name = '\\\\.\\pipe\\PhotocloudBackup-' + self.sid
+
+    def acquire(self):
+        c, w, k = self.c, self.w, self.k
+        # Keep the old mutex name during migration: never start beside an old TCP client.
+        self.mutex = k.CreateMutexW(None, False, 'Local\\PhotocloudBackup')
+        err = c.get_last_error()
+        if not self.mutex:
+            raise c.WinError(err)
+        if err == 183:
+            k.CloseHandle(self.mutex)
+            self.mutex = None
+            if not self.poke():
+                raise OSError('Клиент уже запущен, но не отвечает через канал. Закрой прежнюю версию в трее и повтори запуск.')
+            return False
+        descriptor = c.c_void_p()
+        try:
+            # Protected DACL: this Windows logon only, no Everyone/anonymous access.
+            if not self.a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    f'D:P(A;;GA;;;{self.sid})', 1, c.byref(descriptor), None):
+                raise c.WinError(c.get_last_error())
+            sa = self.SA(c.sizeof(self.SA), descriptor, False)
+            self.handle = k.CreateNamedPipeW(self.name, 0x40080003, 0x0e, 1, 64, 64, 0, c.byref(sa))
+            # DUPLEX | OVERLAPPED | FIRST_INSTANCE; MESSAGE | READMODE_MESSAGE | REJECT_REMOTE
+            if self.handle == c.c_void_p(-1).value:
+                self.handle = None
+                raise c.WinError(c.get_last_error())
+            self.thread = threading.Thread(target=self.serve, name='instance-pipe', daemon=True)
+            self.thread.start()
+            return True
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if descriptor:
+                k.LocalFree(descriptor)
+
+    def poke(self):
+        c, w, k = self.c, self.w, self.k
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            h = k.CreateFileW(self.name, 0xC0000000, 0, None, 3, 0x40100000, None)
+            # SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS: server cannot impersonate caller.
+            if h != c.c_void_p(-1).value:
+                try:
+                    self.io(handle=h, write=b'show')
+                    if self.io(handle=h) != b'ok':
+                        return False
+                    self.io(handle=h, write=b'done')
+                    return True
+                except OSError:
+                    return False
+                finally:
+                    k.CloseHandle(h)
+            if c.get_last_error() not in (2, 231):
+                return False
+            time.sleep(.05)
+        return False
+
+    def io(self, connect=False, handle=None, write=None):
+        c, w, k = self.c, self.w, self.k
+        handle = self.handle if handle is None else handle
+        ov = self.OV()
+        ov.hEvent = k.CreateEventW(None, True, False, None)
+        if not ov.hEvent:
+            raise c.WinError(c.get_last_error())
+        n, buf = w.DWORD(), c.create_string_buffer(16)
+        pending = False
+        try:
+            if connect:
+                ok = k.ConnectNamedPipe(handle, c.byref(ov))
+            elif write is not None:
+                ok = k.WriteFile(handle, write, len(write), c.byref(n), c.byref(ov))
+            else:
+                ok = k.ReadFile(handle, buf, 16, c.byref(n), c.byref(ov))
+            if not ok:
+                err = c.get_last_error()
+                if connect and err in (535, 232):
+                    return b''
+                if err != 997:
+                    raise c.WinError(err)
+                pending = True
+                deadline = time.monotonic() + 2 if not connect else float('inf')
+                while k.WaitForSingleObject(ov.hEvent, 100) == 258:
+                    if self.stop.is_set() or time.monotonic() >= deadline:
+                        raise TimeoutError('ожидание команды канала прервано')
+                if not k.GetOverlappedResult(handle, c.byref(ov), c.byref(n), False):
+                    raise c.WinError(c.get_last_error())
+                pending = False
+            return buf.raw[:n.value]
+        finally:
+            if pending:
+                k.CancelIoEx(handle, c.byref(ov))
+                k.GetOverlappedResult(handle, c.byref(ov), c.byref(n), True)
+            k.CloseHandle(ov.hEvent)
+
+    def serve(self):
+        while not self.stop.is_set():
+            try:
+                self.io(connect=True)
+                if self.io() == b'show' and not self.stop.is_set():
+                    self.on_show()
+                    self.io(write=b'ok')
+                    self.io()  # client consumed acknowledgement; bounded wait before disconnect
+            except (OSError, TimeoutError):
+                pass
+            finally:
+                self.k.DisconnectNamedPipe(self.handle)
+
+    def close(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join()  # overlapped waits check stop every 100 ms
+            self.thread = None
+        if self.handle:
+            self.k.CloseHandle(self.handle)
+            self.handle = None
+        if self.mutex:
+            self.k.CloseHandle(self.mutex)
+            self.mutex = None
+
+
 class SingleInstance:
     """Второй запуск не создаёт второй клиент, а показывает окно первого.
-    Первый экземпляр слушает 127.0.0.1 на случайном порту, номер — в файле рядом с настройками."""
+    Windows: именованный канал текущего сеанса. На остальных ОС — локальный TCP."""
 
     def __init__(self, folder: Path, on_show):
         self.port_file = folder / "instance.port"
         self.on_show = on_show
         self.sock: socket.socket | None = None
-        self._mutex = None
+        self._win = WindowsInstance(on_show) if IS_WIN else None
+
+    def close(self):
+        if self._win:
+            self._win.close()
+        if self.sock:
+            self.sock.close()
 
     def acquire(self) -> bool:
-        if IS_WIN:
-            import ctypes
-            self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\PhotocloudBackup")
-            if ctypes.windll.kernel32.GetLastError() == 183:       # ERROR_ALREADY_EXISTS
-                self._poke()
-                return False
-        elif self._poke():
+        if self._win:
+            acquired = self._win.acquire()
+            if acquired:
+                try:
+                    self.port_file.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("не удалось убрать старый instance.port")
+            return acquired
+        if self._poke():
             return False
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
@@ -2725,7 +2925,14 @@ def main() -> None:
         except (ValueError, IndexError):
             pass
     app = None
-    inst = winutil.SingleInstance(d, lambda: app and app.q.put(app.show))
+    show_pending = threading.Event()
+    def request_show():
+        show_pending.set()
+        if app:
+            app.q.put(app.show)
+    inst = winutil.SingleInstance(d, request_show)
+    import atexit
+    atexit.register(inst.close)
     if not inst.acquire():
         log.info("уже запущен — показываю окно работающей копии")
         return                                   # уже запущен — показали его окно
@@ -2747,9 +2954,12 @@ def main() -> None:
     engine.start()
     log.info("запуск, папка: %s", cfg.root or "—")
     app = App(cfg, engine, script, start_hidden="--tray" in sys.argv, log_path=log_path)
+    if show_pending.is_set():
+        app.q.put(app.show)
     try:
         app.run()
     finally:
+        inst.close()
         engine.shutdown()
 
 
