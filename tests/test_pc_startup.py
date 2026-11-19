@@ -51,3 +51,35 @@ class StartupTests(unittest.TestCase):
                 app._show = Mock()
             callback()
             self.assertEqual(app.items, [])
+
+
+class RestoreFilesystemTests(unittest.TestCase):
+    def test_verified_replace_retry_and_tamper(self):
+        import hashlib
+        import sys
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'USERPROFILE': directory, 'XDG_CONFIG_HOME': directory}), patch.object(sys, 'excepthook'):
+            module = runpy.run_path(str(ROOT / 'pc/photocloud_pc.pyw'))
+            root = Path(directory) / 'archive'
+            (root / 'Restored').mkdir(parents=True)
+            dst = root / 'photo.jpg'
+            dst.write_bytes(b'bad')
+            os.utime(dst, (1700000000, 1700000000))
+            src = root / 'Restored/photo.jpg'
+            src.write_bytes(b'bad')
+            item = dict(path='photo.jpg', restored='photo.jpg', size=3, mtime=1700000000,
+                        sha_good=hashlib.sha256(b'new').hexdigest(), sha_bad=hashlib.sha256(b'bad').hexdigest())
+            with self.assertRaises(ValueError):
+                module['apply_restored'](root, item)
+            self.assertEqual(dst.read_bytes(), b'bad')
+            src.write_bytes(b'new')
+            with patch.object(module['os'], 'replace', side_effect=PermissionError('file locked')):
+                with self.assertRaises(PermissionError):
+                    module['apply_restored'](root, item)
+            self.assertEqual(dst.read_bytes(), b'bad')
+            self.assertFalse(list(root.glob('.photocloud-restore-*')))
+            self.assertTrue(module['apply_restored'](root, item))
+            self.assertEqual(dst.read_bytes(), b'new')
+            self.assertEqual(int(dst.stat().st_mtime), 1700000000)
+            self.assertFalse(module['apply_restored'](root, item))
+            self.assertFalse(list(root.glob('.photocloud-restore-*')))
+            self.assertTrue(any(p.read_bytes() == b'bad' for p in (module['app_dir']() / 'replaced-originals').glob('*.bak')))
