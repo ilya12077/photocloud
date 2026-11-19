@@ -127,6 +127,7 @@ class LiveRestoreTests(unittest.TestCase):
             self.assertFalse(list(self.media.glob('.photocloud-restore-*')))
 
     def test_auth_revision_and_unannounced_file(self):
+        self.assertIn('Применить восстановленные копии', self.http.get('/admin').text)
         it = self.item('stale.jpg')
         self.assertEqual(self.http.get('/api/pc/restored').status_code, 401)
         self.assertEqual(self.http.post('/api/pc/restored/complete', json=self.body(it)).status_code, 401)
