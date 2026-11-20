@@ -395,7 +395,11 @@ class DB:
         return had
 
     def finish_deletions(self, items):
-        """Record confirmed deletions and clear their marks in one transaction."""
+        """Record confirmed deletions and clear their marks atomically.
+
+        Do not delete user_hidden: a photo recovered from the recycle bin
+        must remain hidden for the users who originally hid it.
+        """
         paths = []
         with self.mu:
             self.con.execute("BEGIN IMMEDIATE")
@@ -411,7 +415,6 @@ class DB:
                         continue
                     self.con.execute("INSERT OR REPLACE INTO backup_deleted VALUES(?,?)", (path, time.time()))
                     self.con.execute("DELETE FROM delete_marks WHERE path=?", (path,))
-                    self.con.execute("DELETE FROM user_hidden WHERE path=?", (path,))
                     paths.append(path)
                 self.con.execute("COMMIT")
             except BaseException:
