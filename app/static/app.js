@@ -1434,7 +1434,13 @@ function stopServer(id) {
     headers: { 'X-Requested-With': 'photocloud' } }).catch(() => {});
 }
 function stopVideo() {
-  $('v-note').hidden = true; $('v-origwrap').hidden = true;
+  clearTimeout(V.qualityStallTimer); V.qualityStallTimer = 0;
+  if (V.qualityRequest) { V.qualityRequest.abort(); V.qualityRequest = null; }
+  V.qualitySequence = (V.qualitySequence || 0) + 1;
+  qualityMenuOpen(false);
+  $('v-note').hidden = true; $('v-quality').hidden = true;
+  V.videoQuality = null; V.videoSource = null; V.autoAdaptive = false;
+  V.allowedQualities = [];
   if (V.hls) { V.hls.destroy(); V.hls = null; }
   if (V.vidPid) { stopServer(V.vidPid); V.vidPid = null; }
   const v = $('v-video'); v.pause(); v.removeAttribute('src'); v.removeAttribute('poster'); v.load(); v.hidden = true;
@@ -1451,52 +1457,192 @@ function loadHls() {
   return hlsLib;
 }
 
-async function playVideo(ph, tok, startAt) {
-  const v = $('v-video');
-  const canTranscode = st.me && st.me.transcode;
-  // Новый ключ: после обновления всем по умолчанию открываем исходный файл,
-  // даже если раньше сохранялся выключенный «Оригинал». Явное выключение
-  // «без сжатия» запоминаем для следующих видео.
-  const orig = !canTranscode || store('pc.vraw') !== '0';
-  $('v-origwrap').hidden = !canTranscode; $('v-origchk').checked = orig;
-  $('v-note').hidden = !(orig && (ph[6] & F_NOPLAY));
-  if (!$('v-note').hidden) {
-    $('v-note').textContent = canTranscode
-      ? 'Браузер может не воспроизвести этот формат без сжатия. Сними галочку «без сжатия» или скачай файл кнопкой ⤓.'
-      : 'Этот формат видео браузер не воспроизводит — скачай файл кнопкой ⤓.';
+const QUALITY_NAMES = { auto: 'Авто', orig: 'Оригинал', p144: '144p', p240: '240p',
+  p720: '720p', p1080: '1080p', p2160: '4K' };
+const videoPref = () => QUALITY_NAMES[store('pc.vquality')] ? store('pc.vquality') : 'auto';
+
+function qualityMenuOpen(visible) {
+  $('v-quality-menu').hidden = !visible;
+  $('v-quality-toggle').setAttribute('aria-expanded', String(visible));
+}
+function updateVideoQuality() {
+  const mode = V.videoQuality || 'auto';
+  const automatic = mode === 'auto' ? (V.autoAdaptive ? 'адаптивно' : 'оригинал') : '';
+  $('v-quality-state').textContent = QUALITY_NAMES[mode] + (automatic ? ' · ' + automatic : '');
+  for (const button of $('v-quality-menu').querySelectorAll('[role="menuitemradio"]')) {
+    const chosen = button.dataset.quality === mode;
+    button.classList.toggle('on', chosen);
+    button.setAttribute('aria-checked', String(chosen));
   }
-  if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
-  if (orig) { v.src = origUrl(ph, false); return; }
-  const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // сжатый HLS, если «без сжатия» выключено
-  V.vidPid = ph[0];
-  // Сначала hls.js (через MediaSource): новый Chrome на Android заявляет «родную»
-  // поддержку HLS, но наш поток в ней не играет — шкала есть, видео нет. Родной HLS —
-  // только там, где hls.js не работает (старые iPhone).
-  try {
-    const Hls = await loadHls();
-    if (tok !== V.token) return;
-    if (!Hls || !Hls.isSupported()) {
-      v.src = v.canPlayType('application/vnd.apple.mpegurl') ? url : origUrl(ph, false);
-      return;
-    }
-    V.hls = new Hls({ enableWorker: false, maxBufferLength: 20, backBufferLength: 30 });
-    V.hls.on(Hls.Events.ERROR, (_e, d) => {
-      if (!d.fatal || tok !== V.token) return;
-      // перекодированный поток не пошёл — показываем оригинал, чтобы видео всё равно открылось
-      if (V.hls) { V.hls.destroy(); V.hls = null; }
-      v.src = origUrl(ph, false);
-    });
-    V.hls.loadSource(url); V.hls.attachMedia(v);
-  } catch (_) { v.src = origUrl(ph, false); }
+}
+function videoQualityURL(ph, profile) {
+  return '/vid/' + encodeURIComponent(ph[0]) + '/' + profile + '/index.m3u8?v=' + ph[4];
+}
+function videoNotice(message) {
+  $('v-note').textContent = message;
+  $('v-note').hidden = false;
 }
 
-$('v-origchk').addEventListener('change', (e) => {
-  store('pc.vraw', e.target.checked ? '1' : '0');
-  const ph = st.list[V.i]; if (!ph) return;
-  const v = $('v-video'), t = v.currentTime, playing = !v.paused;
+async function fetchVideoQualities(ph, token) {
+  if (!(st.me && st.me.transcode)) return;
+  const ctrl = new AbortController();
+  V.qualityRequest = ctrl;
+  try {
+    const response = await fetch('/vid/' + encodeURIComponent(ph[0]) + '/quality', {
+      credentials: 'same-origin', cache: 'no-store', signal: ctrl.signal
+    });
+    if (!response.ok) return;
+    const meta = await response.json();
+    if (token !== V.token || ctrl.signal.aborted) return;
+    const allowed = Array.isArray(meta.profiles) ? meta.profiles : [];
+    V.allowedQualities = allowed;
+    for (const button of $('v-quality-menu').querySelectorAll('[role="menuitemradio"]')) {
+      if (button.dataset.quality.startsWith('p')) button.hidden = !allowed.includes(button.dataset.quality);
+    }
+    // Выбор 4K из прошлого видео не может примениться к Full HD.
+    if (V.videoQuality && V.videoQuality.startsWith('p') && !allowed.includes(V.videoQuality)) {
+      store('pc.vquality', 'auto');
+      V.videoQuality = 'auto';
+      V.autoAdaptive = false;
+      switchVideoQuality(ph);
+    }
+  } catch (error) {
+    if (error.name !== 'AbortError') console.debug('Не удалось определить разрешение видео', error);
+  } finally {
+    if (V.qualityRequest === ctrl) V.qualityRequest = null;
+  }
+}
+
+async function playVideo(ph, token, startAt = 0, resume = false) {
+  const v = $('v-video');
+  const canTranscode = !!(st.me && st.me.transcode);
+  const mode = canTranscode ? (V.videoQuality || 'auto') : 'orig';
+  const source = mode === 'auto' ? (V.autoAdaptive ? 'auto' : 'orig') : mode;
+  const sequence = ++V.qualitySequence;
+  V.videoSource = source;
+  $('v-quality').hidden = false;
+  $('v-quality-menu').querySelector('[data-quality="optimize"]').hidden = !canTranscode;
+  updateVideoQuality();
+  $('v-note').hidden = !(source === 'orig' && (ph[6] & F_NOPLAY));
+  if (!$('v-note').hidden) videoNotice(canTranscode
+    ? 'Браузер не поддерживает этот исходный формат. Выбери «Авто» или разрешение через ⚙.'
+    : 'Браузер не поддерживает этот формат — скачай видео кнопкой ⤓.');
+  if (startAt > 0) v.addEventListener('loadedmetadata', () => {
+    if (token === V.token && sequence === V.qualitySequence && Number.isFinite(v.duration)) {
+      v.currentTime = Math.min(startAt, Math.max(0, v.duration - 0.1));
+    }
+  }, { once: true });
+  if (resume) v.addEventListener('canplay', () => {
+    if (token === V.token && sequence === V.qualitySequence && !v.hidden) v.play().catch(() => {});
+  }, { once: true });
+  if (source === 'orig') {
+    v.src = origUrl(ph, false);
+    return;
+  }
+  V.vidPid = ph[0];
+  const url = videoQualityURL(ph, source);
+  try {
+    const Hls = await loadHls();
+    if (token !== V.token || sequence !== V.qualitySequence) return;
+    if (!Hls || !Hls.isSupported()) {
+      if (v.canPlayType('application/vnd.apple.mpegurl')) v.src = url;
+      else {
+        V.videoSource = 'orig';
+        videoNotice('Браузер не поддерживает HLS — используется исходный файл.');
+        v.src = origUrl(ph, false);
+      }
+      return;
+    }
+    const hls = new Hls({ enableWorker: false, maxBufferLength: 20, backBufferLength: 30,
+      abrEwmaDefaultEstimate: 1300000, startLevel: -1 });
+    V.hls = hls;
+    hls.on(Hls.Events.LEVEL_SWITCHED, () => {
+      if (V.hls !== hls || source !== 'auto') return;
+      const level = hls.levels && hls.levels[hls.currentLevel];
+      const href = level && level.url && (Array.isArray(level.url) ? level.url[0] : level.url);
+      const found = href && /\/(p144|p240|p720|p1080|p2160)\//.exec(href);
+      $('v-quality-state').textContent = 'Авто · ' + (found ? QUALITY_NAMES[found[1]] : 'адаптивно');
+    });
+    hls.on(Hls.Events.ERROR, (_event, detail) => {
+      if (!detail.fatal || token !== V.token || sequence !== V.qualitySequence) return;
+      if (V.hls === hls) { hls.destroy(); V.hls = null; }
+      V.videoSource = 'orig';
+      videoNotice('Не удалось воспроизвести сжатый поток. Используется исходный файл.');
+      v.src = origUrl(ph, false);
+    });
+    hls.loadSource(url);
+    hls.attachMedia(v);
+  } catch (_error) {
+    if (token === V.token && sequence === V.qualitySequence) {
+      V.videoSource = 'orig';
+      videoNotice('Адаптивный плеер недоступен, используется исходный файл.');
+      v.src = origUrl(ph, false);
+    }
+  }
+}
+function switchVideoQuality(ph) {
+  if (!ph) return;
+  const v = $('v-video'), time = v.currentTime || 0, wasPlaying = !v.paused;
+  clearTimeout(V.qualityStallTimer); V.qualityStallTimer = 0;
   if (V.hls) { V.hls.destroy(); V.hls = null; }
-  v.removeAttribute('src'); v.load();
-  playVideo(ph, V.token, t).then(() => { if (playing) v.play().catch(() => {}); });
+  if (V.videoQuality === 'orig' && V.vidPid) { stopServer(V.vidPid); V.vidPid = null; }
+  v.pause();
+  v.removeAttribute('src');
+  v.load();
+  playVideo(ph, V.token, time, wasPlaying);
+}
+function switchToAdaptive() {
+  if (V.videoQuality !== 'auto' || V.autoAdaptive || !(st.me && st.me.transcode)) return;
+  V.autoAdaptive = true;
+  switchVideoQuality(st.list[V.i]);
+}
+$('v-quality-toggle').addEventListener('click', () => qualityMenuOpen($('v-quality-menu').hidden));
+$('v-quality-menu').addEventListener('click', (event) => {
+  const option = event.target.closest('button[data-quality]');
+  if (!option || option.hidden) return;
+  const quality = option.dataset.quality;
+  qualityMenuOpen(false);
+  if (quality === 'optimize') {
+    if (!V.autoAdaptive || V.videoQuality !== 'auto') {
+      V.videoQuality = 'auto';
+      V.autoAdaptive = false;
+      store('pc.vquality', 'auto');
+      switchToAdaptive();
+    }
+    return;
+  }
+  if (quality.startsWith('p') && !V.allowedQualities.includes(quality)) return;
+  if (quality === V.videoQuality && !(quality === 'auto' && V.autoAdaptive)) return;
+  store('pc.vquality', quality);
+  V.videoQuality = quality;
+  V.autoAdaptive = false;
+  switchVideoQuality(st.list[V.i]);
+});
+document.addEventListener('click', (event) => {
+  if (!$('v-quality').contains(event.target)) qualityMenuOpen(false);
+});
+const qualityVideo = $('v-video');
+function clearVideoStall() {
+  clearTimeout(V.qualityStallTimer);
+  V.qualityStallTimer = 0;
+}
+function onVideoStall() {
+  if (V.videoQuality !== 'auto' || V.autoAdaptive || V.videoSource !== 'orig'
+      || qualityVideo.paused || qualityVideo.seeking) return;
+  clearVideoStall();
+  V.qualityStallTimer = setTimeout(() => {
+    if (V.videoQuality === 'auto' && !V.autoAdaptive && !qualityVideo.paused
+        && !qualityVideo.seeking && qualityVideo.readyState < 3) switchToAdaptive();
+  }, 2500);
+}
+qualityVideo.addEventListener('waiting', onVideoStall);
+qualityVideo.addEventListener('stalled', onVideoStall);
+for (const name of ['playing', 'canplay', 'pause', 'seeking', 'seeked']) {
+  qualityVideo.addEventListener(name, clearVideoStall);
+}
+qualityVideo.addEventListener('error', () => {
+  if (V.videoQuality === 'auto' && !V.autoAdaptive && V.videoSource === 'orig'
+      && !qualityVideo.hidden) switchToAdaptive();
 });
 
 function show(i) {
@@ -1527,6 +1673,15 @@ function show(i) {
   if (isVideo) {
     const v = $('v-video'); v.hidden = false; v.poster = imgUrl('m', ph);
     low.style.visibility = 'hidden'; $('v-spin').hidden = true;
+    V.videoQuality = videoPref();
+    V.autoAdaptive = false;
+    V.qualitySequence = V.qualitySequence || 0;
+    V.allowedQualities = [];
+    for (const button of $('v-quality-menu').querySelectorAll('[role="menuitemradio"]')) {
+      if (button.dataset.quality.startsWith('p')) button.hidden = true;
+    }
+    if (!(st.me && st.me.transcode) && V.videoQuality.startsWith('p')) V.videoQuality = 'orig';
+    fetchVideoQualities(ph, tok);
     playVideo(ph, tok, 0);
   } else {
     // Загрузка по ступеням, строго по очереди (на медленном канале параллельные
