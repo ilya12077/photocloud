@@ -1454,12 +1454,20 @@ function loadHls() {
 async function playVideo(ph, tok, startAt) {
   const v = $('v-video');
   const canTranscode = st.me && st.me.transcode;
-  const orig = !canTranscode || store('pc.vorig') === '1';
+  // Новый ключ: после обновления всем по умолчанию открываем исходный файл,
+  // даже если раньше сохранялся выключенный «Оригинал». Явное выключение
+  // «без сжатия» запоминаем для следующих видео.
+  const orig = !canTranscode || store('pc.vraw') !== '0';
   $('v-origwrap').hidden = !canTranscode; $('v-origchk').checked = orig;
   $('v-note').hidden = !(orig && (ph[6] & F_NOPLAY));
+  if (!$('v-note').hidden) {
+    $('v-note').textContent = canTranscode
+      ? 'Браузер может не воспроизвести этот формат без сжатия. Сними галочку «без сжатия» или скачай файл кнопкой ⤓.'
+      : 'Этот формат видео браузер не воспроизводит — скачай файл кнопкой ⤓.';
+  }
   if (startAt) v.addEventListener('loadedmetadata', () => { v.currentTime = startAt; }, { once: true });
   if (orig) { v.src = origUrl(ph, false); return; }
-  const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // без сжатия — галочка «Оригинал»
+  const url = `/vid/${encodeURIComponent(ph[0])}/eco/index.m3u8?v=${ph[4]}`;   // сжатый HLS, если «без сжатия» выключено
   V.vidPid = ph[0];
   // Сначала hls.js (через MediaSource): новый Chrome на Android заявляет «родную»
   // поддержку HLS, но наш поток в ней не играет — шкала есть, видео нет. Родной HLS —
@@ -1483,7 +1491,7 @@ async function playVideo(ph, tok, startAt) {
 }
 
 $('v-origchk').addEventListener('change', (e) => {
-  store('pc.vorig', e.target.checked ? '1' : '0');
+  store('pc.vraw', e.target.checked ? '1' : '0');
   const ph = st.list[V.i]; if (!ph) return;
   const v = $('v-video'), t = v.currentTime, playing = !v.paused;
   if (V.hls) { V.hls.destroy(); V.hls = null; }
