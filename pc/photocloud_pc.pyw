@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.3"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.4"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -385,6 +385,27 @@ def recycle_with_fallback(ready, recycle, validate, should_stop):
         for bad, _path, why in attempt(revalidate([(item, path, reason)])):
             failed.append((bad["path"], why))
     return gone, failed
+
+def plan_action_groups(sizes, outer_width, padding=12, gap=8, row_gap=6):
+    """Координаты групп в независимых строках; общих колонок между строками нет.
+
+    sizes: (ширина, высота) каждой группы. Возвращает (геометрия, высота панели).
+    При очень узком окне ширина группы не обрезается: вызывающий должен
+    установить минимальную ширину окна не меньше самой широкой группы.
+    """
+    available = max(1, int(outer_width) - 2 * padding)
+    x, y, row_height = padding, 0, 0
+    positions = []
+    for width, height in sizes:
+        width, height = int(width), int(height)
+        if x > padding and x + width > padding + available:
+            x, y = padding, y + row_height + row_gap
+            row_height = 0
+        positions.append((x, y, width, height))
+        x += width + gap
+        row_height = max(row_height, height)
+    return positions, y + row_height + row_gap + 8
+
 
 # ======================================================================== сервер
 
@@ -810,8 +831,9 @@ class App:
         self.status.pack(side="left", fill="x", expand=True)
 
         # Общий адаптивный ряд для пяти групп. Переносим их целиком по ширине окна.
-        toolbar = ttk.Frame(main, padding=(12, 0, 12, 8))
+        toolbar = ttk.Frame(main, height=62)
         toolbar.pack(fill="x")
+        toolbar.pack_propagate(False)   # дочерние группы размещаются через place()
         listing = ttk.LabelFrame(toolbar, text="Список", padding=(8, 5))
         self.b_reload = ttk.Button(listing, text="Обновить список", command=self.load)
         self.b_reload.pack()
@@ -859,27 +881,26 @@ class App:
         self.root.bind_all("<Button-5>", self._wheel)
 
     def _arrange_actions(self, _event=None) -> None:
-        """При расширении окна группы переходят в общий ряд, при сужении переносятся."""
+        """Строки независимы по горизонтали: группа никогда не вылезает за окно."""
         toolbar = self._action_groups[0].master
-        available = max(1, toolbar.winfo_width() - 24)
-        row, width, rows = 0, 0, []
-        for group in self._action_groups:
-            needed = group.winfo_reqwidth() + 8
-            if width and width + needed > available:
-                row += 1
-                width = 0
-            rows.append(row)
-            width += needed
-        layout = tuple(rows)
-        if self._action_layout == layout:
+        sizes = [(group.winfo_reqwidth(), group.winfo_reqheight()) for group in self._action_groups]
+        # На большом масштабе Windows не разрешаем сузить окно сильнее самой
+        # широкой группы. Иначе физически невозможно показать её целиком.
+        required_width = max(820, max(width for width, _ in sizes) + 24)
+        if self.root.winfo_width() < required_width or _event is None:
+            self.root.minsize(required_width, 420)
+
+        width = toolbar.winfo_width()
+        if width <= 1:  # окно ещё не рассчитано Tk — следующее Configure даст реальную ширину
+            return
+        positions, height = plan_action_groups(sizes, width)
+        layout = (tuple(positions), height)
+        if layout == self._action_layout:
             return
         self._action_layout = layout
-        columns = {}
-        for group, r in zip(self._action_groups, rows):
-            group.grid_forget()
-            col = columns.get(r, 0)
-            group.grid(row=r, column=col, padx=(0, 8), pady=(0, 5), sticky="nw")
-            columns[r] = col + 1
+        toolbar.configure(height=height)
+        for group, (x, y, _width, _height) in zip(self._action_groups, positions):
+            group.place(x=x, y=y)
 
     def _build_log(self, lg) -> None:
         bot = ttk.Frame(lg, padding=(8, 6))
