@@ -16,20 +16,13 @@ import sys
 log = logging.getLogger("photocloud.transcode")
 
 SEG = 4.0                          # длина куска, с
-# Фиксированные профили HLS. Качество ограничивается разрешением оригинала.
+# сжатое видео для просмотра; без сжатия — исходный файл (галочка «Оригинал»)
 PROFILES = {
-    "p144":  {"h": 144,  "crf": "31", "maxrate": "180k", "bufsize": "360k", "ab": "48k", "bandwidth": 270000, "level": "3.0"},
-    "p240":  {"h": 240,  "crf": "30", "maxrate": "350k", "bufsize": "700k", "ab": "48k", "bandwidth": 480000, "level": "3.0"},
-    "p720":  {"h": 720,  "crf": "28", "maxrate": "1000k", "bufsize": "2000k", "ab": "64k", "bandwidth": 1300000, "level": "4.1"},
-    "p1080": {"h": 1080, "crf": "25", "maxrate": "3500k", "bufsize": "7000k", "ab": "128k", "bandwidth": 4200000, "level": "4.2"},
-    "p2160": {"h": 2160, "crf": "23", "maxrate": "14000k", "bufsize": "28000k", "ab": "160k", "bandwidth": 17000000, "level": "5.2"},
+    # 720p ~1 Мбит/с: идёт без пауз даже на 2 Мбит/с мобильного интернета
+    "eco": {"h": 720, "crf": "28", "maxrate": "1000k", "bufsize": "2000k", "ab": "64k"},
 }
-PROFILES["eco"] = PROFILES["p720"]  # Совместимость со старыми вкладками
-QUALITY_PROFILES = ("p144", "p240", "p720", "p1080", "p2160")
 _FPS_RE = re.compile(rb"Video:.*?(\d+(?:\.\d+)?) fps")
-_DIM_RE = re.compile(rb"Stream[^\r\n]*Video:[^\r\n]*?(\d{2,5})x(\d{2,5})(?:[^\d]|$)")
 fps_of: dict[str, float] = {}     # src -> частота кадров (из того же вызова ffmpeg -i)
-dimensions_of: dict[str, tuple[int, int]] = {}
 _DUR_RE = re.compile(rb"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 _FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
@@ -52,13 +45,6 @@ def probe_duration(ffmpeg: str, src: str, protocols: str, demuxer: str) -> float
         if len(fps_of) > 5000:
             fps_of.clear()
         fps_of[src] = float(f.group(1))
-    resolution = _DIM_RE.search(r.stderr)
-    if resolution:
-        if len(dimensions_of) > 5000:
-            dimensions_of.clear()
-        dimensions_of[src] = int(resolution.group(1)), int(resolution.group(2))
-    else:
-        dimensions_of.pop(src, None)
     m = _DUR_RE.search(r.stderr)
     if not m:
         return None
@@ -77,23 +63,6 @@ def playlist(duration: float, seg_url) -> str:
     return "\n".join(lines) + "\n"
 
 
-def quality_profiles(short_side: int) -> tuple[str, ...]:
-    """Профили не выше фактической короткой стороны оригинального видео."""
-    return tuple(name for name in QUALITY_PROFILES if PROFILES[name]["h"] <= short_side) or ("p144",)
-
-
-def master_playlist(pid: str, stamp: int, short_side: int) -> str:
-    """HLS с несколькими битрейтами для адаптивного выбора браузером."""
-    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-INDEPENDENT-SEGMENTS"]
-    for name in quality_profiles(short_side):
-        p = PROFILES[name]
-        level_hex = {"3.0": "1e", "4.1": "29", "4.2": "2a", "5.2": "34"}[p["level"]]
-        codecs = f'avc1.6400{level_hex},mp4a.40.2'
-        lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={p["bandwidth"]},CODECS="{codecs}"')
-        lines.append(f"/vid/{pid}/{name}/index.m3u8?v={stamp}")
-    return "\n".join(lines) + "\n"
-
-
 def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, duration: float,
             profile: str) -> bytes:
     from .video import picture_fix
@@ -109,12 +78,10 @@ def segment(ffmpeg: str, src: str, protocols: str, demuxer: str, index: int, dur
            # 60 к/с -> 30 (для просмотра хватает, а кодирование вдвое легче; кадры отбрасываются
            # до уменьшения, так что и масштабировать вдвое меньше). Не больше p["h"] по короткой
            # стороне (вертикальные тоже), чётные размеры, 8 бит.
-           "-vf", picture_fix(demuxer) + ("fps=30," if fps_of.get(src, 0) > 32 else "")
-                  + f"scale='if(gt(iw,ih),-2,max(2,trunc(min({p['h']},iw)/2)*2))':"
-                    f"'if(gt(iw,ih),max(2,trunc(min({p['h']},ih)/2)*2),-2)':flags=bilinear,format=yuv420p",
+           "-vf", picture_fix(demuxer) + ("fps=30," if fps_of.get(src, 0) > 32 else "") + f"scale='if(gt(iw,ih),-2,min({p['h']},iw))':'if(gt(iw,ih),min({p['h']},ih),-2)':flags=bilinear,format=yuv420p",
            "-c:v", "libx264", "-preset", "superfast", "-crf", p["crf"],
            "-maxrate", p["maxrate"], "-bufsize", p["bufsize"],
-           "-profile:v", "high", "-level", p["level"], "-g", "48",
+           "-profile:v", "high", "-level", "4.1", "-g", "48",
            "-force_key_frames", "expr:eq(n,0)",              # каждый кусок начинается с ключевого кадра
            "-c:a", "aac", "-ac", "2", "-b:a", p["ab"], "-ar", "48000",
            # метки времени — как в полном ролике, чтобы куски шли встык
