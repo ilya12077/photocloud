@@ -59,9 +59,11 @@ def _ntstatus(e: BaseException) -> int | None:
 
 
 def is_connection_error(e: BaseException) -> bool:
-    """Разрыв SMB/сети: не ошибка содержимого архива и не повод сбрасывать индекс."""
+    """Разрыв связи или временная перегрузка SMB: не удаляем прежний индекс."""
     return (isinstance(e, (ConnectionError, TimeoutError))
+            or _is_credit_error(e)
             or _ntstatus(e) in _RECONNECT_NT
+            or _ntstatus(e) == NT_REQUEST_NOT_ACCEPTED
             or (isinstance(e, ValueError) and isinstance(e.__cause__, OSError)))
 
 
@@ -168,9 +170,11 @@ class LocalStorage:
 # «кредитов» на одновременные запросы; если запросов больше, smbprotocol не ждёт, а
 # падает с «Request requires 1 credits but only 0 credits are available». Поэтому
 # одновременных сетевых операций — не больше SMB_PARALLEL, а нехватку кредитов
-# пережидаем короткой паузой (это не обрыв связи — переподключаться нельзя).
+# пережидаем с уменьшением параллелизма (это не разрыв связи: переподключаться нельзя).
 SMB_PARALLEL = 6
-SMB_BACKGROUND = 4     # фоновое чтение дат/обход папок — не больше стольких слотов
+SMB_BACKGROUND = 4     # верхний предел; при дефиците кредитов временно ниже
+SMB_CREDIT_RETRIES = 9
+SMB_CREDIT_COOLDOWN = 15.0
 
 
 class GateBusy(TimeoutError):
@@ -185,7 +189,15 @@ class _Gate:
     def __init__(self, n: int, bg_max: int):
         self.n, self.bg_max = n, bg_max
         self.used = self.bg_used = self.fg_waiting = 0
+        self.credit_limited_until = 0.0
         self.cv = threading.Condition()
+
+    def credit_shortage(self) -> None:
+        """Нехватка SMB credits: временно не более двух операций, из них одна фоновая."""
+        with self.cv:
+            self.credit_limited_until = max(self.credit_limited_until,
+                                            time.monotonic() + SMB_CREDIT_COOLDOWN)
+            self.cv.notify_all()
 
     def acquire(self, bg: bool, timeout: float) -> bool:
         end = time.monotonic() + timeout
@@ -194,14 +206,20 @@ class _Gate:
                 self.fg_waiting += 1
             try:
                 while True:
-                    if self.used < self.n and (not bg or (self.bg_used < self.bg_max and not self.fg_waiting)):
+                    now = time.monotonic()
+                    limited = now < self.credit_limited_until
+                    cap = min(self.n, 2) if limited else self.n
+                    bg_cap = min(self.bg_max, 1) if limited else self.bg_max
+                    if self.used < cap and (not bg or (self.bg_used < bg_cap and not self.fg_waiting)):
                         self.used += 1
                         self.bg_used += bg
                         return True
-                    left = end - time.monotonic()
+                    left = end - now
                     if left <= 0:
                         return False
-                    self.cv.wait(left)
+                    # Просыпаемся, когда ограничение снимется, даже если слоты не освобождались.
+                    credit_left = self.credit_limited_until - now if limited else left
+                    self.cv.wait(min(left, credit_left))
             finally:
                 if not bg:
                     self.fg_waiting -= 1
@@ -222,7 +240,8 @@ def _background() -> bool:
 
 
 def _is_credit_error(e: BaseException) -> bool:
-    return "credits" in str(e) and "available" in str(e)
+    message = str(e).lower()
+    return "credit" in message and "available" in message
 
 
 _active: dict[int, float] = {}          # операция -> к какому моменту должна закончиться (для сторожа)
@@ -233,7 +252,7 @@ HANG_AFTER = 40                         # сетевая операция дол
 
 def _gated(fn, *a, **kw):
     bg = _background()
-    for attempt in range(6):
+    for attempt in range(SMB_CREDIT_RETRIES):
         if not _gate.acquire(bg, GATE_WAIT * (4 if bg else 1)):
             raise GateBusy("SMB: все слоты заняты")
         key = id(threading.current_thread()) ^ int(time.monotonic() * 1e6)
@@ -242,13 +261,20 @@ def _gated(fn, *a, **kw):
         try:
             return fn(*a, **kw)
         except Exception as e:  # noqa: BLE001
-            if not _is_credit_error(e) or attempt == 5:
+            if not _is_credit_error(e):
+                raise
+            # Не сбрасываем сессию: это перегрузка доступных credits.
+            # Ограничиваем новые операции, чтобы credits успели вернуться.
+            _gate.credit_shortage()
+            if attempt == 0:
+                log.warning("SMB: закончились credits — временно снижаю параллелизм")
+            if attempt == SMB_CREDIT_RETRIES - 1:
                 raise
         finally:
             with _active_mu:
                 _active.pop(key, None)
             _gate.release(bg)
-        time.sleep(0.05 * (attempt + 1))
+        time.sleep(min(2.0, 0.2 * (2 ** attempt)))
 
 
 class _SMBFile:

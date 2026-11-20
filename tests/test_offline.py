@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,6 +31,12 @@ def production_function(path, name, owner=None, globals_=None):
 
 class NetworkNameDeleted(OSError):
     ntstatus = 0xC00000C9
+
+
+class SMBNoCredits(Exception):
+    """smbprotocol.exceptions.SMBException в момент нехватки credits."""
+    def __str__(self):
+        return "Request requires 1 credits but only 0 credits are available"
 
 
 class FakeResponse:
@@ -90,7 +97,47 @@ class OfflineTests(unittest.TestCase):
     def test_network_name_deleted_is_transient(self):
         from app.storage import is_connection_error
         self.assertTrue(is_connection_error(NetworkNameDeleted("PC sleeping")))
+        self.assertTrue(is_connection_error(SMBNoCredits()))
         self.assertFalse(is_connection_error(ValueError("invalid data")))
+
+    def test_smb_credit_shortage_retries_without_resetting_connection(self):
+        from app import storage
+        attempts = []
+        def operation():
+            attempts.append(1)
+            if len(attempts) <= 3:
+                raise SMBNoCredits()
+            return "ok"
+
+        gate = storage._Gate(6, 4)
+        with patch.object(storage, "_gate", gate), patch.object(storage.time, "sleep"):
+            self.assertEqual(storage._gated(operation), "ok")
+        self.assertEqual(len(attempts), 4)
+        self.assertGreater(gate.credit_limited_until, 0)
+        self.assertEqual(gate.used, 0)
+
+    def test_credits_exhausted_maintains_old_index_and_retries(self):
+        def scan(entries):
+            list(entries)
+
+        class Credits:
+            def walk(self):
+                yield ("partial.jpg", 100, 1)
+                raise SMBNoCredits()
+
+        old = object()
+        lib = SimpleNamespace(state="ready", progress=0, meta_total=0, meta_done=0,
+                              attempted_at=0, retry_at=0, error="", by_id={"old": old},
+                              _scan=scan, _publish=lambda *args: self.fail("partial index published"))
+        alerts = []
+        fn = production_function("app/library.py", "_build", owner="Library",
+                                 globals_={"__package__": "app", "time": time,
+                                           "log": logging.getLogger("test.offline")})
+        fn(lib, Credits(), alerts.append)
+        self.assertEqual(lib.state, "ready")
+        self.assertIs(lib.by_id["old"], old)
+        self.assertFalse(alerts)
+        self.assertGreater(lib.retry_at, time.time())
 
     def test_interrupted_index_keeps_last_snapshot_without_alert(self):
         from app.storage import is_connection_error
