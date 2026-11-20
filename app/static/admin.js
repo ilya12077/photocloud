@@ -303,7 +303,6 @@ async function loadUsers(force) {
   }));
 }
 
-let folderList = null;
 const under = (rel, fs) => fs.some((f) => rel === f || rel.startsWith(f + '/'));
 const canSee = (rel, allow, deny) => (allow == null || under(rel, allow)) && !under(rel, deny || []);
 function foldersText(u) {
@@ -316,17 +315,42 @@ function foldersText(u) {
 // снял — снялись. При сохранении из галочек получается «разрешённые + скрытые внутри».
 async function editFolders(u, card) {
   const open = card.querySelector('.fold-edit'); if (open) { open.remove(); return; }
-  if (!folderList) { const r = await act(() => api('/api/admin/folders')); if (!r) return; folderList = r.folders; }
+  // Получаем актуальные папки при каждом открытии: после пересканирования
+  // ранее невидимые вложенные альбомы должны появиться без перезагрузки сайта.
+  const result = await act(() => api('/api/admin/folders')); if (!result) return;
+  const folderList = [...new Set([...(result.folders || []), ...(u.folders || []), ...(u.exclude || [])])]
+    .sort((a, b) => a.localeCompare(b, 'ru'));
   const row = el('div', 'fold-edit'), td = row;
   const all = el('label', 'fold-all'); const allChk = el('input'); allChk.type = 'checkbox';
   // «все папки» — только целиком, без исключений (старые записи «все, кроме…» показываем списком)
   allChk.checked = u.folders == null && !(u.exclude && u.exclude.length); all.append(allChk, ' все папки (и новые тоже)');
+  const search = el('input', 'fold-search');
+  search.type = 'search'; search.placeholder = 'Найти папку на любой глубине…';
+  search.autocomplete = 'off'; search.spellcheck = false;
+  search.setAttribute('aria-label', 'Поиск папки по полному пути');
+  const matches = el('div', 'dim2 fold-matches');
   const box = el('div', 'fold-list');
   const chks = folderList.map((f) => {
-    const l = el('label', f.includes('/') ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f;
+    const depth = f.split('/').length - 1;
+    const l = el('label', depth ? 'sub' : null), c = el('input'); c.type = 'checkbox'; c.value = f;
     c.checked = canSee(f, u.folders, u.exclude);
+    l.style.paddingLeft = Math.min(depth * 14, 84) + 'px';
+    l.title = f;
     l.append(c, ' ' + f); box.append(l); return c;
   });
+  const filter = () => {
+    const query = search.value.trim().toLocaleLowerCase('ru');
+    let count = 0;
+    for (const c of chks) {
+      const visible = !query || c.value.toLocaleLowerCase('ru').includes(query);
+      c.parentElement.hidden = !visible;
+      if (visible) count++;
+    }
+    matches.textContent = query ? `Найдено папок: ${count} из ${chks.length}`
+      : `Папок в индексе: ${chks.length}. Можно искать по любой части полного пути.`;
+  };
+  search.addEventListener('input', filter);
+  filter();
   const byName = new Map(chks.map((c) => [c.value, c]));
   const parentOf = (c) => { const i = c.value.lastIndexOf('/'); return i < 0 ? null : byName.get(c.value.slice(0, i)) || null; };
   // из галочек -> «разрешённые + скрытые внутри»
@@ -353,7 +377,7 @@ async function editFolders(u, card) {
     if (ok) loadUsers(true);
   });
   td.append(el('div', 'dim2', 'Отмеченная папка открыта вместе со всеми подпапками, кроме снятых. «Все папки» — всё, и новые папки тоже. Файлы прямо в корне — только при «все папки».'),
-    all, box, summary);
+    all, search, matches, box, summary);
   const bar = el('div', 'fold-btns'); bar.append(save, btn('отмена', () => row.remove())); td.append(bar);
   card.append(row);
 }
