@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.1"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.2"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
