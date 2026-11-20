@@ -1419,8 +1419,8 @@ async def pc_restore(request: Request, _: dict = Depends(require_pc)):
 
 @app.post("/api/pc/deleted")
 async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
-    """Отчёт клиента: эти файлы ушли в корзину на ПК. Снимает пометки и «скрыто» —
-    только с подписью ключом TPM над точным списком."""
+    """Отчёт клиента: снимает пометку удаления, но сохраняет «скрыто»
+    на случай восстановления из корзины. Подпись TPM обязательна."""
     d = _pc_json(request)
     items, ts, sig = d.get("items"), d.get("ts"), d.get("sig", "")
     if not isinstance(items, list) or not items or len(items) > 10000 or not isinstance(ts, int) \
@@ -1438,10 +1438,6 @@ async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
             paths = db.finish_deletions(items)
             _deleted_times = dict(db.run("SELECT path, at FROM backup_deleted"))
             _marks = db.marks_load()
-            for user, hidden in list(mine.hidden.items()):
-                if hidden.keys() & set(paths):
-                    mine.hidden[user] = {p: at for p, at in hidden.items() if p not in paths}
-                    mine.changed(user)
             return paths
 
     paths = await run_in_threadpool(finish)
