@@ -29,6 +29,7 @@ from starlette.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 
 from . import config
+from .activity import ArchiveScanDebounce
 from . import geo
 from . import logs
 from . import totp
@@ -67,6 +68,7 @@ db = DB(S.data_dir / "photocloud.db")
 db.run("CREATE TABLE IF NOT EXISTS archive_events(id TEXT PRIMARY KEY, at REAL, kind TEXT, src TEXT, dst TEXT, received REAL)")
 db.run("CREATE INDEX IF NOT EXISTS archive_events_received ON archive_events(received)")
 db.run("CREATE TABLE IF NOT EXISTS backup_deleted(path TEXT PRIMARY KEY, at REAL NOT NULL)")
+archive_scan = ArchiveScanDebounce(quiet_seconds=20, max_wait_seconds=180)   # объединяем события массового удаления
 pthumbs = ThumbStore(S.data_dir / "thumbs.db")      # эскизы фото 240/400 — отдельный файл
 library = Library(S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
@@ -870,9 +872,15 @@ async def _pc_watch() -> None:
             up = await PC.is_up()
             if up:
                 PC.wake_at = 0
-                dirty = db.run("SELECT 1 FROM archive_events WHERE received > ? LIMIT 1", (library.built_at,))
-                if PC.revived or dirty or library.stale(S.index_ttl):
+                dirty = bool(await run_in_threadpool(
+                    db.run, "SELECT 1 FROM archive_events WHERE received > ? LIMIT 1", (library.built_at,)
+                ))
+                # Во время массовых изменений ждём короткую паузу: один полный обход
+                # вместо десятков одновременных с записью событий и удалением.
+                defer = dirty and bool(library.by_id) and archive_scan.waiting()
+                if not defer and (PC.revived or dirty or library.stale(S.index_ttl)):
                     if library.start_build(storage, _index_error):
+                        archive_scan.reset()
                         PC.revived = False
             elif PC.wake_at and pc_state(False) == "down" and not PC.wake_notified:
                 PC.wake_notified = True
@@ -1273,7 +1281,7 @@ def _pc_marks() -> list[dict]:
 @app.post("/api/pc/changes")
 async def pc_changes(request: Request, _: dict = Depends(require_pc)):
     events = _pc_json(request).get("events")
-    if not isinstance(events, list) or not 0 < len(events) <= 32:
+    if not isinstance(events, list) or not 0 < len(events) <= 256:
         raise HTTPException(400)
     now = time.time()
     rows = []
@@ -1287,6 +1295,7 @@ async def pc_changes(request: Request, _: dict = Depends(require_pc)):
             raise HTTPException(400)
         rows.append((ident, at, kind, src, dst, now))
     await run_in_threadpool(db.many, "INSERT OR IGNORE INTO archive_events VALUES(?,?,?,?,?,?)", rows)
+    archive_scan.note()
     return no_store(JSONResponse({"ok": True}))
 
 
@@ -1438,9 +1447,12 @@ async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
             return paths
 
     paths = await run_in_threadpool(finish)
-    audit("pc_deleted", "клиент ПК", ip_of(request), f"в корзину на ПК: {len(paths)}: {', '.join(paths[:3])}")
+    await run_in_threadpool(audit, "pc_deleted", "клиент ПК", ip_of(request),
+                            f"в корзину на ПК: {len(paths)}: {', '.join(paths[:3])}")
     if paths:
-        library.start_build(storage, _index_error)   # файлов больше нет — пересобрать список
+        # Массовое удаление может идти десятками пачек. Не пересканируем весь SMB
+        # после каждой: пометки скрываем сразу, фактический индекс обновит _pc_watch.
+        archive_scan.note()
     return no_store(JSONResponse({"ok": True, "count": len(paths)}))
 
 
@@ -2391,6 +2403,15 @@ def _damaged_check(force: bool = False) -> None:
 
 def _after_scan() -> None:
     threading.Thread(target=lambda: _safe(_damaged_check), name="meta-damaged", daemon=True).start()
+    # Журнал событий изменённого архива больше не нужен после полного обхода.
+    # Не чистим его при пропущенных папках, чтобы не подтвердить ложные удаления.
+    if not library.skipped and library.built_at:
+        def prune_events():
+            try:
+                db.run("DELETE FROM archive_events WHERE received <= ?", (library.built_at,))
+            except Exception:
+                log.exception("не удалось очистить обработанные события архива")
+        threading.Thread(target=prune_events, name="archive-event-prune", daemon=True).start()
 
 
 def _safe(fn, *a) -> None:

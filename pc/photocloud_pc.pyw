@@ -650,7 +650,7 @@ def watch_archive(app):
         record("startup")
         while (cfg.server, cfg.client_id, cfg.root) == app._watch_scope and Path(cfg.root).resolve() == root:
             with closing(connect()) as con:
-                rows = con.execute("SELECT id,at,kind,src,dst FROM events WHERE scope=? ORDER BY rowid LIMIT 32",
+                rows = con.execute("SELECT id,at,kind,src,dst FROM events WHERE scope=? ORDER BY rowid LIMIT 256",
                                    (scope,)).fetchall()
             if rows:
                 try:
