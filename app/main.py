@@ -3392,8 +3392,11 @@ async def admin_user_2fa(request: Request, name: str, s: Session = Depends(requi
 
 @app.get("/api/admin/folders")
 async def admin_folders(_: Session = Depends(require_admin)):
-    """Папки для настройки доступа: верхний уровень и следующий (длинное дерево не нужно)."""
-    fl = [f for f in library._folders if f and f.count("/") <= 1]
+    """Все уровни папок из готового индекса, без нового обращения к SMB.
+
+    Отдаём и вложенные каталоги, например Google Фото/Фото 2026 г_/Альбом.
+    """
+    fl = sorted((f for f in library._folders if f), key=lambda path: (path.casefold(), path))
     return no_store(JSONResponse({"folders": fl}))
 
 

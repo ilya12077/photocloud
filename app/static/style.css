@@ -314,9 +314,13 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .ucard .fold-edit { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
 .fold-edit label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 .fold-edit .fold-all { font-weight: 600; margin: 6px 0; }
-.fold-list { columns: 240px; column-gap: 16px; margin: 4px 0 10px; }   /* сверху вниз: подпапки идут под своей папкой */
-.fold-list label { break-inside: avoid; }
-.fold-list label.sub { padding-left: 18px; opacity: .85; }
+.fold-search { display: block; width: 100%; max-width: 520px; margin: 8px 0 4px; padding: 8px 10px; box-sizing: border-box; }
+.fold-matches { margin-bottom: 6px; }
+.fold-list { max-height: 390px; overflow-y: auto; overflow-x: hidden; margin: 4px 0 10px; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 8px; }
+.fold-list label { overflow-wrap: anywhere; }
+.fold-list label[hidden] { display: none; }
+.fold-list label.sub { opacity: .85; }
 .fold-btns { display: flex; gap: 8px; margin-top: 4px; }
 .fold-sum { font-weight: 600; margin: 4px 0 8px; }
 .fold-list.off { opacity: .45; }
