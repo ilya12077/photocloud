@@ -3065,20 +3065,38 @@ async def _duration(p) -> float:
     return d
 
 
+@app.get("/vid/{pid}/quality")
+async def vid_quality(pid: str = PathParam(pattern=ID_RE), s: Session = Depends(require_user)):
+    """Разрешение исходника, чтобы не показывать 4K для Full HD."""
+    p = _vid(pid, s)
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
+    await _duration(p)
+    src, _ = _video_src(p)
+    width, height = transcode.dimensions_of.get(src, (0, 0))
+    profiles = list(transcode.quality_profiles(min(width, height))) if width and height else []
+    return no_store(JSONResponse({"width": width, "height": height, "profiles": profiles}))
+
+
 @app.get("/vid/{pid}/{profile}/index.m3u8")
-async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathParam(pattern=r"^eco$"),
+async def vid_playlist(pid: str = PathParam(pattern=ID_RE), profile: str = PathParam(pattern=r"^(auto|eco|p144|p240|p720|p1080|p2160)$"),
                        s: Session = Depends(require_user)):
     p = _vid(pid, s)
     if not await PC.is_up():
         raise HTTPException(503, "pc")
     d = await _duration(p)
-    body = transcode.playlist(d, lambda i: f"{i}.ts?v={int(p.mtime)}")
+    if profile == "auto":
+        src, _ = _video_src(p)
+        width, height = transcode.dimensions_of.get(src, (0, 0))
+        body = transcode.master_playlist(pid, int(p.mtime), min(width, height))
+    else:
+        body = transcode.playlist(d, lambda i: f"{i}.ts?v={int(p.mtime)}")
     return Response(body, media_type="application/vnd.apple.mpegurl", headers={"cache-control": "no-cache"})
 
 
 @app.get("/vid/{pid}/{profile}/{n}.ts")
 async def vid_segment(request: Request, pid: str = PathParam(pattern=ID_RE),
-                      profile: str = PathParam(pattern=r"^eco$"), n: int = PathParam(ge=0, le=100000),
+                      profile: str = PathParam(pattern=r"^(eco|p144|p240|p720|p1080|p2160)$"), n: int = PathParam(ge=0, le=100000),
                       s: Session = Depends(require_user)):
     p = _vid(pid, s)
     d = await _duration(p)
