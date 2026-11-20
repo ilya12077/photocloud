@@ -23,7 +23,8 @@ class ArchiveEventTests(unittest.TestCase):
                 save = production_function("app/main.py", "pc_changes", globals_=dict(
                     app=SimpleNamespace(post=lambda _:lambda f:f), Depends=lambda _:None,
                     require_pc=None, _pc_json=lambda _:{"events":[event]}, re=re, time=time,
-                    db=db, run_in_threadpool=run, no_store=lambda x:x, JSONResponse=dict))
+                    db=db, run_in_threadpool=run, no_store=lambda x:x, JSONResponse=dict,
+                    archive_scan=SimpleNamespace(note=lambda: None)))
                 self.assertEqual(asyncio.run(save(None)), {"ok":True})
                 self.assertEqual(db.run("SELECT kind,src,dst FROM archive_events"), [tuple(event[2:])])
                 db.con.close()
