@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.2"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.3"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -306,6 +306,85 @@ else:
     def open_folder(p: Path) -> None:
         subprocess.Popen(["xdg-open", str(p)])
 
+
+
+def recycle_with_fallback(ready, recycle, validate, should_stop):
+    """Корзина Windows: не больше трёх попыток на файл (пачка, половина, одиночно).
+
+    После каждого вызова проверяем реально удалённые файлы. Ошибка группы не
+    переносится на элементы: о конкретной ошибке сообщаем после одиночного
+    отказа. Перед повторами заново валидируем исходные файлы.
+    """
+    gone, failed = [], []
+
+    def attempt(batch):
+        if not batch:
+            return []
+        if should_stop():
+            return [(item, path, "остановлено") for item, path in batch]
+        try:
+            error = recycle([path for item, path in batch]) or ""
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        remain = []
+        for item, path in batch:
+            try:
+                still_exists = path.exists()
+            except OSError as exc:
+                still_exists = True
+                reason = f"не удалось проверить результат: {type(exc).__name__}: {exc}"
+            else:
+                reason = error or "Windows оставила файл на месте"
+            if still_exists:
+                remain.append((item, path, reason))
+            else:
+                gone.append(item)
+        return remain
+
+    def revalidate(group):
+        verified = []
+        for item, _path, _reason in group:
+            if should_stop():
+                failed.append((item["path"], "остановлено"))
+                continue
+            try:
+                state, path, note = validate(item)
+            except Exception as exc:
+                failed.append((item["path"], f"ошибка перепроверки: {type(exc).__name__}: {exc}"))
+                continue
+            if state != "ok" or path is None:
+                failed.append((item["path"], note or "файл изменён"))
+            else:
+                verified.append((item, path))
+        return verified
+
+    pending = attempt(ready)
+    if not pending:
+        return gone, failed
+    if should_stop() or any(why == "отменено" for _item, _path, why in pending):
+        failed.extend((item["path"], why) for item, _path, why in pending)
+        return gone, failed
+
+    # Вторая попытка — только неудавшиеся файлы, двумя подгруппами.
+    step = max(1, (len(pending) + 1) // 2)
+    second_pending = []
+    for start in range(0, len(pending), step):
+        if should_stop():
+            failed.extend((item["path"], "остановлено") for item, _, _ in pending[start:])
+            break
+        second_pending.extend(attempt(revalidate(pending[start:start + step])))
+    if should_stop():
+        failed.extend((item["path"], "остановлено") for item, _, _ in second_pending)
+        return gone, failed
+
+    # Последний раз — каждый файл отдельно; дальше никаких повторов.
+    for item, path, reason in second_pending:
+        if should_stop() or reason == "отменено":
+            failed.append((item["path"], "остановлено" if should_stop() else reason))
+            continue
+        for bad, _path, why in attempt(revalidate([(item, path, reason)])):
+            failed.append((bad["path"], why))
+    return gone, failed
 
 # ======================================================================== сервер
 
@@ -690,6 +769,7 @@ class App:
         self.drawn: dict[int, object] = {}           # нарисованные карточки -> их картинка
         self.cols, self.gen, self._pending = 1, 0, False
         self.busy, self.stop = False, False              # идёт удаление; просили остановить
+        self._sorted_checks_gen = -1                     # проблемные файлы наверх после проверки всех
         self._restore_startup_checked = False           # проверка восстановленных копий один раз при запуске
         self._build()
         h = _UiLog(self)
@@ -724,39 +804,37 @@ class App:
         self._buttons(False)
 
     def _build_main(self, main) -> None:
-        top = ttk.Frame(main, padding=(12, 10, 12, 5))
+        top = ttk.Frame(main, padding=(12, 8, 12, 4))
         top.pack(fill="x")
-        listing = ttk.LabelFrame(top, text="Список", padding=(8, 5))
-        listing.pack(side="right")
-        self.b_reload = ttk.Button(listing, text="Обновить список", command=self.load)
-        self.b_reload.pack()
         self.status = ttk.Label(top, text="Запуск…")
         self.status.pack(side="left", fill="x", expand=True)
 
-        toolbar = ttk.Frame(main, padding=(12, 0, 12, 4))
+        # Общий адаптивный ряд для пяти групп. Переносим их целиком по ширине окна.
+        toolbar = ttk.Frame(main, padding=(12, 0, 12, 8))
         toolbar.pack(fill="x")
-        selecting = ttk.LabelFrame(toolbar, text="Выделение", padding=(8, 5))
-        selecting.pack(side="left", padx=(0, 8))
-        ttk.Button(selecting, text="Выбрать все", command=lambda: self._select(True)).pack(side="left")
-        ttk.Button(selecting, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=(6, 0))
+        listing = ttk.LabelFrame(toolbar, text="Список", padding=(8, 5))
+        self.b_reload = ttk.Button(listing, text="Обновить список", command=self.load)
+        self.b_reload.pack()
+        selection = ttk.LabelFrame(toolbar, text="Выделение", padding=(8, 5))
+        ttk.Button(selection, text="Выбрать все", command=lambda: self._select(True)).pack(side="left")
+        ttk.Button(selection, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=(6, 0))
         deletion = ttk.LabelFrame(toolbar, text="Удаление и пометки", padding=(8, 5))
-        deletion.pack(side="left")
         self.b_del = ttk.Button(deletion, text="Удалить выбранные в корзину", command=self.delete)
         self.b_del.pack(side="left")
         self.b_unmark = ttk.Button(deletion, text="Снять пометку на удаление", command=self.unmark)
         self.b_unmark.pack(side="left", padx=(6, 0))
-
-        actions = ttk.Frame(main, padding=(12, 0, 12, 8))
-        actions.pack(fill="x")
-        gallery = ttk.LabelFrame(actions, text="Галерея", padding=(8, 5))
-        gallery.pack(side="left", padx=(0, 8))
+        gallery = ttk.LabelFrame(toolbar, text="Галерея", padding=(8, 5))
         self.b_restore = ttk.Button(gallery, text="Вернуть в галерею", command=self.restore)
         self.b_restore.pack()
-        recovery = ttk.LabelFrame(actions, text="Восстановление файлов", padding=(8, 5))
-        recovery.pack(side="left", fill="x", expand=True)
+        recovery = ttk.LabelFrame(toolbar, text="Восстановление файлов", padding=(8, 5))
         self.b_apply = ttk.Button(recovery, text="Применить восстановленные копии", command=self.apply_restores)
         self.b_apply.pack(side="left")
-        ttk.Label(recovery, text="Сверка SHA-256 и подтверждение сервера", foreground="#666").pack(side="left", padx=(8, 0))
+        ttk.Label(recovery, text="SHA-256 и проверка сервера", foreground="#666").pack(side="left", padx=(8, 0))
+        self._action_groups = (listing, selection, deletion, gallery, recovery)
+        self._action_layout = None
+        toolbar.bind("<Configure>", self._arrange_actions)
+        self.root.after_idle(self._arrange_actions)
+
         self.summary = ttk.Label(main, text="", padding=(12, 0, 12, 8))
         self.summary.pack(fill="x")
         self.prog = ttk.Frame(main, padding=(12, 0, 12, 8))       # прогресс: проверка файлов, удаление
@@ -779,6 +857,29 @@ class App:
         self.root.bind_all("<MouseWheel>", self._wheel)
         self.root.bind_all("<Button-4>", self._wheel)
         self.root.bind_all("<Button-5>", self._wheel)
+
+    def _arrange_actions(self, _event=None) -> None:
+        """При расширении окна группы переходят в общий ряд, при сужении переносятся."""
+        toolbar = self._action_groups[0].master
+        available = max(1, toolbar.winfo_width() - 24)
+        row, width, rows = 0, 0, []
+        for group in self._action_groups:
+            needed = group.winfo_reqwidth() + 8
+            if width and width + needed > available:
+                row += 1
+                width = 0
+            rows.append(row)
+            width += needed
+        layout = tuple(rows)
+        if self._action_layout == layout:
+            return
+        self._action_layout = layout
+        columns = {}
+        for group, r in zip(self._action_groups, rows):
+            group.grid_forget()
+            col = columns.get(r, 0)
+            group.grid(row=r, column=col, padx=(0, 8), pady=(0, 5), sticky="nw")
+            columns[r] = col + 1
 
     def _build_log(self, lg) -> None:
         bot = ttk.Frame(lg, padding=(8, 6))
@@ -1071,6 +1172,7 @@ class App:
         self._layout()
         self._buttons(True)
         self._count()
+        self.say("Список загружен")
         root, gen = Path(self.cfg.root), self.gen
         for it in items:
             self.check_pool.submit(self._check, root, it, gen)
@@ -1290,10 +1392,13 @@ class App:
         self.summary.configure(text=f"Помечено: {len(self.items)} · проверены: {ok}" + (f" · проверяю: {wait}" if wait else "")
                                     + f" · выбрано: {len(picked)} ({human(sum(max(0, it['size']) for it in picked))})"
                                     + "\nЩелчок по карточке — выбрать, двойной щелчок по фото — открыть крупно")
-        if self.cfg.fp:
-            self.say(f"Сервер {self.cfg.server} · ключ {self.cfg.fp}"
-                     f"{' (программный, не в TPM)' if self.cfg.key_type == 'software' else ' (TPM)'}\n"
-                     f"Папка архива: {self.cfg.root if len(self.cfg.root) <= 70 else '…' + self.cfg.root[-69:]}")
+        if not wait and self._sorted_checks_gen != self.gen:
+            self._sorted_checks_gen = self.gen
+            # Стабильная сортировка: не прошедшие проверку в начале.
+            self.items.sort(key=lambda item: item["state"] == "ok")
+            self.index = {item["path"]: i for i, item in enumerate(self.items)}
+            self.canvas.yview_moveto(0)
+            self._layout()
 
     # ---- действия
     def delete(self) -> None:
@@ -1314,8 +1419,9 @@ class App:
         self.bg(lambda: self._delete(picked))
 
     def _delete(self, picked: list[dict]) -> None:
-        """Пачками по 50: перепроверка, в корзину одним вызовом, отчёт серверу с подписью TPM —
-        после каждой пачки сетка и сервер уже знают, что удалено (можно остановить в любой момент)."""
+        """Пачками до 50: если Windows отказала, неудачные повторяются
+        половинами и по одному (не больше 3 вызовов на файл). Серверу
+        подтверждаем только действительно удалённые файлы."""
         total, done, reported, failed, rep_err = len(picked), 0, 0, [], ""
         root = Path(self.cfg.root)
         for k in range(0, total, 50):
@@ -1330,15 +1436,15 @@ class App:
                     failed.append((it["path"], "изменился после проверки"))
             if ready:
                 self._journal([it for it, _ in ready])
-                err = to_recycle_bin([p for _it, p in ready])
-                gone = []
-                for it, p in ready:
-                    if p.exists():
-                        failed.append((it["path"], err or "остался на месте"))
-                        log.error("не удалён %s: %s", it["path"], err or "остался на месте")
-                    else:
-                        gone.append(it)
-                        log.info("в корзину: %s", it["path"])
+                gone, errs = recycle_with_fallback(
+                    ready, to_recycle_bin, lambda item: check_file(root, item),
+                    lambda: self.stop
+                )
+                failed.extend(errs)
+                for name, why in errs:
+                    log.error("не удалён %s: %s", name, why)
+                for it in gone:
+                    log.info("в корзину: %s", it["path"])
                 if gone:
                     done += len(gone)
                     try:
