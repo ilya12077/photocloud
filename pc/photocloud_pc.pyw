@@ -5,7 +5,7 @@
 программа предложит поставить сама. Настройки и журнал — в %USERPROFILE%\\.photocloud-pc.
 
 Вход на сервер — ключом в TPM этого ПК (ключ не извлекается из чипа):
-1) в админке: «Бэкап» → «Клиент на ПК» → «Привязать» (окно на 10 минут);
+1) в админке: «Клиенты» → «Агент основного ПК» → «Привязать» (окно на 10 минут);
 2) программа присылает открытый ключ, кладёт подписанный файл в служебную папку шары
    (.photocloud\\ — скрытая), сервер читает его по сети и запоминает ключ;
 3) дальше каждый сеанс открывается подписью ключа, каждый запрос подписан ключом сеанса,
@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.0"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.1"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -690,6 +690,7 @@ class App:
         self.drawn: dict[int, object] = {}           # нарисованные карточки -> их картинка
         self.cols, self.gen, self._pending = 1, 0, False
         self.busy, self.stop = False, False              # идёт удаление; просили остановить
+        self._restore_startup_checked = False           # проверка восстановленных копий один раз при запуске
         self._build()
         h = _UiLog(self)
         log.addHandler(h)
@@ -723,24 +724,39 @@ class App:
         self._buttons(False)
 
     def _build_main(self, main) -> None:
-        top = ttk.Frame(main, padding=(12, 10))
+        top = ttk.Frame(main, padding=(12, 10, 12, 5))
         top.pack(fill="x")
-        self.b_reload = ttk.Button(top, text="Обновить список", command=self.load)
-        self.b_reload.pack(side="right", padx=4)          # сначала кнопка — длинная строка её не вытеснит
+        listing = ttk.LabelFrame(top, text="Список", padding=(8, 5))
+        listing.pack(side="right")
+        self.b_reload = ttk.Button(listing, text="Обновить список", command=self.load)
+        self.b_reload.pack()
         self.status = ttk.Label(top, text="Запуск…")
         self.status.pack(side="left", fill="x", expand=True)
-        bar = ttk.Frame(main, padding=(12, 0, 12, 8))
-        bar.pack(fill="x")
-        self.b_del = ttk.Button(bar, text="Удалить выбранные в корзину", command=self.delete)
+
+        toolbar = ttk.Frame(main, padding=(12, 0, 12, 4))
+        toolbar.pack(fill="x")
+        selecting = ttk.LabelFrame(toolbar, text="Выделение", padding=(8, 5))
+        selecting.pack(side="left", padx=(0, 8))
+        ttk.Button(selecting, text="Выбрать все", command=lambda: self._select(True)).pack(side="left")
+        ttk.Button(selecting, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=(6, 0))
+        deletion = ttk.LabelFrame(toolbar, text="Удаление и пометки", padding=(8, 5))
+        deletion.pack(side="left")
+        self.b_del = ttk.Button(deletion, text="Удалить выбранные в корзину", command=self.delete)
         self.b_del.pack(side="left")
-        self.b_restore = ttk.Button(bar, text="Вернуть в галерею", command=self.restore)
-        self.b_restore.pack(side="left", padx=(8, 0))
-        self.b_apply = ttk.Button(top, text="Применить восстановленные копии", command=self.apply_restores)
-        self.b_apply.pack(side="right", padx=4)
-        self.b_unmark = ttk.Button(bar, text="Снять пометку на удаление", command=self.unmark)
-        self.b_unmark.pack(side="left", padx=8)
-        ttk.Button(bar, text="Выбрать все", command=lambda: self._select(True)).pack(side="left")
-        ttk.Button(bar, text="Снять выбор", command=lambda: self._select(False)).pack(side="left", padx=8)
+        self.b_unmark = ttk.Button(deletion, text="Снять пометку на удаление", command=self.unmark)
+        self.b_unmark.pack(side="left", padx=(6, 0))
+
+        actions = ttk.Frame(main, padding=(12, 0, 12, 8))
+        actions.pack(fill="x")
+        gallery = ttk.LabelFrame(actions, text="Галерея", padding=(8, 5))
+        gallery.pack(side="left", padx=(0, 8))
+        self.b_restore = ttk.Button(gallery, text="Вернуть в галерею", command=self.restore)
+        self.b_restore.pack()
+        recovery = ttk.LabelFrame(actions, text="Восстановление файлов", padding=(8, 5))
+        recovery.pack(side="left", fill="x", expand=True)
+        self.b_apply = ttk.Button(recovery, text="Применить восстановленные копии", command=self.apply_restores)
+        self.b_apply.pack(side="left")
+        ttk.Label(recovery, text="Сверка SHA-256 и подтверждение сервера", foreground="#666").pack(side="left", padx=(8, 0))
         self.summary = ttk.Label(main, text="", padding=(12, 0, 12, 8))
         self.summary.pack(fill="x")
         self.prog = ttk.Frame(main, padding=(12, 0, 12, 8))       # прогресс: проверка файлов, удаление
@@ -990,12 +1006,12 @@ class App:
         self.ui(lambda: (self.v_root.set(self.cfg.root), self._key_text()))
         log.info("привязан: ключ %s, папка %s", res["fp"], rootp)
         self.ui(lambda: messagebox.showinfo(APP, f"Привязано.\n\nОтпечаток ключа: {res['fp']}\nСверь его с админкой "
-                                                 "(«Бэкап» → «Клиент на ПК»)."))
+                                                 "(«Клиенты» → «Агент основного ПК»)."))
         self.ui(self.load)
 
     def _pair_failed(self, err: str) -> None:
         log.warning("привязка: %s", err)
-        if messagebox.askretrycancel(APP, f"Привязка не удалась:\n{err}\n\nВ админке: «Бэкап» → «Клиент на ПК» → "
+        if messagebox.askretrycancel(APP, f"Привязка не удалась:\n{err}\n\nВ админке: «Клиенты» → «Агент основного ПК» → "
                                           "«Привязать», затем «Повторить»."):
             self.bg(self._pair)
         else:
@@ -1058,6 +1074,52 @@ class App:
         root, gen = Path(self.cfg.root), self.gen
         for it in items:
             self.check_pool.submit(self._check, root, it, gen)
+        if not self._restore_startup_checked:
+            self._restore_startup_checked = True
+            self.bg(self._check_startup_restores)
+
+    def _check_startup_restores(self) -> None:
+        """После первой загрузки проверяем только объявленные сервером и целые копии."""
+        api, folder = self.api, self.cfg.root
+        if not api or not folder or not Path(folder).is_dir():
+            return
+        try:
+            response = api.call("GET", "/api/pc/restored")
+            if response.status_code != 200:
+                log.warning("проверка восстановленных копий: %s", _err(response))
+                return
+            items = response.json().get("items", [])
+            if not isinstance(items, list):
+                raise ValueError("неверный список восстановленных копий")
+            verified = []
+            for item in items:
+                try:
+                    # Файл в Restored сам по себе не даёт права на запись.
+                    # Перед предложением сверяем его с записью сервера и SHA-256.
+                    src = restore_path(Path(folder), item["restored"], restored=True)
+                    if src.stat().st_size == item["size"] and restore_digest(src) == item["sha_good"]:
+                        verified.append(item["path"])
+                except (OSError, ValueError, KeyError, TypeError):
+                    log.warning("восстановленная копия не прошла проверку: %s", item.get("path") if isinstance(item, dict) else "<unknown>")
+            if verified:
+                self.ui(lambda: self._offer_startup_restores(api, folder, tuple(verified)))
+        except Exception:
+            log.warning("не удалось проверить восстановленные копии при запуске", exc_info=True)
+
+    def _offer_startup_restores(self, api: Api, folder: str, paths: tuple[str, ...]) -> None:
+        if self.api is not api or self.cfg.root != folder:
+            return
+        if self.busy:
+            self.root.after(500, lambda: self._offer_startup_restores(api, folder, paths))
+            return
+        n = len(paths)
+        if messagebox.askyesno(
+            APP, f"Сервер сообщил о восстановленных файлах: {n}.\n"
+                 "Копии найдены в Restored, их SHA-256 совпадают с эталоном.\n\n"
+                 "Проверить актуальное разрешение сервера и заменить повреждённые оригиналы?\n"
+                 "Перед заменой оригиналы будут сохранены отдельно."
+        ):
+            self.apply_restores(only_paths=set(paths))
 
     def _check(self, root: Path, it: dict, gen: int) -> None:
         if gen != self.gen:
@@ -1362,7 +1424,7 @@ class App:
         self._send("/api/pc/unmark", "Снять пометку «на удаление» с {n} файл(ов)? Файлы останутся на месте "
                                      "и в скрытых — их можно будет пометить снова.")
 
-    def apply_restores(self) -> None:
+    def apply_restores(self, only_paths: set[str] | None = None) -> None:
         if self.busy:
             return
         if not self.api or not self.cfg.root:
@@ -1382,6 +1444,8 @@ class App:
                     raise ServerError(_err(r))
                 return r.json()
             items = request("GET", "/api/pc/restored")["items"]
+            if only_paths is not None:
+                items = [it for it in items if it["path"] in only_paths]
             done, errors = 0, []
             for it in items:
                 try:
@@ -1463,7 +1527,7 @@ class App:
     def repair(self) -> None:
         if self.busy or self.api is None:
             return
-        if not messagebox.askyesno(APP, "Привязать этот ПК заново?\n\nСначала в админке: «Бэкап» → «Клиент на ПК» → "
+        if not messagebox.askyesno(APP, "Привязать этот ПК заново?\n\nСначала в админке: «Клиенты» → «Агент основного ПК» → "
                                         "«Привязать заново», потом «Да» здесь."):
             return
         self.cfg.client_id = self.cfg.fp = ""
