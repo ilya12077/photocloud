@@ -6,6 +6,8 @@ import runpy
 import tempfile
 import unittest
 from unittest.mock import patch, Mock
+from types import SimpleNamespace
+import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,12 +47,14 @@ class StartupTests(unittest.TestCase):
             import time
             api.sid, api.skey, api.exp = "session", b"key", time.time() + 900
             app.api = api
+            app.bg = Mock()  # startup check is tested independently without a UI thread
             app._load()
             callback = app.q.get_nowait()
             if not os.environ.get("DISPLAY") and os.name != "nt":
                 app._show = Mock()
             callback()
             self.assertEqual(app.items, [])
+            app.bg.assert_called_once_with(app._check_startup_restores)
 
 
 class RestoreFilesystemTests(unittest.TestCase):
@@ -83,3 +87,59 @@ class RestoreFilesystemTests(unittest.TestCase):
             self.assertFalse(module['apply_restored'](root, item))
             self.assertFalse(list(root.glob('.photocloud-restore-*')))
             self.assertTrue(any(p.read_bytes() == b'bad' for p in (module['app_dir']() / 'replaced-originals').glob('*.bak')))
+
+
+class StartupRestorePromptTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import sys
+        with patch.object(sys, "excepthook"):
+            cls.module = runpy.run_path(str(ROOT / "pc/photocloud_pc.pyw"))
+
+    def test_only_server_reported_sha_matching_copies_are_offered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory)
+            (archive / "Restored").mkdir()
+            (archive / "Restored" / "good.jpg").write_bytes(b"good")
+            (archive / "Restored" / "tampered.jpg").write_bytes(b"evil")
+            (archive / "Restored" / "unannounced.jpg").write_bytes(b"good")
+            reported = [
+                dict(path="good.jpg", restored="good.jpg", size=4,
+                     sha_good=hashlib.sha256(b"good").hexdigest()),
+                dict(path="tampered.jpg", restored="tampered.jpg", size=4,
+                     sha_good=hashlib.sha256(b"good").hexdigest()),
+                dict(path="missing.jpg", restored="missing.jpg", size=4,
+                     sha_good=hashlib.sha256(b"good").hexdigest()),
+            ]
+            api = Mock()
+            api.call.return_value = SimpleNamespace(status_code=200, json=lambda: {"items": reported})
+            app = SimpleNamespace(api=api, cfg=SimpleNamespace(root=str(archive)),
+                                  ui=Mock(), _offer_startup_restores=Mock())
+            self.module["App"]._check_startup_restores(app)
+            api.call.assert_called_once_with("GET", "/api/pc/restored")
+            app.ui.assert_called_once()
+            app.ui.call_args.args[0]()
+            app._offer_startup_restores.assert_called_once_with(api, str(archive), ("good.jpg",))
+
+    def test_local_file_without_server_notice_does_not_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory)
+            (archive / "Restored").mkdir()
+            (archive / "Restored" / "unannounced.jpg").write_bytes(b"good")
+            api = Mock()
+            api.call.return_value = SimpleNamespace(status_code=200, json=lambda: {"items": []})
+            app = SimpleNamespace(api=api, cfg=SimpleNamespace(root=str(archive)),
+                                  ui=Mock(), _offer_startup_restores=Mock())
+            self.module["App"]._check_startup_restores(app)
+            app.ui.assert_not_called()
+
+    def test_confirmation_is_required(self):
+        api = Mock()
+        app = SimpleNamespace(api=api, cfg=SimpleNamespace(root="archive"),
+                              busy=False, apply_restores=Mock())
+        with patch.object(self.module["messagebox"], "askyesno", return_value=False):
+            self.module["App"]._offer_startup_restores(app, api, "archive", ("good.jpg",))
+        app.apply_restores.assert_not_called()
+        with patch.object(self.module["messagebox"], "askyesno", return_value=True):
+            self.module["App"]._offer_startup_restores(app, api, "archive", ("good.jpg",))
+        app.apply_restores.assert_called_once_with(only_paths={"good.jpg"})
