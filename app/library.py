@@ -383,7 +383,7 @@ class Library:
             self.skipped = int(d.get("skipped", 1))
             self._publish(photos, folder_list)
             self.built_at, self.attempted_at, self.state = float(d.get("at") or 0), 0.0, "ready"
-        log.info("список из снимка: %d файлов (от %s)", len(photos),
+        log.info("список из кешированного индекса: %d файлов (от %s)", len(photos),
                  time.strftime("%d.%m.%Y %H:%M", time.localtime(self.built_at)))
         return True
 
