@@ -313,9 +313,9 @@ async function enter() {
   $('menu-hidden').hidden = HID;
   $('menu-starred').hidden = STARRED || HID;
   $('menu-all').hidden = !HID && !STARRED;
-  // действия с выбранными: скрыть (кому можно), вернуть (на /hidden), избранное (всем, кроме /hidden)
-  // скрывать и группировать может каждый (у каждого свои); «удалить окончательно» — только админ
-  $('sel-hide').hidden = HID; $('sel-show').hidden = !HID; $('sel-del').hidden = !HID || !me.can_delete;
+  // «Удалить окончательно» доступно админу в основной галерее и на /hidden.
+  // Сервер ставит пометку; физическое удаление делает клиент ПК.
+  $('sel-hide').hidden = HID; $('sel-show').hidden = !HID; $('sel-del').hidden = STARRED || !me.can_delete;
   $('sel-group').hidden = HID;
   $('sel-star').hidden = HID || STARRED; $('sel-unstar').hidden = !STARRED;
   $('v-star').hidden = HID;
@@ -1089,7 +1089,7 @@ async function selGroup(make) {
 }
 $('sel-undel').addEventListener('click', () => selMarkDelete(false));
 
-// ================================================================== «удалить окончательно» (на /hidden)
+// ================================================================== «удалить окончательно» (галерея и /hidden)
 // Пока только пометка в базе: удалять с компьютера будет отдельный клиент на ПК, он и решает.
 // Помеченные — с красной корзиной и бледнее; «Не удалять» или «вернуть в галерею» снимает пометку.
 const MARK = { ids: new Set() };
@@ -1109,13 +1109,13 @@ function paintMarks() {
 async function selMarkDelete(on) {
   const ids = selIds(); if (!ids.length) return;
   const n = ids.length.toLocaleString('ru');
-  if (on && !confirm(`Пометить ${n} фото на окончательное удаление?\n\nОни пропадут и из скрытых. Удалять файлы с компьютера будет отдельная программа на ПК.`)) return;
+  if (on && !confirm(`Пометить ${n} фото на окончательное удаление?\n\nОни исчезнут из галереи и скрытых. В корзину Windows файлы отправит клиент ПК после повторной проверки.`)) return;
   const btn = on ? $('sel-del') : $('sel-undel'); btn.disabled = true;
   try {
     const r = await api('/api/marks', { method: 'POST', body: { ids, on } });
     if (!r.ok) { const j = await r.json().catch(() => ({})); banner(j.error || `Не получилось (${r.status})`, null, null, true); btn.disabled = false; return; }
     const place = keepPlace(on ? new Set(ids) : null);
-    selEnd(); await loadMarks(); await loadLibrary();       // помеченные из скрытых пропадают
+    selEnd(); await loadLibrary();                           // помеченные исчезают из всех галерей
     banner(on ? `Помечено на удаление: ${n}` : `Пометка снята: ${n}`);
     restorePlace(place);
     setTimeout(() => { if (/^(Помечено|Пометка)/.test($('banner-text').textContent)) banner(null); }, 3000);

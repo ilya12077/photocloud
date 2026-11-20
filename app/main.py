@@ -1006,19 +1006,19 @@ def _view_for(s: Session, hidden: int, starred: int):
     u = s.user
     hid = frozenset(mine.hidden.get(u, ()))
     gone = frozenset(p for p, at in _deleted_times.items() if at >= library.built_at)
+    marks = frozenset(_marks)  # помеченное не показываем ни в одной галерее
     grp = mine.groups.get(u) or None
-    key = (u, gone, mine.gen.get(u, 0), "h" if hidden else "s" if starred else "m")
+    key = (u, gone, marks, mine.gen.get(u, 0), "h" if hidden else "s" if starred else "m")
     if hidden:
         if s.role == "admin":  # type: ignore[attr-defined]
             # админ видит скрытое всеми; помеченное на удаление уже не показываем
-            marks = frozenset(_marks)
             allh = frozenset(_hidden_all())
             key = (u, tuple(sorted(mine.gen.items())), "H", marks, gone)
             return library.view(user_folders(s), only=allh - marks - gone, groups=grp, key=key)
-        return library.view(user_folders(s), only=hid - gone, groups=grp, key=key)
+        return library.view(user_folders(s), only=hid - marks - gone, groups=grp, key=key)
     if starred:
-        return library.view(user_folders(s), hide=hid | gone, only=frozenset(mine.starred.get(u, ())), groups=grp, key=key)
-    return library.view(user_folders(s), hide=hid | gone, groups=grp, key=key)
+        return library.view(user_folders(s), hide=hid | marks | gone, only=frozenset(mine.starred.get(u, ())), groups=grp, key=key)
+    return library.view(user_folders(s), hide=hid | marks | gone, groups=grp, key=key)
 
 
 @app.get("/api/library")
@@ -1107,9 +1107,9 @@ async def unhide_photos(request: Request, s: Session = Depends(require_user)):
 
 
 # ---------------------------------------------------------------- пометка «удалить окончательно»
-# Только админ и только то, что скрыто (у кого угодно — админ видит скрытые всех). С ПК пока ничего не удаляется: будущий клиент
-# на ПК заберёт список, сам проверит (путь, размер, дата, хеш) и удалит. Вернуть фото
-# в галерею или «Не удалять» — снять пометку.
+# Только админ — и в основной галерее, и на /hidden. Сервер только ставит
+# пометку, а клиент ПК проверяет исходник и отправляет в корзину Windows.
+# До физического удаления помеченные фото не показываются в галереях.
 
 @app.get("/api/marks")
 async def marks_ids(s: Session = Depends(require_user)):
@@ -1133,10 +1133,8 @@ async def marks_set(request: Request, s: Session = Depends(require_admin)):
     on = d.get("on")
     if not isinstance(on, bool):
         return _bad("on: true/false")
-    hid = _hidden_all()
-    ps = [p for p in ps if p.rel in hid or (p.live and (q := library.get(p.live)) is not None and q.rel in hid)]
     if not ps:
-        return _bad("пометить можно только скрытые фото")
+        return _bad("нечего помечать")
 
     def go() -> None:
         global _marks
