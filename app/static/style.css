@@ -284,22 +284,6 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .v-origchk { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 10px; border-radius: 9px;
   background: #ffffff14; border: 1px solid #ffffff22; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
 .v-origchk input { accent-color: var(--accent); margin: 0; }
-.v-quality { position: relative; flex: 0 0 auto; }
-.v-quality:not([hidden]) { display: block; }
-.v-quality-toggle { display: flex; align-items: center; gap: 6px; border: 1px solid #ffffff33; background: #ffffff1b;
-  color: #fff; border-radius: 9px; min-height: 36px; padding: 4px 10px; cursor: pointer; white-space: nowrap; }
-.v-quality-toggle:focus-visible, .v-quality-menu button:focus-visible { outline: 2px solid var(--accent); }
-#v-quality-state { font-size: 12px; }
-.v-quality-menu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: min(295px, calc(100vw - 24px));
-  max-height: min(70vh, 430px); overflow-y: auto; background: #1c1e22; border: 1px solid #555; border-radius: 12px;
-  box-shadow: 0 12px 30px #000a; padding: 5px; }
-.v-quality-menu:not([hidden]) { display: flex; flex-direction: column; }
-.v-quality-menu button { width: 100%; text-align: left; border: 0; border-radius: 7px; padding: 9px 10px;
-  background: transparent; color: #fff; cursor: pointer; }
-.v-quality-menu button[hidden] { display: none; }
-.v-quality-menu button:hover, .v-quality-menu button.on { background: #ffffff21; }
-.v-quality-menu button small { display: block; font-size: 11px; color: #b5b8bf; margin-top: 3px; }
-.v-quality-menu .v-quality-optimize { margin-top: 4px; border-top: 1px solid #555; color: #f7d37c; }
 /* живое фото: ролик лежит поверх снимка, ведёт себя как картинка (масштаб, свайпы) */
 #v-live, #v-live2, #v-live3 { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none;
   opacity: 0; transition: opacity .25s; background: transparent; }

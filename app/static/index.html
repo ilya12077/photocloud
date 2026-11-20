@@ -119,19 +119,7 @@
     <a id="v-orig" class="icon" target="_blank" rel="noopener" title="Оригинал в новой вкладке" aria-label="Оригинал">⤢</a>
     <a id="v-dl" class="icon" title="Скачать оригинал" aria-label="Скачать">⤓</a>
     <label class="v-origchk" id="v-livewrap" hidden title="Живое фото: проигрывать ролик при открытии"><input type="checkbox" id="v-livechk"> <span class="live-ico" aria-hidden="true"></span>Live</label>
-    <div id="v-quality" class="v-quality" hidden>
-      <button id="v-quality-toggle" class="v-quality-toggle" type="button" aria-label="Настройки качества видео" title="Качество видео" aria-haspopup="true" aria-controls="v-quality-menu" aria-expanded="false">⚙ <span id="v-quality-state">Авто · оригинал</span></button>
-      <div id="v-quality-menu" class="v-quality-menu" role="menu" aria-label="Качество видео" hidden>
-        <button type="button" role="menuitemradio" data-quality="auto" aria-checked="true">Авто <small>оригинал, при задержках — адаптивно</small></button>
-        <button type="button" role="menuitemradio" data-quality="orig" aria-checked="false">Оригинал <small>без перекодирования</small></button>
-        <button type="button" role="menuitemradio" data-quality="p144" aria-checked="false" hidden>144p</button>
-        <button type="button" role="menuitemradio" data-quality="p240" aria-checked="false" hidden>240p</button>
-        <button type="button" role="menuitemradio" data-quality="p720" aria-checked="false" hidden>720p</button>
-        <button type="button" role="menuitemradio" data-quality="p1080" aria-checked="false" hidden>1080p</button>
-        <button type="button" role="menuitemradio" data-quality="p2160" aria-checked="false" hidden>4K</button>
-        <button type="button" data-quality="optimize" class="v-quality-optimize">⚡ Подобрать оптимальное качество</button>
-      </div>
-    </div>
+    <label class="v-origchk" id="v-origwrap" hidden title="Включено: исходный видеофайл без перекодирования. Выключено: сжатый совместимый поток HLS"><input type="checkbox" id="v-origchk" checked> без сжатия</label>
     <div class="v-meta"><div id="v-name"></div><div id="v-date" class="dim"></div></div>
     <button id="v-star" class="icon star-btn" type="button" aria-label="В избранное" title="В избранное"><svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path class="star-path" d="M12 3.2l2.7 5.6 6.1.8-4.5 4.2 1.1 6.1L12 17l-5.4 2.9 1.1-6.1-4.5-4.2 6.1-.8z"/></svg></button>
     <button id="v-infobtn" class="icon" type="button" aria-label="Подробнее" title="Подробнее (или смахни фото вверх)">ⓘ</button>
