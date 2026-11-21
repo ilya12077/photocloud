@@ -66,6 +66,51 @@ class UploadQueueTests(unittest.TestCase):
         self.assertEqual(self.queue.get(ident)["state"], "done")
         self.assertFalse(self.queue.path(ident).exists())
 
+    def test_other_files_upload_while_large_video_is_copied_to_restored(self):
+        import threading
+        first = self.queue.start("alice", "large.mp4", "", 4, 1700000000)
+        self.queue.chunk(first["id"], "alice", 0, b"data")
+        self.queue.finish(first["id"], "alice")
+        copying = threading.Event()
+        release = threading.Event()
+        next_uploaded = threading.Event()
+
+        class SlowRestore:
+            enabled = True
+            def write(self, rel, src, mtime, sha):
+                copying.set()
+                release.wait(4)
+                return rel
+
+        worker = threading.Thread(target=lambda: self.queue.stage_one(SlowRestore()),
+                                  daemon=True)
+        worker.start()
+        self.assertTrue(copying.wait(2), "SMB transfer did not start")
+        self.assertEqual(self.queue.get(first["id"])["state"], "staging")
+
+        def next_file():
+            other = self.queue.start("alice", "next.jpg", "", 4, 1700000000)
+            self.queue.chunk(other["id"], "alice", 0, b"next")
+            self.queue.finish(other["id"], "alice")
+            next_uploaded.set()
+        second = threading.Thread(target=next_file, daemon=True)
+        second.start()
+        try:
+            self.assertTrue(next_uploaded.wait(1.5), "slow SMB transfer blocked new uploads")
+        finally:
+            release.set()
+            worker.join(5)
+            second.join(5)
+        self.assertEqual(self.queue.get(first["id"])["state"], "ready")
+
+    def test_staging_is_requeued_after_server_restart(self):
+        item = self.queue.start("alice", "photo.jpg", "", 4, 1700000000)
+        self.queue.chunk(item["id"], "alice", 0, b"file")
+        self.queue.finish(item["id"], "alice")
+        self.db.run("UPDATE uploads SET state='staging' WHERE id=?", (item["id"],))
+        restarted = UploadQueue(self.db, self.root / "incoming")
+        self.assertEqual(restarted.get(item["id"])["state"], "queued")
+
     def test_non_admin_cannot_overwrite_part_of_another_upload(self):
         item = self.queue.start("alice", "test.mp4", "", 4, 1700000000)
         with self.assertRaises(ValueError):

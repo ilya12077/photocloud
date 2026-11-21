@@ -97,6 +97,8 @@ class UploadQueue:
             destination TEXT NOT NULL DEFAULT ''
         )""")
         db.run("CREATE INDEX IF NOT EXISTS uploads_state ON uploads(state,created)")
+        # В случае перезапуска посреди SMB-передачи пробуем снова.
+        db.run("UPDATE uploads SET state='queued' WHERE state='staging'")
 
     def path(self, ident: str) -> Path:
         if not isinstance(ident, str) or not ID_PATTERN.fullmatch(ident):
@@ -112,13 +114,16 @@ class UploadQueue:
     def get(self, ident: str):
         return self._row(ident) if isinstance(ident, str) and ID_PATTERN.fullmatch(ident) else None
 
-    def list(self, states=("queued","ready")):
-        allowed = tuple(s for s in states if s in ("queued","ready","done","uploading"))
+    def list(self, states=("queued","staging","ready")):
+        allowed = tuple(s for s in states if s in ("queued","staging","ready","done","uploading"))
         if not allowed:
             return []
-        rows = self.db.run("SELECT id FROM uploads WHERE state IN (" + ",".join("?" for _ in allowed)
+        cols = ("id","user","name","folder","size","mtime","offset","sha","staged",
+                "state","created","completed","destination")
+        rows = self.db.run("SELECT " + ",".join(cols) + " FROM uploads WHERE state IN ("
+                           + ",".join("?" for _ in allowed)
                            + ") ORDER BY created DESC LIMIT 3000", allowed)
-        return [self._row(r[0]) for r in rows]
+        return [dict(zip(cols, row)) for row in rows]
 
     def start(self, user: str, name: str, folder: str, size: int, mtime: float) -> dict:
         name, folder = media_name(name), destination_folder(folder)
@@ -168,7 +173,7 @@ class UploadQueue:
             if not item or item["user"] != user:
                 raise ValueError("загрузка недоступна")
             if item["state"] != "uploading":
-                if item["state"] in ("queued","ready"):
+                if item["state"] in ("queued","staging","ready"):
                     return item
                 raise ValueError("загрузка уже закрыта")
             p=self.path(ident)
@@ -197,22 +202,29 @@ class UploadQueue:
         return self.get(rows[0][0]) if rows else None
 
     def stage_one(self, writer) -> dict | None:
-        """Копировать из DATA_DIR на выделенную SMB-шару восстановления.
-        При недоступном ПК запись остаётся queued и будет повторена позднее.
-        """
+        """Блокировать только переход состояния; SMB работает вне mutex."""
         with self.mu:
-            item=self.next_to_stage()
+            item = self.next_to_stage()
             if item is None:
                 return None
-            rel=f"{UPLOAD_PREFIX}/{item['id']}/{item['name']}"
             if not writer.enabled:
                 raise OSError("учётная запись записи в Restored не настроена")
-            p=self.path(item["id"])
+            p = self.path(item["id"])
             if p.stat().st_size != item["size"]:
                 raise OSError("временный файл загрузки изменился")
-            staged=writer.write(rel,p,item["mtime"],item["sha"])
+            rel = f"{UPLOAD_PREFIX}/{item['id']}/{item['name']}"
+            self.db.run("UPDATE uploads SET state='staging' WHERE id=? AND state='queued'",
+                        (item["id"],))
+        try:
+            staged = writer.write(rel, p, item["mtime"], item["sha"])
+        except BaseException:
+            with self.mu:
+                self.db.run("UPDATE uploads SET state='queued' WHERE id=? AND state='staging'",
+                            (item["id"],))
+            raise
+        with self.mu:
             self.db.run("""UPDATE uploads SET staged=?,state='ready'
-                           WHERE id=? AND state='queued'""",(staged,item["id"]))
+                           WHERE id=? AND state='staging'""", (staged,item["id"]))
             return self.get(item["id"])
 
     def completed(self, ident: str, destination: str) -> bool:
