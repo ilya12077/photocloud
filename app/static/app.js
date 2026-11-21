@@ -20,6 +20,7 @@ const $ = (id) => document.getElementById(id);
 const MONTHS = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
 const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 const HEAD_H = 46;          // высота заголовка месяца, px
+const DAY_H = 36;           // высота заголовка дня в beta, px
 const BUFFER = 1.2;         // сколько экранов рендерим сверху/снизу
 const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16, F_FOLDER = 32;
 // /hidden — та же галерея, но только скрытые фото (тем, кто может скрывать; сервер отдаёт их
@@ -1096,7 +1097,17 @@ function selIds() {
 
 function count(n) { return `${n.toLocaleString('ru')} файл${n % 10 === 1 && n % 100 !== 11 ? '' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)) ? 'а' : 'ов'}`; }
 const monthKey = (ts) => { const d = new Date(ts * 1000); return d.getFullYear() * 12 + d.getMonth(); };
+const dayKey = (ts) => {
+  const d = new Date(ts * 1000);
+  return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+};
 const monthName = (k) => `${MONTHS[k % 12]} ${Math.floor(k / 12)}`;
+const dayDateFormat = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' });
+const dayWeekdayFormat = new Intl.DateTimeFormat('ru-RU', { weekday: 'long' });
+const dayName = (ts) => {
+  const d = new Date(ts * 1000);
+  return `${dayDateFormat.format(d)} · ${dayWeekdayFormat.format(d)}`;
+};
 
 // ================================================================== виртуальная сетка
 // В DOM только строки около экрана: десятки тысяч фото не тормозят ни телефон, ни комп.
@@ -1121,9 +1132,25 @@ function layout() {
       month = monthKey(gdate(i));
       end = i + 1;
       while (end < list.length && monthKey(gdate(end)) === month) end++;
-      rows.push({ h: true, month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
+      rows.push({ h: true, kind: 'month', month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
+      // Beta: внутри месяца — самостоятельный заголовок каждой календарной даты.
+      // Сохраняем «строки» в одном виртуальном списке: поиск строки и прокрутка не меняются.
+      for (let s = i; s < end;) {
+        const day = dayKey(gdate(s)), dayTs = gdate(s);
+        let last = s + 1;
+        while (last < end && dayKey(gdate(last)) === day) last++;
+        rows.push({ h: true, kind: 'day', month, day, dayTs, n: last - s, start: s, top: y, height: DAY_H }); y += DAY_H;
+        for (let k = s; k < last; k += cols) {
+          rows.push({ h: false, start: k, end: Math.min(last, k + cols), month, top: y, height: rowH }); y += rowH;
+        }
+        s = last;
+      }
+    } else {
+      // Сортировка по имени остаётся без календарной группировки.
+      for (let s = i; s < end; s += cols) {
+        rows.push({ h: false, start: s, end: Math.min(end, s + cols), month, top: y, height: rowH }); y += rowH;
+      }
     }
-    for (let s = i; s < end; s += cols) { rows.push({ h: false, start: s, end: Math.min(end, s + cols), month, top: y, height: rowH }); y += rowH; }
     i = end;
   }
   L.rows = rows; L.height = y + 8;
@@ -1231,12 +1258,15 @@ function draw(force) {
 
 function buildRow(r) {
   if (r.h) {
-    const h = el('div', 'mhead', monthName(r.month));
+    const isDay = r.kind === 'day';
+    const label = isDay ? dayName(r.dayTs) : monthName(r.month);
+    const h = el('div', isDay ? 'dhead' : 'mhead', label);
     h.append(el('span', null, r.n.toLocaleString('ru')));
-    // в режиме выбора — кружок: выбрать (или снять) весь месяц сразу
+    // И для месяца, и для дня можно выбрать сразу все фотографии группы.
     h.dataset.start = r.start; h.dataset.n = r.n;
     const c = el('button', 'mcheck'); c.type = 'button';
-    c.setAttribute('aria-label', 'Выбрать весь месяц'); c.title = 'Выбрать весь месяц';
+    c.setAttribute('aria-label', isDay ? 'Выбрать весь день' : 'Выбрать весь месяц');
+    c.title = c.getAttribute('aria-label');
     c.addEventListener('click', (e) => { e.stopPropagation(); selMonth(r.start, r.n); });
     h.prepend(c);
     if (SEL.on && monthAllSel(r.start, r.n)) h.classList.add('sel');
@@ -1465,7 +1495,7 @@ function selUpdate() {
   $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
-  for (const h of $('grid').querySelectorAll('.mhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
+  for (const h of $('grid').querySelectorAll('.mhead, .dhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {
