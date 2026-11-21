@@ -29,9 +29,13 @@ const assert=require('node:assert/strict');
      narrowDates:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
      datesWithLabels:[...document.querySelectorAll('.day-spacer')].every(g=>{
        const label=g.querySelector('.day-spacer-text'), lines=[...g.querySelectorAll('.day-spacer-line')];
-       return lines.length===2 && lines.every(s=>!!s.textContent) &&
-         getComputedStyle(label).textAlign==='right' &&
-         lines.every(s=>s.scrollWidth<=s.clientWidth+1);
+       const style=getComputedStyle(label);
+       const first=lines[0],second=lines[1];
+       return lines.length===2 && /^\\d{1,2} [А-Яа-яЁё]+$/.test(first.textContent) &&
+         /^[А-ЯЁ][а-яё]+$/.test(second.textContent) &&
+         style.textAlign==='right' && style.justifyContent==='center' &&
+         lines.every(s=>s.scrollWidth<=s.clientWidth+1) &&
+         (second.getBoundingClientRect().top-first.getBoundingClientRect().bottom)<Math.max(4,parseFloat(style.fontSize)*.2);
      }),
      lingeringBands:document.querySelectorAll('.dhead').length,
      mappings:idx.every(i=>{const r=L.rows[rowOfIndex(i)];return !r.h&&r.start<=i&&i<r.end})};

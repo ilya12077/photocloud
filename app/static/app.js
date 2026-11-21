@@ -1106,6 +1106,19 @@ const dayName = (ts) => {
   const d = new Date(ts * 1000);
   return `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]}, ${WEEKDAYS_SHORT[d.getDay()]}`;
 };
+const DAY_DATE_FORMAT = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' });
+const DAY_WEEKDAY_FORMAT = new Intl.DateTimeFormat('ru-RU', { weekday: 'long' });
+const DAY_TEXT_MEASURER = document.createElement('canvas').getContext('2d');
+function dateTileFontSize(lines, tileWidth, padding) {
+  // Подгоняем шрифт под обе ПОЛНЫЕ строки, чтобы длинные месяцы не обрезались
+  // при большом количестве столбцов на телефоне.
+  if (!DAY_TEXT_MEASURER) return Math.max(5, tileWidth * 0.17);
+  DAY_TEXT_MEASURER.font = '750 100px system-ui';
+  const widest = Math.max(1, ...lines.map(line => DAY_TEXT_MEASURER.measureText(line).width));
+  const available = Math.max(1, tileWidth - padding * 2);
+  const size = Math.min(tileWidth * 0.41, available * 100 / widest * 0.96, available / 2.25);
+  return Math.max(4, Math.floor(size * 10) / 10);
+}
 
 // ================================================================== виртуальная сетка
 // В DOM только строки около экрана: десятки тысяч фото не тормозят ни телефон, ни комп.
@@ -1119,8 +1132,7 @@ function layout() {
   L.tileH = (W - L.gap * (cols - 1)) / cols;
   // значки на плитках — в масштабе плитки: полный размер от 160 px, мельче — пропорционально (не меньше 55%)
   $('grid').style.setProperty('--bs', Math.max(0.55, Math.min(1, L.tileH / 160)).toFixed(3));
-  // Дата масштабируется вместе с размером плитки, а не остаётся мелкой подписью.
-  $('grid').style.setProperty('--date-size', (Math.max(8, L.tileH * 0.22)).toFixed(2) + 'px');
+  // Размер шрифта дат определяется по фактической ширине обеих строк в каждой ячейке.
   const rowH = L.tileH + L.gap;
   const rows = []; let y = 0;
   const byMonth = st.sort !== 'name';
@@ -1303,10 +1315,16 @@ function buildRow(r) {
       c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
       c.addEventListener('click', e => { e.stopPropagation(); selMonth(slot.start, slot.n); });
       const date = new Date(slot.dayTs * 1000);
+      const firstLine = DAY_DATE_FORMAT.format(date);
+      const weekday = DAY_WEEKDAY_FORMAT.format(date);
+      const secondLine = weekday.charAt(0).toUpperCase() + weekday.slice(1);
       const label = el('span', 'day-spacer-text');
+      const padding = Math.max(1, Math.min(12, L.tileH * 0.04));
+      spacer.style.setProperty('--date-pad', padding.toFixed(2) + 'px');
+      label.style.fontSize = dateTileFontSize([firstLine, secondLine], L.tileH, padding) + 'px';
       label.append(
-        el('span', 'day-spacer-line', `${date.getDate()} ${MONTHS_SHORT[date.getMonth()]},`),
-        el('span', 'day-spacer-line', WEEKDAYS_SHORT[date.getDay()])
+        el('span', 'day-spacer-line', firstLine),
+        el('span', 'day-spacer-line', secondLine)
       );
       spacer.append(c, label);
       if (SEL.on && monthAllSel(slot.start, slot.n)) spacer.classList.add('sel');
