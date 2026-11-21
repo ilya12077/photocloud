@@ -158,7 +158,7 @@
 <div id="up-modal" class="up-overlay" role="dialog" aria-modal="true" aria-labelledby="up-title" hidden>
   <section class="up-dialog">
     <header class="up-head">
-      <div><h2 id="up-title">Загрузка фото и видео</h2><small>Только администратор. Передача возможна только при включённом ПК.</small></div>
+      <div><h2 id="up-title">Загрузка фото и видео</h2></div>
       <button id="up-close" type="button" class="icon" aria-label="Закрыть загрузку">✕</button>
     </header>
     <div id="up-offline" class="up-offline" hidden role="status">
@@ -188,6 +188,7 @@
     <div id="up-progress-wrap" class="up-progress-wrap" hidden>
       <progress id="up-progress" max="100" value="0"></progress>
       <span id="up-progress-caption"></span>
+      <span id="up-progress-stats" aria-live="off"></span>
     </div>
     <div id="up-result" class="up-result" role="status" aria-live="polite" hidden>
       <span id="up-result-icon" class="up-result-icon" aria-hidden="true">✓</span>

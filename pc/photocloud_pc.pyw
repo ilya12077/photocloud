@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.8"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.9"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -905,6 +905,7 @@ class App:
         self.up_cols = self.up_gen = 1
         self._up_pending_render = False
         self._up_last_tile = None
+        self._up_active_id = None             # последний нажатый файл для предпросмотра
         self._build()
         h = _UiLog(self)
         log.addHandler(h)
@@ -958,15 +959,9 @@ class App:
         self.up_status = ttk.Label(tab, text="Новые загрузки появятся здесь автоматически",
                                    padding=(12, 3, 12, 10))
         self.up_status.pack(fill="x")
-        choices = ttk.Frame(tab, padding=(12, 0, 12, 8))
-        choices.pack(fill="x")
-        ttk.Label(choices, text="Папка для выбранных:").pack(side="left")
-        self.up_folder = tk.StringVar(value="")
-        self.up_folder_box = ttk.Combobox(choices, textvariable=self.up_folder, width=54)
-        self.up_folder_box.pack(side="left", padx=8, fill="x", expand=True)
-        ttk.Button(choices, text="Новая папка", command=self._up_new_folder).pack(side="left")
-        ttk.Label(tab, text="Папку можно изменить для одного файла или для всей выделенной группы.",
-                  padding=(12, 0, 12, 5), foreground="#777").pack(fill="x")
+        ttk.Label(tab, text="Файлы сгруппированы по папкам, выбранным при загрузке на сайте. "
+                            "Изменить папку назначения в клиенте нельзя.",
+                  padding=(12, 0, 12, 8), foreground="#777").pack(fill="x")
 
         wrap = ttk.Frame(tab)
         wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
@@ -991,14 +986,17 @@ class App:
             self.up_canvas.bind(sequence, self._up_wheel)
 
         table = ttk.Frame(self.up_views)
+        self.up_table = table
         self.up_views.add(table, text="Список")
-        columns = ("name", "folder", "size", "sender")
-        self.up_tree = ttk.Treeview(table, columns=columns, show="headings",
+        columns = ("name", "size", "sender")
+        self.up_tree = ttk.Treeview(table, columns=columns, show="tree headings",
                                     selectmode="extended")
-        for key, title, width in (("name", "Файл", 280), ("folder", "Целевая папка", 290),
-                                   ("size", "Размер", 95), ("sender", "Загрузил", 110)):
+        self.up_tree.heading("#0", text="Папка назначения (выбрана при загрузке)")
+        self.up_tree.column("#0", width=290, stretch=True)
+        for key, title, width in (("name", "Файл", 300), ("size", "Размер", 100),
+                                   ("sender", "Загрузил", 125)):
             self.up_tree.heading(key, text=title)
-            self.up_tree.column(key, width=width, stretch=key in ("name", "folder"))
+            self.up_tree.column(key, width=width, stretch=key == "name")
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.up_tree.yview)
         self.up_tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -1007,7 +1005,7 @@ class App:
 
         preview = ttk.Frame(tab, padding=(12, 0, 12, 12))
         preview.pack(fill="x")
-        self.up_preview = ttk.Label(preview, text="Выбери файл для предпросмотра",
+        self.up_preview = ttk.Label(preview, text="Выберите файл для предпросмотра",
                                     width=34, anchor="center")
         self.up_preview.pack(side="left")
         self._up_preview_img = None
@@ -1025,17 +1023,39 @@ class App:
         return "break"
 
     def _up_layout(self):
+        """Загруженные файлы группируются по исходной папке назначения."""
         c = self.up_canvas
-        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
-        self.up_cols = max(1, (w - GAP) // (CARD_W + GAP))
-        rows = (len(self.upload_items) + self.up_cols - 1) // self.up_cols
-        c.configure(scrollregion=(0, 0, w, max(h, rows * (CARD_H + GAP) + GAP)))
+        width, height = max(1, c.winfo_width()), max(1, c.winfo_height())
+        self.up_cols = max(1, (width - GAP) // (CARD_W + GAP))
+        self.up_positions = []
+        self.up_headers = []
+        y, start = GAP, 0
+        while start < len(self.upload_items):
+            folder = self.upload_items[start].get("folder") or ""
+            finish = start + 1
+            while finish < len(self.upload_items) and self.upload_items[finish].get("folder", "") == folder:
+                finish += 1
+            count = finish - start
+            self.up_headers.append((y, folder or "Корень фотоархива", count))
+            y += 32
+            for local in range(count):
+                x = GAP + (local % self.up_cols) * (CARD_W + GAP)
+                cy = y + (local // self.up_cols) * (CARD_H + GAP)
+                self.up_positions.append((x, cy))
+            y += ((count + self.up_cols - 1) // self.up_cols) * (CARD_H + GAP) + GAP
+            start = finish
+        c.configure(scrollregion=(0, 0, width, max(height, y + GAP)))
         c.delete("all")
         self.up_drawn = {}
         if not self.upload_items:
-            c.create_text(w // 2, 70, text="Нет загруженных файлов, ожидающих переноса.",
+            c.create_text(width // 2, 70, text="Нет загруженных файлов, ожидающих переноса.",
                           fill=DIM, font=("Segoe UI", 12))
         else:
+            for pos, folder, count in self.up_headers:
+                c.create_text(GAP + 4, pos + 15, anchor="w",
+                              text=f"📁 {folder} · {count} файл(ов)",
+                              fill=TEXT, font=("Segoe UI", 11, "bold"),
+                              tags=("upload-group-heading",))
             self._up_render()
 
     def _up_soon(self):
@@ -1048,10 +1068,9 @@ class App:
         if not self.upload_items:
             return
         c = self.up_canvas
-        top, h, rh = c.canvasy(0), max(1, c.winfo_height()), CARD_H + GAP
-        r0 = max(0, int((top - h) // rh))
-        r1 = int((top + 2 * h) // rh) + 1
-        visible = set(range(r0 * self.up_cols, min(len(self.upload_items), r1 * self.up_cols)))
+        top, h = c.canvasy(0), max(1, c.winfo_height())
+        visible = {idx for idx, (_x, cy) in enumerate(self.up_positions)
+                   if cy + CARD_H >= top - h and cy <= top + 2 * h}
         for idx in list(self.up_drawn):
             if idx not in visible:
                 c.delete(f"up{idx}")
@@ -1070,10 +1089,11 @@ class App:
         item, c, tag = self.upload_items[idx], self.up_canvas, f"up{idx}"
         ident = item["id"]
         selected = ident in self.up_tree.selection()
-        x, y = GAP + (idx % self.up_cols) * (CARD_W + GAP), GAP + (idx // self.up_cols) * (CARD_H + GAP)
+        active = selected and ident == self._up_active_id
+        x, y = self.up_positions[idx]
         c.create_rectangle(x, y, x + CARD_W, y + CARD_H,
                            fill=CARD, outline=ACCENT if selected else "#d6d6d6",
-                           width=3 if selected else 1, tags=(tag, "up-card"))
+                           width=4 if active else 2 if selected else 1, tags=(tag, "up-card"))
         ix, iy = x + (CARD_W - THUMB) // 2, y + 8
         c.create_rectangle(ix, iy, ix + THUMB, iy + THUMB,
                            fill=IMGBG, outline="", tags=(tag, "up-card", "up-img"))
@@ -1157,6 +1177,13 @@ class App:
         else:
             self.up_tree.selection_add(ident)
         self._up_last_tile = idx
+        if ident in self.up_tree.selection():
+            self._up_active_id = ident
+        elif self._up_active_id == ident:
+            # Сняли выделение с текущего файла: возвращаемся к
+            # предыдущему выбранному, а не к верхней карточке по умолчанию.
+            self._up_active_id = next((sid for sid in reversed(previous)
+                                      if sid != ident and sid in self.up_tree.selection()), None)
         self._up_selection_changed()
         return "break"
 
@@ -1228,8 +1255,15 @@ class App:
             self.up_status.configure(text="Не удалось получить очередь: " + error)
             return
         old_selected = set(self.up_tree.selection())
-        self.upload_items = items
-        self.upload_by_id = {item["id"]: item for item in items}
+        # Автообновление списка не должно прокручивать вкладку к первой
+        # карточке: остаёмся на позиции последнего выбранного файла.
+        scroll_position = self.up_canvas.yview()[0] if self.upload_items else 0.0
+        self.upload_items = sorted(
+            items,
+            key=lambda it: ((it.get("folder") or "").casefold(),
+                            it.get("folder") or "", -float(it.get("created") or 0),
+                            (it.get("name") or "").casefold()))
+        self.upload_by_id = {item["id"]: item for item in self.upload_items}
         present = set(self.upload_by_id)
         initial = self._uploads_known is None
         if not initial and present - self._uploads_known:
@@ -1241,28 +1275,58 @@ class App:
             self.root.after(700, lambda: messagebox.showinfo(
                 APP, f"Есть новые загруженные файлы: {count}.\n\n"
                      "Файлы находятся в Restored и ещё не добавлены в галерею.\n"
-                     "Открой вкладку «Загруженные»: там доступны превью, "
+                     "Откройте вкладку «Загруженные»: там доступны превью, "
                      "перенос по одному или группой и удаление ненужных файлов."))
         self.nb.tab(self.upload_tab, text=f"Загруженные ({len(items)})" if items else "Загруженные")
         self.up_tree.delete(*self.up_tree.get_children())
-        self.up_folder_box["values"] = ["⟪Корень архива⟫"] + folders
-        for item in items:
-            self.up_tree.insert("", "end", iid=item["id"], values=(
-                item["name"], item["folder"] or "Корень архива",
-                human(item["size"]), item["user"]))
+        self.up_groups = {}
+        for item in self.upload_items:
+            folder = item.get("folder") or ""
+            group_id = "folder:" + folder
+            if group_id not in self.up_groups:
+                self.up_groups[group_id] = []
+                self.up_tree.insert("", "end", iid=group_id,
+                                    text=f"📁 {folder or 'Корень фотоархива'}", open=True)
+            self.up_groups[group_id].append(item["id"])
+            self.up_tree.insert(group_id, "end", iid=item["id"],
+                                values=(item["name"], human(item["size"]), item["user"]))
         self.up_tree.selection_set([ident for ident in old_selected if ident in present])
+        if self._up_active_id not in present:
+            self._up_active_id = None
         self.up_gen += 1
-        self.up_canvas.yview_moveto(0)
         self._up_layout()
+        self.up_canvas.yview_moveto(scroll_position)
+        self._up_render()
         self._up_selection_changed()
         self.up_status.configure(text=f"Ожидают переноса: {len(items)} файл(ов). "
-                              "Выбери карточки и укажи папку, либо удали ненужное из Restored.")
+                              "Выберите файлы для переноса в заданные при загрузке папки или для удаления из Restored.")
 
     def _up_select_all(self):
-        self.up_tree.selection_set(self.up_tree.get_children())
+        self.up_tree.selection_set(list(self.upload_by_id))
+        if self.upload_items:
+            self._up_active_id = self.upload_items[-1]["id"]
+        self._up_selection_changed()
 
     def _up_selection_changed(self, _event=None):
-        picked = [self.upload_by_id[k] for k in self.up_tree.selection() if k in self.upload_by_id]
+        selected = self.up_tree.selection()
+        category_ids = [sid for sid in selected if sid in self.up_groups]
+        if category_ids:
+            # Выбор категории равнозначен выбору всех файлов этой папки.
+            expanded = {sid for sid in selected if sid in self.upload_by_id}
+            for group in category_ids:
+                expanded.update(self.up_groups[group])
+            self.up_tree.selection_set(list(expanded))
+            return
+        picked = [self.upload_by_id[k] for k in selected if k in self.upload_by_id]
+        # Для таблицы последним нажатым является Treeview.focus().
+        # При клике по карточке запоминаем ID напрямую в _up_tile_click,
+        # поэтому скрытый Treeview не должен перехватывать фокус.
+        if _event is not None and self.up_views.select() == str(self.up_table):
+            focused = self.up_tree.focus()
+            if focused in self.upload_by_id and focused in selected:
+                self._up_active_id = focused
+        if self._up_active_id not in {p["id"] for p in picked}:
+            self._up_active_id = picked[-1]["id"] if picked else None
         for i in list(self.up_drawn):
             self.up_canvas.delete(f"up{i}")
             self._up_card(i)
@@ -1270,12 +1334,10 @@ class App:
             button.state(["!disabled"] if picked and not self.busy else ["disabled"])
         if not picked:
             self.up_details.configure(text="")
-            self.up_preview.configure(image="", text="Выбери файл для предпросмотра")
+            self.up_preview.configure(image="", text="Выберите файл для предпросмотра")
             self._up_preview_img = None
             return
-        folders = {item["folder"] for item in picked}
-        self.up_folder.set(next(iter(folders)) if len(folders) == 1 else "")
-        item = picked[0]
+        item = self.upload_by_id[self._up_active_id]
         self.up_details.configure(text=f"{item['name']}\nЗагружено: {item['user']}\n"
                                        f"Папка: {item['folder'] or 'корень'}\n"
                                        f"Выделено: {len(picked)}")
@@ -1292,7 +1354,8 @@ class App:
                 except Exception:
                     raw = b""
             def show():
-                if item["id"] not in self.up_tree.selection(): return
+                if item["id"] != self._up_active_id or item["id"] not in self.up_tree.selection():
+                    return  # устаревшая загрузка превью уже неактуальна
                 if not raw:
                     self.up_preview.configure(text="Видео или нет превью")
                     return
@@ -1306,25 +1369,11 @@ class App:
             self.ui(show)
         threading.Thread(target=worker, daemon=True).start()
 
-    def _up_new_folder(self):
-        parent = self.up_folder.get().strip()
-        if parent == "⟪Корень архива⟫": parent = ""
-        name = ask_text(self.root, APP, "Название новой папки (внутри выбранной):")
-        if not name: return
-        try:
-            safe_rel(name)
-            if "/" in name or "\\" in name or name.endswith((".", " ")):
-                raise ValueError("недопустимое имя")
-        except ValueError:
-            messagebox.showerror(APP, "Имя содержит недопустимые символы")
-            return
-        self.up_folder.set((parent + "/" if parent else "") + name)
-
     def _up_delete(self) -> None:
         """Подтверждённое удаление только полученных веб-загрузок из Restored."""
         ids = [ident for ident in self.up_tree.selection() if ident in self.upload_by_id]
         if self.busy or not ids:
-            messagebox.showinfo(APP, "Выдели одну или несколько загруженных карточек.")
+            messagebox.showinfo(APP, "Выберите одну или несколько загруженных карточек.")
             return
         total = sum(self.upload_by_id[ident]["size"] for ident in ids)
         if not messagebox.askyesno(
@@ -1373,15 +1422,15 @@ class App:
     def _up_move(self) -> None:
         ids = list(self.up_tree.selection())
         if self.busy or not ids:
-            messagebox.showinfo(APP, "Выдели фотографии или видео для переноса.")
+            messagebox.showinfo(APP, "Выберите фотографии или видео для переноса.")
             return
-        folder = self.up_folder.get().strip()
-        override = None if not folder else ("" if folder == "⟪Корень архива⟫" else folder)
+        destinations = {self.upload_by_id[ident].get("folder", "") for ident in ids
+                        if ident in self.upload_by_id}
         if not messagebox.askyesno(APP,
             f"Перенести {len(ids)} файл(ов) в фотоархив?\n"
-            + (f"Общая папка: {override or 'корень'}" if override is not None
-               else "Для каждого файла: выбранная при загрузке папка")
-            + "\n\nСуществующие файлы не будут заменены."):
+            f"Папок назначения: {len(destinations)}.\n"
+            "Для каждого файла будет использована папка, заданная при загрузке на сайте.\n\n"
+            "Существующие файлы не будут заменены."):
             return
         self.busy = True
         self.b_up_move.state(["disabled"])
@@ -1391,9 +1440,8 @@ class App:
             for ident in ids:
                 item = self.upload_by_id.get(ident)
                 if not item: continue
-                foldername = item["folder"] if override is None else override
                 try:
-                    dst = import_uploaded(Path(self.cfg.root), item, foldername)
+                    dst = import_uploaded(Path(self.cfg.root), item, item["folder"])
                     r = self.api.call("POST", "/api/pc/uploads/complete",
                                       {"id":item["id"],"destination":dst})
                     if r.status_code != 200:
@@ -1722,7 +1770,7 @@ class App:
         self.cfg.save()
         self.ui(lambda: (self.v_root.set(self.cfg.root), self._key_text()))
         log.info("привязан: ключ %s, папка %s", res["fp"], rootp)
-        self.ui(lambda: messagebox.showinfo(APP, f"Привязано.\n\nОтпечаток ключа: {res['fp']}\nСверь его с админкой "
+        self.ui(lambda: messagebox.showinfo(APP, f"Привязано.\n\nОтпечаток ключа: {res['fp']}\nСверьте его с панелью администратора "
                                                  "(«Клиенты» → «Агент основного ПК»)."))
         self.ui(self.load)
 
@@ -1738,7 +1786,7 @@ class App:
         if found and Path(found).is_dir():
             if messagebox.askyesno(APP, f"Папка архива (общая папка «{share}»):\n{found}\n\nВерно?"):
                 return found
-        messagebox.showinfo(APP, f"Укажи папку архива на этом ПК — ту, что открыта по сети как «{share}».")
+        messagebox.showinfo(APP, f"Укажите папку архива на этом ПК — ту, что открыта по сети как «{share}».")
         return filedialog.askdirectory(title="Папка архива") or ""
 
     # ---- список
@@ -1755,7 +1803,7 @@ class App:
             self.cfg.client_id = ""
             self.cfg.save()
             self.ui(lambda: messagebox.showwarning(APP, "Сервер не знает этот ключ (отвязан или привязан другой). "
-                                                        "Привяжем заново: в админке нажми «Привязать»."))
+                                                        "Привяжите клиент заново: в панели администратора нажмите «Привязать»."))
             self._pair()
             return
         if r.status_code != 200:
@@ -1836,7 +1884,7 @@ class App:
         if messagebox.askyesno(
             APP, f"При запуске обнаружены восстановленные файлы: {n}.\n"
                  "Копии находятся в Restored и проверены по SHA-256.\n\n"
-                 "Посмотри вкладку «Удаление» → «Восстановление файлов».\n"
+                 "Посмотрите вкладку «Удаление» → «Восстановление файлов».\n"
                  "Применить восстановление сейчас? Перед заменой оригиналы "
                  "будут сохранены отдельно."
         ):
@@ -2153,7 +2201,7 @@ class App:
         if self.busy:
             return
         if not self.api or not self.cfg.root:
-            messagebox.showerror(APP, "Сначала привяжи клиент и укажи папку архива.")
+            messagebox.showerror(APP, "Сначала привяжите клиент и укажите папку архива.")
             return
         from urllib.parse import urlsplit
         url = urlsplit(self.cfg.server)
@@ -2187,7 +2235,7 @@ class App:
                 self._buttons(True)
                 messagebox.showinfo(APP, f"Подтверждено сервером: {done} из {len(items)}.\n"
                     + ("\n".join(errors[:10]) if errors else "")
-                    + ("\nПри обрыве связи нажми кнопку повторно: уже исправленные файлы не перезаписываются." if errors else ""))
+                    + ("\nПри обрыве связи нажмите кнопку повторно: уже исправленные файлы не перезаписываются." if errors else ""))
             self.ui(show)
         self.bg(go)
 
@@ -2207,7 +2255,7 @@ class App:
         def go():
             r = self.api.call("POST", url, {"paths": picked})
             if r.status_code == 404:
-                raise ServerError("сервер не знает эту команду — обнови сервер")
+                raise ServerError("Сервер не распознал команду — обновите сервер")
             if r.status_code != 200:
                 raise ServerError(_err(r))
             self.ui(self.load)
@@ -2221,7 +2269,7 @@ class App:
 
     def save_settings(self) -> None:
         if self.busy:
-            messagebox.showinfo(APP, "Дождись окончания операции.")
+            messagebox.showinfo(APP, "Дождитесь завершения операции.")
             return
         srv = self.v_server.get().strip().rstrip("/")
         if not valid_server(srv):
@@ -2252,8 +2300,8 @@ class App:
     def repair(self) -> None:
         if self.busy or self.api is None:
             return
-        if not messagebox.askyesno(APP, "Привязать этот ПК заново?\n\nСначала в админке: «Клиенты» → «Агент основного ПК» → "
-                                        "«Привязать заново», потом «Да» здесь."):
+        if not messagebox.askyesno(APP, "Привязать этот ПК заново?\n\nСначала в панели администратора: «Клиенты» → «Агент основного ПК» → "
+                                        "«Привязать заново», затем нажмите «Да» здесь."):
             return
         self.cfg.client_id = self.cfg.fp = ""
         self.cfg.save()

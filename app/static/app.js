@@ -373,7 +373,7 @@ $('up-feed-open').addEventListener('click', () => upOpen());
 
 // ---------------------------------------------------------------- загрузка новых фото/видео в Restored через очередь ПК
 const UP = { files: [], busy: false, abort: null, activeId: null, depth: 0, done: 0,
-  available: false, offlineMessage: 'Проверяем доступность компьютера…' };
+  available: false, offlineMessage: 'Проверяем доступность компьютера…', folderEdited: false };
 const UP_EXT = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif',
   'mp4','mov','m4v','3gp','webm','mts','m2ts','avi','mpg','mpeg','vob']);
 const upMedia = file => UP_EXT.has(file.name.split('.').pop().toLowerCase());
@@ -388,6 +388,7 @@ function upResetResult() {
   $('up-progress-wrap').hidden = true;
   $('up-progress').value = 0;
   $('up-progress-caption').textContent = '';
+  $('up-progress-stats').textContent = '';
 }
 function upShowResult(done, skipped, errors, stopped) {
   const anyErrors = errors.length > 0, anyUploaded = done > 0;
@@ -405,9 +406,9 @@ function upShowResult(done, skipped, errors, stopped) {
     (anyErrors ? '. Ошибок: ' + errors.length + '.' : '.');
   $('up-result-hint').textContent = anyErrors
     ? 'Ошибки: ' + errors.slice(0, 3).join(' · ')
-    : anyUploaded ? 'Файлы уже сохранены в Restored на ПК. Для переноса в основную галерею открой вкладку «Загруженные» в клиенте ПК.'
+    : anyUploaded ? ''
     : skipped && !stopped ? 'Дубли пропущены: файл с таким именем и не меньшим размером уже существует.'
-    : 'Выбери файлы и начни новую загрузку.';
+    : 'Выберите файлы для загрузки.';
   $('up-status').textContent = '';
 }
 $('up-result-again').addEventListener('click', () => {
@@ -445,6 +446,7 @@ async function upLoadFolders() {
     $('up-folder-list').replaceChildren(...(data.folders || []).map(name => {
       const item = el('option'); item.value = name; return item;
     }));
+    if (!UP.folderEdited) $('up-folder').value = data.default_folder || '';
     UP.available = !!data.ready;
     UP.offlineMessage = data.message ||
       (UP.available ? '' : 'ПК выключен. Включите компьютер — загрузка недоступна.');
@@ -481,9 +483,8 @@ async function upLoadPending() {
       image.src = '/api/upload/' + encodeURIComponent(item.id) + '/thumb';
       image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
       const details = el('div');
-      const status = 'Уже записан в Restored · ожидает переноса клиентом ПК';
-      details.append(el('strong', null, item.name), el('small', null,
-        (item.folder || 'Корень') + ' · ' + status));
+      details.append(el('strong', null, item.name));
+      if (item.folder) details.append(el('small', null, item.folder));
       row.append(image, details);
       container.append(row);
     }
@@ -494,7 +495,9 @@ function upOpen(files) {
   if (!st.me || st.me.role !== 'admin') return;
   if (!UP.busy) upResetResult();
   $('up-modal').hidden = false;
-  $('up-folder').value = st.folder || '';
+  UP.folderEdited = false;
+  const newestPhoto = st.lib?.photos.find(photo => !(photo[6] & F_VIDEO));
+  $('up-folder').value = newestPhoto ? (st.lib.folders[newestPhoto[1]] || '') : '';
   if (files) upPrepare(files);
   upLoadFolders();
   upLoadPending();
@@ -509,6 +512,7 @@ $('up-modal').addEventListener('click', event => {
   if (event.target === $('up-modal')) upClose();
 });
 $('up-files').addEventListener('change', event => upPrepare(event.target.files));
+$('up-folder').addEventListener('input', () => { UP.folderEdited = true; });
 $('up-refresh').addEventListener('click', () => { upLoadPending(); upLoadFolders(); });
 $('up-new-folder').addEventListener('click', () => {
   const name = prompt('Название новой папки внутри выбранной:');
@@ -518,6 +522,7 @@ $('up-new-folder').addEventListener('click', () => {
   }
   const parent = $('up-folder').value.trim().replace(/\/+$/, '');
   $('up-folder').value = (parent ? parent + '/' : '') + name;
+  UP.folderEdited = true;
   $('up-status').textContent = 'Папка будет создана клиентом ПК при переносе.';
 });
 async function upPostJSON(path, body, signal) {
@@ -528,7 +533,7 @@ async function upPostJSON(path, body, signal) {
   if (!response.ok) throw new Error(json.detail || json.error || 'Ошибка сервера: ' + response.status);
   return json;
 }
-async function upSendOne(file, folder, signal, onProgress, allowLarger = false) {
+async function upSendOne(file, folder, signal, onProgress, allowLarger = false, onVerify = () => {}) {
   const task = await upPostJSON('/api/upload/start', {
     name: file.name, folder, size: file.size,
     allow_larger: allowLarger,
@@ -553,7 +558,7 @@ async function upSendOne(file, folder, signal, onProgress, allowLarger = false) 
       onProgress(sent / file.size);
     }
     $('up-status').textContent = 'Файл передан. Проверяю целостность на ПК: ' + file.name;
-    $('up-progress-caption').textContent = 'Данные переданы. Проверка SHA-256 на ПК…';
+    onVerify();
     await upPostJSON('/api/upload/' + task.id + '/finish', {}, signal);
   } catch (error) {
     await upPostJSON('/api/upload/' + task.id + '/cancel', {}).catch(() => {});
@@ -605,6 +610,45 @@ function upAskLarger(file, existingSize, ordinal, total, signal) {
     else no.focus();
   });
 }
+// Статистика прогресса всей партии: считаем только байты реально передаваемых
+// файлов; пропущенные дубли вычитаем из общего объёма.
+function upEta(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return 'вычисляется';
+  if (sec < 60) return Math.max(1, Math.ceil(sec)) + ' с';
+  if (sec < 3600) return Math.ceil(sec / 60) + ' мин';
+  return Math.floor(sec / 3600) + ' ч ' + Math.ceil((sec % 3600) / 60) + ' мин';
+}
+function upProgressTracker(totalBytes) {
+  let total = totalBytes, completed = 0;
+  const samples = [];
+  function render(current = 0, label = '', checking = false) {
+    const now = performance.now(), sent = completed + current;
+    if (!checking) {
+      if (!samples.length || samples[samples.length - 1].bytes !== sent)
+        samples.push({ time: now, bytes: sent });
+      while (samples.length > 2 && now - samples[0].time > 12000) samples.shift();
+    }
+    const first = samples[0], last = samples[samples.length - 1];
+    const seconds = first && last ? (last.time - first.time) / 1000 : 0;
+    const speed = seconds >= 0.3 ? Math.max(0, (last.bytes - first.bytes) / seconds) : 0;
+    const left = Math.max(0, total - sent);
+    $('up-progress').value = total ? Math.min(100, sent * 100 / total) : 100;
+    $('up-progress-caption').textContent = (checking ? 'Проверка SHA-256 на ПК' :
+      'Передача файлов') + (label ? ' · ' + label : '');
+    $('up-progress-stats').textContent =
+      'Передано ' + upByteSize(sent) + ' из ' + upByteSize(total) +
+      ' · осталось ' + upByteSize(left) +
+      ' · скорость ' + (speed > 0 && !checking ? upByteSize(speed) + '/с' : '—') +
+      ' · время до конца ' + (checking ? 'проверка файла' : speed > 0 ? '≈ ' + upEta(left / speed) : 'вычисляется');
+  }
+  return {
+    render,
+    skip(bytes) { total = Math.max(completed, total - bytes); render(); },
+    complete(bytes) { completed += bytes; render(); },
+    get completed() { return completed; },
+  };
+}
+
 $('up-submit').addEventListener('click', async () => {
   if (!UP.files.length || UP.busy || !UP.available) return;
   if (!await upLoadFolders()) return;
@@ -626,7 +670,9 @@ $('up-submit').addEventListener('click', async () => {
   $('up-progress').value = 0;
   $('up-progress-caption').textContent = 'Проверяю имена и размеры файлов на ПК…';
   const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
-  let finished = 0, skips = [], errors = [], previewComplete = false, rejected = 0;
+  const tracker = upProgressTracker(totalBytes);
+  let skips = [], errors = [], previewComplete = false, rejected = 0;
+  tracker.render(0, 'подготовка партии');
   try {
     const checked = await upPostJSON('/api/upload/check', {
       folder, files: files.map(f => ({ name: f.name, size: f.size }))
@@ -669,14 +715,19 @@ $('up-submit').addEventListener('click', async () => {
       if (ctrl.signal.aborted) break;
       if (allowed) {
         $('up-status').textContent = 'Передаю ' + (i + 1) + ' из ' + files.length + ': ' + f.name;
+        let uploadedBytes = 0;
         try {
           await upSendOne(f, folder, ctrl.signal, progress => {
-            const p = totalBytes ? (finished + progress * f.size) / totalBytes : 0;
-            $('up-progress').value = p * 100;
-            $('up-progress-caption').textContent = Math.round(p * 100) + '% · ' + f.name;
-          }, allowLarger);
+            uploadedBytes = Math.round(progress * f.size);
+            tracker.render(uploadedBytes, 'файл ' + (i + 1) + '/' + files.length + ' · ' + f.name);
+          }, allowLarger, () => {
+            tracker.render(f.size, 'файл ' + (i + 1) + '/' + files.length + ' · ' + f.name, true);
+          });
+          tracker.complete(f.size);
           UP.done++;
         } catch (error) {
+          tracker.skip(f.size - uploadedBytes);
+          tracker.complete(uploadedBytes);
           if (ctrl.signal.aborted) break;
           if (/^Дубль:/.test(error.message)) {
             skips.push(f.name + ' — дубль обнаружен при повторной проверке');
@@ -691,9 +742,9 @@ $('up-submit').addEventListener('click', async () => {
             break;
           }
         }
+      } else {
+        tracker.skip(f.size);
       }
-      finished += f.size;
-      $('up-progress').value = totalBytes ? (finished / totalBytes) * 100 : 100;
     }
   } catch (error) {
     if (!ctrl.signal.aborted) errors.push('Не удалось проверить дубликаты: ' + error.message);

@@ -466,3 +466,11 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .up-result-actions button { border: 1px solid var(--line); border-radius: 8px;
   background: var(--surface); padding: 8px 12px; cursor: pointer; }
 #up-result-close { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+
+/* Общая скорость и оставшееся время для всех выбранных файлов. */
+#up-progress-stats { display: block; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.5; }
+
+/* Скрытые состояния загрузки не должны быть переопределены display:grid/flex. */
+.up-overlay[hidden], .up-progress-wrap[hidden], .up-result[hidden],
+.up-duplicate-dialog[hidden], .up-drop[hidden], .up-offline[hidden],
+.up-feed[hidden], .up-pending[hidden] { display: none !important; }

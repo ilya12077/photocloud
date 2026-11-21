@@ -267,6 +267,17 @@ class Library:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
+    def latest_photo_folder(self) -> str:
+        """Папка самой новой проиндексированной фотографии (без видео).
+
+        Дата фотографии учитывает EXIF, имя и затем mtime.
+        Если фотографий пока нет, используем корень фотоархива.
+        """
+        for photo in self._feed:
+            if not photo.video:
+                return photo.rel.rpartition("/")[0]
+        return ""
+
     def get(self, pid: str) -> Photo | None:
         return self.by_id.get(pid)
 

@@ -204,6 +204,42 @@ class DirectUploadTests(unittest.TestCase):
         self.assertIn("Проверка SHA-256 на ПК", js)
         self.assertIn("upResetResult();", js)
 
+    def test_latest_indexed_photo_sets_default_destination(self):
+        from app.library import Library
+        fake = SimpleNamespace(_feed=[
+            SimpleNamespace(video=True, rel="Videos/newest.mp4"),
+            SimpleNamespace(video=False, rel="Album/2026/newest.jpg"),
+            SimpleNamespace(video=False, rel="Album/2025/old.jpg"),
+        ])
+        self.assertEqual(Library.latest_photo_folder(fake), "Album/2026")
+        self.assertEqual(Library.latest_photo_folder(SimpleNamespace(_feed=[])), "")
+        source = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        self.assertIn('"default_folder": library.latest_photo_folder()', source)
+        js = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
+        self.assertIn("data.default_folder", js)
+        self.assertIn("UP.folderEdited", js)
+
+    def test_progress_shows_sent_remaining_speed_and_eta_for_entire_batch(self):
+        js = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
+        html = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="up-progress-stats"', html)
+        for fragment in ("function upProgressTracker(", "Передано ", " · осталось ",
+                         " · скорость ", " · время до конца ", "tracker.skip(f.size)",
+                         "tracker.complete(f.size)", "tracker.render(uploadedBytes",
+                         "onVerify()"):
+            self.assertIn(fragment, js)
+
+    def test_excessive_server_ui_descriptions_are_removed(self):
+        html = (ROOT / "app/static/admin.html").read_text(encoding="utf-8")
+        main_html = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+        js = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
+        self.assertNotIn("Только администратор. Передача возможна только при включённом ПК.", main_html)
+        self.assertNotIn("Файлы уже сохранены в Restored на ПК. Для переноса", js)
+        self.assertNotIn("Уже записан в Restored · ожидает переноса клиентом ПК", js)
+        self.assertNotIn("Клиент бэкапа на другом компьютере копирует оригиналы", html)
+        self.assertNotIn("Хеши файлов</b> считаются сами", html)
+        self.assertNotIn("Программа <b>photocloud_pc.pyw</b>", html)
+
     def test_server_endpoints_require_admin_and_online_pc(self):
         src = (ROOT / "app/main.py").read_text(encoding="utf-8")
         t = ast.parse(src)

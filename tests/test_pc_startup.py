@@ -163,13 +163,15 @@ class UploadedFilesStartupTests(unittest.TestCase):
         api = self.module["App"]
         mock_root = Mock()
         object_under_test = SimpleNamespace(
-            _up_refreshing=True, up_tree=Mock(), up_folder_box={},
+            _up_refreshing=True, up_tree=Mock(),
             root=mock_root, upload_tab=Mock(), nb=Mock(), up_canvas=Mock(),
             upload_items=[], upload_by_id={}, _uploads_known=None,
+            _up_active_id=None,
             up_gen=1, _up_layout=Mock(), _up_selection_changed=Mock(),
             up_status=Mock())
         object_under_test.up_tree.selection.return_value = ()
         object_under_test.up_tree.get_children.return_value = ()
+        object_under_test.up_canvas.yview.return_value = (0.0, 1.0)
         loaded = [{"id": "0" * 32, "name": "test.jpg", "folder": "Photos",
                    "size": 100, "user": "admin"}]
         with patch.object(self.module["messagebox"], "showinfo") as shown:
@@ -193,3 +195,78 @@ class UploadedFilesStartupTests(unittest.TestCase):
             cls._up_delete(app)
         app.api.call.assert_not_called()
         app.bg.assert_not_called()
+
+    def test_last_clicked_tile_becomes_active_without_losing_other_selection(self):
+        app_class = self.module["App"]
+        first, second = "a" * 32, "b" * 32
+        selected = [first]
+        tree = Mock()
+        tree.selection.side_effect = lambda: tuple(selected)
+        tree.selection_add.side_effect = selected.append
+        app = SimpleNamespace(
+            _up_hit=Mock(return_value=1),
+            upload_items=[{"id": first}, {"id": second}],
+            up_tree=tree, _up_last_tile=0, _up_active_id=first,
+            _up_selection_changed=Mock(),
+        )
+        app_class._up_tile_click(app, SimpleNamespace(state=0))
+        self.assertEqual(selected, [first, second])
+        self.assertEqual(app._up_active_id, second)
+        app._up_selection_changed.assert_called_once()
+
+    def test_preview_uses_last_clicked_not_first_selected(self):
+        app_class = self.module["App"]
+        first, second = "a" * 32, "b" * 32
+        items = {
+            first: {"id": first, "name": "top.jpg", "user": "admin", "folder": "Album"},
+            second: {"id": second, "name": "last.jpg", "user": "admin", "folder": "Album"},
+        }
+        tree = Mock()
+        tree.selection.return_value = (first, second)
+        mock_views = Mock()
+        mock_views.select.return_value = "gallery"
+        app = SimpleNamespace(
+            up_tree=tree, up_groups={}, upload_by_id=items,
+            _up_active_id=second, up_views=mock_views, up_table="table",
+            up_drawn={}, up_canvas=Mock(), b_up_move=Mock(), b_up_delete=Mock(),
+            busy=False, up_details=Mock(), up_preview=Mock(), _up_preview_img=None,
+            up_thumbs={},
+        )
+        with patch.object(self.module["threading"], "Thread") as new_thread:
+            app_class._up_selection_changed(app)
+            new_thread.return_value.start.assert_called_once()
+        text = app.up_details.configure.call_args.kwargs["text"]
+        self.assertIn("last.jpg", text)
+        self.assertNotIn("top.jpg", text)
+        self.assertIn("Выделено: 2", text)
+
+    def test_tree_focus_selects_last_pressed_when_using_list_view(self):
+        app_class = self.module["App"]
+        first, second = "a" * 32, "b" * 32
+        items = {k: {"id": k, "name": k + ".jpg", "user": "admin", "folder": "Album"}
+                 for k in (first, second)}
+        tree = Mock()
+        tree.selection.return_value = (first, second)
+        tree.focus.return_value = second
+        mock_views = Mock()
+        mock_views.select.return_value = "table"
+        app = SimpleNamespace(
+            up_tree=tree, up_groups={}, upload_by_id=items,
+            _up_active_id=first, up_views=mock_views, up_table="table",
+            up_drawn={}, up_canvas=Mock(), b_up_move=Mock(), b_up_delete=Mock(),
+            busy=False, up_details=Mock(), up_preview=Mock(), _up_preview_img=None,
+            up_thumbs={},
+        )
+        with patch.object(self.module["threading"], "Thread"):
+            app_class._up_selection_changed(app, SimpleNamespace(widget=tree))
+        self.assertEqual(app._up_active_id, second)
+
+    def test_upload_destination_is_fixed_by_website_and_grouped(self):
+        source = (ROOT / "pc/photocloud_pc.pyw").read_text(encoding="utf-8")
+        self.assertNotIn("self.up_folder_box", source)
+        self.assertNotIn("self.up_folder.get()", source)
+        self.assertNotIn("def _up_new_folder(", source)
+        self.assertIn('item, item["folder"]', source)
+        self.assertIn("self.up_groups", source)
+        self.assertIn("self.up_headers", source)
+

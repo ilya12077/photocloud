@@ -1594,6 +1594,7 @@ async def upload_folders(_: Session = Depends(require_admin)):
     ready = online and bool(restorer.enabled)
     return no_store(JSONResponse({
         "folders": sorted(f for f in library._folders if f),
+        "default_folder": library.latest_photo_folder(),
         "pc_online": online, "ready": ready,
         "message": ("" if ready else "ПК выключен. Включите компьютер с фотоархивом для загрузки."
                     if not online else "На сервере не настроена запись в Restored."),
