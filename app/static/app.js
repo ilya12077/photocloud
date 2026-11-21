@@ -333,6 +333,7 @@ async function enter() {
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();
+  upLoadFeed();
   const early = await st.libPromise; st.libPromise = null;
   // Если ранний запрос не удался, пробуем снова сразу, не дожидаясь опроса статуса.
   if (!st.lib) {
@@ -340,6 +341,35 @@ async function enter() {
     catch (e) { if (e.message === 'auth') throw e; }
   }
 }
+
+// Ожидающие переноса файлы администратора доступны на главной странице
+// отдельной галереей, пока агент ПК не подтвердит их перенос.
+async function upLoadFeed() {
+  if (!st.me || st.me.role !== 'admin') return;
+  try {
+    const r = await api('/api/upload/list', {poll: true});
+    if (!r.ok) return;
+    const data = await r.json();
+    const items = data.items || [];
+    const feed = $('up-feed');
+    feed.hidden = !items.length || HID || STARRED;
+    if (feed.hidden) return;
+    $('up-feed-title').textContent = 'Загруженные · ожидают переноса: ' + items.length;
+    const cards = [];
+    for (const item of items.slice(0, 24)) {
+      const a = el('a', 'up-feed-card');
+      a.href = '/api/upload/' + encodeURIComponent(item.id) + '/media';
+      a.target = '_blank'; a.rel = 'noopener'; a.title = item.name + ' · ' + (item.folder || 'Корень');
+      const image = el('img'); image.alt = ''; image.loading = 'lazy';
+      image.src = '/api/upload/' + encodeURIComponent(item.id) + '/thumb';
+      image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
+      a.append(image, el('span', null, item.name));
+      cards.push(a);
+    }
+    $('up-feed-grid').replaceChildren(...cards);
+  } catch (_) {}
+}
+$('up-feed-open').addEventListener('click', () => upOpen());
 
 // ---------------------------------------------------------------- загрузка новых фото/видео в Restored через очередь ПК
 const UP = { files: [], busy: false, abort: null, activeId: null, depth: 0, done: 0 };
@@ -510,6 +540,7 @@ $('up-submit').addEventListener('click', async () => {
   $('up-selected').replaceChildren();
   $('up-submit').disabled = true;
   upLoadPending();
+  upLoadFeed();
 });
 $('up-cancel').addEventListener('click', () => UP.abort?.abort());
 let upDragDepth = 0;
@@ -704,6 +735,7 @@ async function loadLibraryInner(pre) {
   // Повторно запрашиваем видимые плитки без необходимости обновлять страницу.
   requestAnimationFrame(() => { if (st.lib === lib && !$('main').hidden) draw(false); });
   if ($('banner-text').textContent.startsWith('Загружаю')) banner(null);
+  if (st.me?.role === 'admin') upLoadFeed();
   if (!st.placed) { st.placed = true; restorePlace(loadPlace()); }   // первая загрузка — туда, где был
 }
 
