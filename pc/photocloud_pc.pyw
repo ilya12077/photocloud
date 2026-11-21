@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.4"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.5"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -507,34 +507,26 @@ def safe_rel(rel: str) -> list[str]:
 
 
 def check_file(root: Path, item: dict) -> tuple[str, Path | None, str]:
-    """-> (состояние, путь, пояснение). ok — можно удалять: путь внутри архива, файл тот же, что помечали."""
+    """Быстрая проверка перед удалением: путь, обычный файл, размер и mtime."""
+    import stat
     try:
         p = root.joinpath(*safe_rel(item["path"]))
-        rp = p.resolve()
-        if root.resolve() not in rp.parents:
+        if root.resolve() not in p.resolve(strict=False).parents:
             return "bad", None, "путь ведёт за пределы папки архива"
     except (ValueError, OSError) as e:
         return "bad", None, str(e)
     try:
-        st = os.stat(p, follow_symlinks=False)
+        st = p.lstat()
     except FileNotFoundError:
         return "missing", p, "файла уже нет"
     except OSError as e:
         return "bad", p, f"не читается: {e}"
-    if not os.path.isfile(p) or os.path.islink(p):
-        return "bad", p, "не обычный файл"
+    if (not stat.S_ISREG(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400
+            or st.st_nlink != 1):
+        return "bad", p, "не обычный файл или ссылка"
     if st.st_size != item["size"] or int(st.st_mtime) != item["mtime"]:
         return "changed", p, "файл изменили после пометки (размер или дата)"
-    if item.get("sha"):
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
-                h.update(chunk)
-        if h.hexdigest() != item["sha"]:
-            return "changed", p, "содержимое отличается от помеченного (SHA-256)"
-        return "ok", p, "проверен: размер, дата, SHA-256"
-    return "ok", p, "проверен: размер и дата (хеша на сервере нет)"
-
+    return "ok", p, "проверен: размер и дата"
 
 def restore_path(root: Path, rel: str, restored: bool = False) -> Path:
     """Reject Windows aliases, links/junctions and all service subtrees as originals."""
