@@ -1131,7 +1131,7 @@ function layout() {
       end = i + 1;
       while (end < list.length && monthKey(gdate(end)) === month) end++;
       rows.push({ h: true, kind: 'month', month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
-      // Подписи над снимками: ни дата, ни граница дня не занимают фото-ячейку.
+      // Между днями — пустая ячейка шириной в целую плитку, без сжатия фотографий.
       const days = new Map();
       for (let s = i; s < end;) {
         const day = dayKey(gdate(s));
@@ -1140,17 +1140,35 @@ function layout() {
         days.set(s, { dayTs: gdate(s), start: s, n: last - s });
         s = last;
       }
-      for (let s = i; s < end; s += cols) {
-        const last = Math.min(end, s + cols), labels = [];
-        for (let k = s; k < last; k++) {
-          if (days.has(k)) labels.push({ ...days.get(k), col: k - s,
-            span: Math.min(days.get(k).n, last - k) });
+      let slots = [];
+      const flush = (nextIndex) => {
+        if (!slots.length) return;
+        const cells = slots; slots = [];
+        const photos = cells.filter(v => v !== null);
+        const start = photos.length ? photos[0] : nextIndex;
+        const last = photos.length ? photos[photos.length - 1] + 1 : nextIndex;
+        const labels = [];
+        for (let col = 0; col < cells.length; col++) {
+          const k = cells[col], label = k === null ? null : days.get(k);
+          if (!label) continue;
+          let span = 0;
+          for (let j = col; j < cells.length && cells[j] !== null && dayKey(gdate(cells[j])) === dayKey(label.dayTs); j++) span++;
+          labels.push({ ...label, col, span });
         }
         const band = labels.length ? 30 : 0;
-        rows.push({ h: false, start: s, end: last, month, labels, band,
+        rows.push({ h: false, start, end: last, month, slots: cells, labels, band,
           top: y, height: rowH + band });
         y += rowH + band;
+      };
+      const push = (slot, nextIndex) => {
+        slots.push(slot);
+        if (slots.length === cols) flush(nextIndex);
+      };
+      for (let k = i; k < end; k++) {
+        if (k > i && dayKey(gdate(k)) !== dayKey(gdate(k - 1))) push(null, k);
+        push(k, k + 1);
       }
+      flush(end);
     } else {
       // Сортировка по имени остаётся без календарной группировки.
       for (let s = i; s < end; s += cols) {
@@ -1196,7 +1214,7 @@ function rowOfIndex(idx) {
 function topVisibleIndex() {
   const y = window.scrollY - gridTop() + $('banner').offsetHeight + 60;
   const ri = firstRowAt(Math.max(0, y));
-  for (let k = ri; k < L.rows.length; k++) if (!L.rows[k].h) { return { i: L.rows[k].start, offset: L.rows[k].top - Math.max(0, y) }; }
+  for (let k = ri; k < L.rows.length; k++) if (!L.rows[k].h && L.rows[k].end > L.rows[k].start) { return { i: L.rows[k].start, offset: L.rows[k].top - Math.max(0, y) }; }
   return null;
 }
 
@@ -1283,9 +1301,8 @@ function buildRow(r) {
   for (const label of r.labels || []) {
     const d = el('div', 'dhead');
     d.dataset.start = label.start; d.dataset.n = label.n;
-    const inset = label.col > 0 ? L.tileH / 2 : 0;
-    d.style.left = (label.col * (L.tileH + L.gap) + inset) + 'px';
-    d.style.width = (label.span * (L.tileH + L.gap) - L.gap - inset) + 'px';
+    d.style.left = (label.col * (L.tileH + L.gap)) + 'px';
+    d.style.width = (label.span * (L.tileH + L.gap) - L.gap) + 'px';
     d.title = dayName(label.dayTs);
     const c = el('button', 'mcheck'); c.type = 'button';
     c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
@@ -1295,18 +1312,15 @@ function buildRow(r) {
     row.append(d);
   }
   const kind = thumbKind();
-  for (let i = r.start; i < r.end; i++) {
-    const ph = st.list[i];
-    const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
-    // Extra breathing room only where two different days share a row.
-    if (st.sort !== 'name') {
-      const left = i > r.start && dayKey(gdate(i - 1)) !== dayKey(gdate(i)) ? L.tileH / 2 : 0;
-      const right = i + 1 < r.end && dayKey(gdate(i + 1)) !== dayKey(gdate(i)) ? L.tileH / 2 : 0;
-      if (left || right) {
-        b.style.marginLeft = left + 'px';
-        b.style.width = `calc(100% - ${left + right}px)`;
-      }
+  for (const slot of r.slots || Array.from({ length: r.end - r.start }, (_, offset) => r.start + offset)) {
+    if (slot === null) {
+      const spacer = el('div', 'day-spacer');
+      spacer.setAttribute('aria-hidden', 'true');
+      row.append(spacer);
+      continue;
     }
+    const i = slot, ph = st.list[i];
+    const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
     if (SEL.set.has(ph[0])) b.classList.add('sel');
     const img = el('img'); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.dataset.src = imgUrl(kind, ph);
     img.onload = () => { img.classList.add('ok'); img.dataset.loaded = '1'; b.classList.remove('broken'); };

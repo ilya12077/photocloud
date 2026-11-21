@@ -18,17 +18,24 @@ const assert=require('node:assert/strict');
   for(const cols of [2,3,5,8]){
    await page.evaluate(cols=>{Z.cols=cols;relayout(false)},cols);
    const data=await page.evaluate(()=>{
-    const rows=L.rows.filter(r=>!r.h),idx=rows.flatMap(r=>Array.from({length:r.end-r.start},(_,i)=>r.start+i));
-    return {idx, count:st.list.length, labels:rows.flatMap(r=>r.labels||[]).map(x=>[x.start,x.n]),
-     rows:rows.map(r=>({n:r.end-r.start,labels:(r.labels||[]).length,band:r.band})),
+    const rows=L.rows.filter(r=>!r.h);
+    const idx=rows.flatMap(r=>r.slots||Array.from({length:r.end-r.start},(_,i)=>r.start+i)).filter(i=>i!==null);
+    const gaps=rows.flatMap(r=>r.slots||[]).filter(i=>i===null).length;
+    return {idx, gaps, count:st.list.length, labels:rows.flatMap(r=>r.labels||[]).map(x=>[x.start,x.n]),
+     rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,labels:(r.labels||[]).length,band:r.band})),
      overlaps:[...document.querySelectorAll('.dhead')].some(h=>{
       const tile=h.parentElement.querySelector('.tile'),a=h.getBoundingClientRect(),b=tile.getBoundingClientRect();return a.bottom>b.top+.5;
-     }), wrong:[...document.querySelectorAll('.tile')].some(t=>Math.abs(t.getBoundingClientRect().height-L.tileH)>.5),
+     }), wrong:[...document.querySelectorAll('.tile')].some(t=>
+      Math.abs(t.getBoundingClientRect().height-L.tileH)>.5 ||
+      Math.abs(t.getBoundingClientRect().width-L.tileH)>.5),
+     narrowGaps:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
      mappings:idx.every(i=>{const r=L.rows[rowOfIndex(i)];return !r.h&&r.start<=i&&i<r.end})};
    });
    assert.deepEqual(data.idx,Array.from({length:78},(_,i)=>i));assert.equal(data.labels.length,7);
-   assert(!data.overlaps);assert(!data.wrong);assert(data.mappings);
-   assert(data.rows.slice(0,-1).every(r=>r.n===cols));
+   assert.equal(data.gaps,6,'one full-size gap per day boundary');
+   assert(!data.overlaps);assert(!data.wrong,'photos must stay square');assert(!data.narrowGaps);
+   assert(data.mappings);
+   assert(data.rows.slice(0,-1).every(r=>r.used===cols));
    results.push({width,cols,rows:data.rows.length});
   }
  }
