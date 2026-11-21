@@ -381,8 +381,46 @@ function upSafeName(name) {
   return typeof name === 'string' && name.length > 0 && name.length <= 200
     && !/[\\/:*?"<>|\u0000-\u001f]/.test(name) && !/[. ]$/.test(name);
 }
+
+function upResetResult() {
+  $('up-result').hidden = true;
+  $('up-result').removeAttribute('data-state');
+  $('up-progress-wrap').hidden = true;
+  $('up-progress').value = 0;
+  $('up-progress-caption').textContent = '';
+}
+function upShowResult(done, skipped, errors, stopped) {
+  const anyErrors = errors.length > 0, anyUploaded = done > 0;
+  const state = stopped ? 'stopped' : anyErrors || !anyUploaded ? 'warning' : 'success';
+  const title = stopped ? 'Загрузка остановлена'
+    : anyErrors ? 'Загрузка завершена с ошибками'
+    : anyUploaded ? 'Загрузка завершена' : 'Файлы не загружены';
+  $('up-progress-wrap').hidden = true;       // полоса 100 % больше не висит в интерфейсе
+  $('up-result').hidden = false;
+  $('up-result').dataset.state = state;
+  $('up-result-icon').textContent = state === 'success' ? '✓' : '!';
+  $('up-result-title').textContent = title;
+  $('up-result-summary').textContent =
+    'Загружено на ПК: ' + done + '. Пропущено: ' + skipped +
+    (anyErrors ? '. Ошибок: ' + errors.length + '.' : '.');
+  $('up-result-hint').textContent = anyErrors
+    ? 'Ошибки: ' + errors.slice(0, 3).join(' · ')
+    : anyUploaded ? 'Файлы уже сохранены в Restored на ПК. Для переноса в основную галерею открой вкладку «Загруженные» в клиенте ПК.'
+    : skipped && !stopped ? 'Дубли пропущены: файл с таким именем и не меньшим размером уже существует.'
+    : 'Выбери файлы и начни новую загрузку.';
+  $('up-status').textContent = '';
+}
+$('up-result-again').addEventListener('click', () => {
+  upResetResult();
+  $('up-files').click();
+});
+$('up-result-close').addEventListener('click', () => {
+  if (!UP.busy) upClose();
+});
+
 function upPrepare(files) {
   if (!st.me || st.me.role !== 'admin') return;
+  if (!UP.busy) upResetResult();
   const picked = Array.from(files || []).filter(file => upMedia(file) && upSafeName(file.name)
     && file.size > 0 && file.size <= 4 * 1024 ** 3);
   UP.files = picked;
@@ -454,6 +492,7 @@ async function upLoadPending() {
 }
 function upOpen(files) {
   if (!st.me || st.me.role !== 'admin') return;
+  if (!UP.busy) upResetResult();
   $('up-modal').hidden = false;
   $('up-folder').value = st.folder || '';
   if (files) upPrepare(files);
@@ -489,9 +528,11 @@ async function upPostJSON(path, body, signal) {
   if (!response.ok) throw new Error(json.detail || json.error || 'Ошибка сервера: ' + response.status);
   return json;
 }
-async function upSendOne(file, folder, signal, onProgress) {
+async function upSendOne(file, folder, signal, onProgress, allowLarger = false) {
   const task = await upPostJSON('/api/upload/start', {
-    name: file.name, folder, size: file.size, mtime: Math.floor(file.lastModified / 1000) || Date.now() / 1000
+    name: file.name, folder, size: file.size,
+    allow_larger: allowLarger,
+    mtime: Math.floor(file.lastModified / 1000) || Date.now() / 1000
   }, signal);
   UP.activeId = task.id;
   const max = 2 * 1024 * 1024;
@@ -511,6 +552,8 @@ async function upSendOne(file, folder, signal, onProgress) {
       sent += bytes.size;
       onProgress(sent / file.size);
     }
+    $('up-status').textContent = 'Файл передан. Проверяю целостность на ПК: ' + file.name;
+    $('up-progress-caption').textContent = 'Данные переданы. Проверка SHA-256 на ПК…';
     await upPostJSON('/api/upload/' + task.id + '/finish', {}, signal);
   } catch (error) {
     await upPostJSON('/api/upload/' + task.id + '/cancel', {}).catch(() => {});
@@ -518,6 +561,49 @@ async function upSendOne(file, folder, signal, onProgress) {
   } finally {
     UP.activeId = null;
   }
+}
+function upByteSize(n) {
+  if (!Number.isFinite(n)) return '?';
+  if (n >= 1024 ** 3) return (n / (1024 ** 3)).toFixed(2) + ' ГиБ';
+  if (n >= 1024 ** 2) return (n / (1024 ** 2)).toFixed(1) + ' МиБ';
+  return (n / 1024).toFixed(1) + ' КиБ';
+}
+
+// Для конфликтов с БОЛЕЕ КРУПНЫМИ локальными файлами — отдельный выбор;
+// кнопки без автоматического подтверждения, галочка распространяет выбор
+// только на оставшиеся конфликты текущей выбранной партии.
+function upAskLarger(file, existingSize, ordinal, total, signal) {
+  const dialog = $('up-duplicate-dialog');
+  $('up-duplicate-text').textContent = 'В папке уже есть «' + file.name + '» (' +
+    upByteSize(existingSize) + '). Новый файл больше: ' + upByteSize(file.size) +
+    '. Загрузить его как отдельную версию? Существующий файл не будет заменён.';
+  $('up-duplicate-count').textContent = 'Конфликт ' + ordinal + ' из ' + total +
+    ' в этой партии (' + UP.files.length + ' файлов выбрано).';
+  const remaining = total - ordinal;
+  $('up-duplicate-all-wrap').hidden = remaining === 0;
+  $('up-duplicate-all-label').textContent = 'Применить это решение ко всем оставшимся ' +
+    remaining + ' конфликтам из текущих ' + UP.files.length + ' файлов';
+  $('up-duplicate-all').checked = false;
+  dialog.hidden = false;
+  return new Promise(resolve => {
+    let settled = false;
+    const yes = $('up-duplicate-yes'), no = $('up-duplicate-no');
+    const finish = upload => {
+      if (settled) return;
+      settled = true;
+      const applyAll = remaining > 0 && $('up-duplicate-all').checked;
+      dialog.hidden = true;
+      yes.onclick = null; no.onclick = null;
+      signal.removeEventListener('abort', abort);
+      resolve({ upload, applyAll });
+    };
+    const abort = () => finish(false);
+    yes.onclick = () => finish(true);
+    no.onclick = () => finish(false);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    else no.focus();
+  });
 }
 $('up-submit').addEventListener('click', async () => {
   if (!UP.files.length || UP.busy || !UP.available) return;
@@ -528,49 +614,108 @@ $('up-submit').addEventListener('click', async () => {
     $('up-status').textContent = 'Недопустимый путь папки'; return;
   }
   const files = [...UP.files], ctrl = new AbortController();
+  if (files.length > 3000) {
+    $('up-status').textContent = 'За раз можно проверить не более 3000 файлов.';
+    return;
+  }
   UP.busy = true; UP.abort = ctrl; UP.done = 0;
+  upResetResult();
   $('up-submit').disabled = true;
   $('up-cancel').hidden = false;
   $('up-progress-wrap').hidden = false;
-  const total = files.reduce((acc, f) => acc + f.size, 0);
-  let finished = 0, errors = [];
-  for (let i = 0; i < files.length; i++) {
-    if (ctrl.signal.aborted) break;
-    const f = files[i];
-    $('up-status').textContent = 'Передаю ' + (i + 1) + ' из ' + files.length + ': ' + f.name;
-    try {
-      await upSendOne(f, folder, ctrl.signal, progress => {
-        const p = total ? (finished + progress * f.size) / total : 0;
-        $('up-progress').value = p * 100;
-        $('up-progress-caption').textContent = Math.round(p * 100) + '% · ' + f.name;
-      });
-      UP.done++; finished += f.size;
-    } catch (error) {
-      if (ctrl.signal.aborted) break;
-      errors.push(f.name + ': ' + error.message);
-      finished += f.size;
-      if (/ПК выключ|ПК выключился|Restored не настроена|Restored не настроен|компьютер.*недоступ|не удалось записать файл на ПК/i.test(error.message)) {
-        UP.available = false;
-        UP.offlineMessage = error.message;
-        $('up-offline').hidden = false;
-        $('up-offline-text').textContent = error.message + ' Включите ПК и повторите загрузку.';
-        break;  // остальные файлы не ставим в очередь при выключенном ПК
-      }
+  $('up-progress').value = 0;
+  $('up-progress-caption').textContent = 'Проверяю имена и размеры файлов на ПК…';
+  const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+  let finished = 0, skips = [], errors = [], previewComplete = false, rejected = 0;
+  try {
+    const checked = await upPostJSON('/api/upload/check', {
+      folder, files: files.map(f => ({ name: f.name, size: f.size }))
+    }, ctrl.signal);
+    if (!Array.isArray(checked.results) || checked.results.length !== files.length) {
+      throw new Error('Сервер вернул некорректный результат проверки дублей.');
     }
+    previewComplete = true;
+    const largerCount = checked.results.filter(x => x.status === 'larger').length;
+    let currentConflict = 0, batchAnswer = null;
+    for (let i = 0; i < files.length; i++) {
+      if (ctrl.signal.aborted) break;
+      const f = files[i], check = checked.results[i];
+      let allowed = true, allowLarger = false;
+      if (check.status === 'duplicate') {
+        allowed = false;
+        const note = check.in_selection
+          ? 'Дубль: в текущей партии есть файл с таким именем не меньшего размера'
+          : 'Дубль: уже существует файл с таким именем (' + upByteSize(check.existing_size) + ')';
+        skips.push(f.name + ' — ' + note);
+      } else if (check.status === 'larger') {
+        currentConflict++;
+        let answer;
+        if (batchAnswer === null) {
+          answer = await upAskLarger(f, check.existing_size, currentConflict, largerCount, ctrl.signal);
+          if (answer.applyAll) batchAnswer = answer.upload;
+        } else {
+          answer = { upload: batchAnswer };
+        }
+        if (!answer.upload) {
+          allowed = false;
+          rejected++;
+          skips.push(f.name + ' — пропущен по решению администратора');
+        } else {
+          allowLarger = true;
+        }
+      } else if (check.status !== 'new') {
+        throw new Error('Неизвестный результат проверки для ' + f.name);
+      }
+      if (ctrl.signal.aborted) break;
+      if (allowed) {
+        $('up-status').textContent = 'Передаю ' + (i + 1) + ' из ' + files.length + ': ' + f.name;
+        try {
+          await upSendOne(f, folder, ctrl.signal, progress => {
+            const p = totalBytes ? (finished + progress * f.size) / totalBytes : 0;
+            $('up-progress').value = p * 100;
+            $('up-progress-caption').textContent = Math.round(p * 100) + '% · ' + f.name;
+          }, allowLarger);
+          UP.done++;
+        } catch (error) {
+          if (ctrl.signal.aborted) break;
+          if (/^Дубль:/.test(error.message)) {
+            skips.push(f.name + ' — дубль обнаружен при повторной проверке');
+          } else {
+            errors.push(f.name + ': ' + error.message);
+          }
+          if (/ПК выключ|ПК выключился|Restored не настроен|компьютер.*недоступ|Связь с ПК прервана/i.test(error.message)) {
+            UP.available = false;
+            UP.offlineMessage = error.message;
+            $('up-offline').hidden = false;
+            $('up-offline-text').textContent = error.message + ' Включите ПК и повторите загрузку.';
+            break;
+          }
+        }
+      }
+      finished += f.size;
+      $('up-progress').value = totalBytes ? (finished / totalBytes) * 100 : 100;
+    }
+  } catch (error) {
+    if (!ctrl.signal.aborted) errors.push('Не удалось проверить дубликаты: ' + error.message);
+  } finally {
+    $('up-duplicate-dialog').hidden = true;
+    UP.busy = false; UP.abort = null;
+    $('up-cancel').hidden = true;
+    $('up-submit').disabled = !UP.available || !UP.files.length;
+    if (previewComplete) {
+      $('up-selected').replaceChildren(...skips.slice(0, 80).map(message => {
+        const row = el('p', 'up-skipped'); row.textContent = message; return row;
+      }));
+      if (skips.length > 80) $('up-selected').append(el('p', null, '… и ещё ' + (skips.length - 80)));
+      UP.files = []; $('up-files').value = '';
+      $('up-submit').disabled = true;
+      upLoadPending();
+      upLoadFeed();
+    }
+    upShowResult(UP.done, skips.length, errors, ctrl.signal.aborted);
+    // Принятые файлы сохраняются, а список обновляется без перехода в режим загрузки.
+    if (UP.done) upLoadPending();
   }
-  UP.busy = false; UP.abort = null;
-  $('up-cancel').hidden = true;
-  $('up-submit').disabled = !UP.files.length;
-  $('up-status').textContent = 'Принято файлов: ' + UP.done +
-    (errors.length ? '. Ошибки: ' + errors.slice(0, 3).join(' · ') : '') +
-    (ctrl.signal.aborted ? '. Отправка остановлена.' : '.');
-  $('up-progress').value = 100;
-  UP.files = []; $('up-files').value = '';
-  $('up-selected').replaceChildren();
-  $('up-submit').disabled = true;
-  upLoadPending();
-  upLoadFeed();
-  upLoadFolders();
 });
 $('up-cancel').addEventListener('click', () => UP.abort?.abort());
 let upDragDepth = 0;

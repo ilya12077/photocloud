@@ -189,9 +189,37 @@
       <progress id="up-progress" max="100" value="0"></progress>
       <span id="up-progress-caption"></span>
     </div>
+    <div id="up-result" class="up-result" role="status" aria-live="polite" hidden>
+      <span id="up-result-icon" class="up-result-icon" aria-hidden="true">✓</span>
+      <div class="up-result-body">
+        <strong id="up-result-title">Загрузка завершена</strong>
+        <p id="up-result-summary"></p>
+        <p id="up-result-hint"></p>
+        <div class="up-result-actions">
+          <button id="up-result-again" type="button">Загрузить ещё</button>
+          <button id="up-result-close" type="button">Готово</button>
+        </div>
+      </div>
+    </div>
     <div class="up-pending-head"><h3>Уже получены · ожидают переноса в архив</h3><button id="up-refresh" class="txt" type="button">Обновить</button></div>
     <div id="up-pending" class="up-pending"><small>Загружаю очередь…</small></div>
   </section>
+  <div id="up-duplicate-dialog" class="up-duplicate-dialog" role="alertdialog"
+       aria-modal="true" aria-labelledby="up-duplicate-title" aria-describedby="up-duplicate-text" hidden>
+    <div class="up-duplicate-panel">
+      <h3 id="up-duplicate-title">Найдена другая версия файла</h3>
+      <p id="up-duplicate-text"></p>
+      <p id="up-duplicate-count" class="dim"></p>
+      <label id="up-duplicate-all-wrap" class="up-duplicate-all" hidden>
+        <input id="up-duplicate-all" type="checkbox">
+        <span id="up-duplicate-all-label"></span>
+      </label>
+      <div class="up-duplicate-actions">
+        <button type="button" id="up-duplicate-no">Пропустить</button>
+        <button type="button" id="up-duplicate-yes">Загрузить файл</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 </body>

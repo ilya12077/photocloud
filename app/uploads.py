@@ -62,6 +62,13 @@ def import_path(folder: str, name: str) -> str:
 
 
 
+def duplicate_status(size: int, existing: int | None) -> str:
+    """Имя совпало: меньший/равный — дубль, больший — решение администратора."""
+    if existing is None:
+        return "new"
+    return "larger" if size > existing else "duplicate"
+
+
 class UploadQueue:
     """Активные передачи только в RAM, готовые файлы + манифесты только на ПК."""
 
@@ -300,6 +307,22 @@ class UploadQueue:
                 self.last_refresh = time.monotonic()
             return [dict(item) for item in sorted(self.received.values(), key=lambda x: x["created"], reverse=True)
                     if item["state"] in states][:UPLOAD_MAX]
+
+    def pending_sizes(self) -> dict[tuple[str, str], int]:
+        """Сравниваем с уже полученными в Restored и текущими загрузками.
+
+        Максимальный размер учитывает все экземпляры имени в одной папке.
+        """
+        existing = {}
+        items = self.list(("ready",))
+        with self.mu:
+            items.extend(dict(x) for x in self.active.values())
+        for item in items:
+            if item.get("state") not in ("ready", "uploading", "finishing"):
+                continue
+            key = (item["folder"].casefold(), item["name"].casefold())
+            existing[key] = max(existing.get(key, -1), int(item["size"]))
+        return existing
 
     def get(self, ident):
         self._validate_id(ident)

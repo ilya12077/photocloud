@@ -165,6 +165,17 @@ class LocalStorage:
     def open(self, rel: str) -> BinaryIO:
         return open(self.local_path(rel), "rb")
 
+    def file_size(self, rel: str) -> int | None:
+        """Актуальный размер файла по метаданным, без чтения всего содержимого."""
+        try:
+            path = self.local_path(rel)
+            st = path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if not statmod.S_ISREG(st.st_mode) or getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+        return st.st_size
+
 
 # Одно SMB-соединение обслуживает все потоки. Windows выдаёт ему ограниченное число
 # «кредитов» на одновременные запросы; если запросов больше, smbprotocol не ждёт, а
@@ -485,6 +496,20 @@ class SMBStorage:
         path = self.base + "\\" + "\\".join(_check_rel(rel))
         return _SMBFile(self._retry(
             lambda: _gated(self._smb.open_file, path, mode="rb", share_access="rw", **self._creds)))
+
+    def file_size(self, rel: str) -> int | None:
+        """SMB stat без чтения медиа, используется для поиска дублей."""
+        path = self.base + "\\" + "\\".join(_check_rel(rel))
+        try:
+            info = self._retry(lambda: _gated(self._smb.stat, path, **self._creds))
+        except OSError as exc:
+            if is_missing(exc):
+                return None
+            raise
+        attrs = getattr(info, "st_file_attributes", 0)
+        if not statmod.S_ISREG(info.st_mode) or attrs & FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+        return int(info.st_size)
 
 
 class RestoreWriter:

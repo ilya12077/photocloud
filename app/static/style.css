@@ -430,3 +430,39 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .up-offline strong { font-size: 15px; }
 .up-offline span { font-size: 13px; color: var(--dim); }
 .up-offline .txt { justify-self: start; }
+
+
+/* Подтверждение при совпадении имени и большем размере новой версии. */
+.up-duplicate-dialog { position: fixed; inset: 0; z-index: 120; background: #000b;
+  display: grid; place-items: center; padding: 16px; }
+.up-duplicate-panel { width: min(445px, 100%); background: var(--surface); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 14px; padding: 20px;
+  box-shadow: 0 18px 50px #0008; }
+.up-duplicate-panel h3 { font-size: 18px; margin: 0 0 10px; }
+.up-duplicate-panel p { overflow-wrap: anywhere; margin: 8px 0; }
+.up-duplicate-all { display: flex; align-items: flex-start; gap: 9px;
+  margin: 16px 0; line-height: 1.35; cursor: pointer; }
+.up-duplicate-all input { flex: none; width: 17px; height: 17px; accent-color: var(--accent); }
+.up-duplicate-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 14px; }
+.up-duplicate-actions button { border: 1px solid var(--line); border-radius: 9px;
+  background: var(--surface); padding: 10px 14px; cursor: pointer; }
+#up-duplicate-yes { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+.up-skipped { color: var(--dim); overflow-wrap: anywhere; }
+
+/* Завершённая загрузка: не оставлять стопроцентную полосу как индикатор работы. */
+.up-result { display: flex; align-items: flex-start; gap: 12px; padding: 14px;
+  border-radius: 10px; border: 1px solid var(--line); background: var(--surface);
+  margin: 12px 0; }
+.up-result-icon { display: grid; place-items: center; flex: none; width: 30px; height: 30px;
+  font-size: 23px; border-radius: 50%; background: var(--tile); }
+.up-result[data-state="success"] .up-result-icon { color: #4baf75; }
+.up-result[data-state="warning"] .up-result-icon,
+.up-result[data-state="stopped"] .up-result-icon { color: var(--dim); }
+.up-result-body { min-width: 0; flex: 1; }
+.up-result-body strong { display: block; font-size: 16px; }
+.up-result-body p { margin: 7px 0; font-size: 13px; overflow-wrap: anywhere; }
+#up-result-hint { color: var(--dim); }
+.up-result-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.up-result-actions button { border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); padding: 8px 12px; cursor: pointer; }
+#up-result-close { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }

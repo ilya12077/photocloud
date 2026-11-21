@@ -32,7 +32,8 @@ from PIL import Image, UnidentifiedImageError
 from . import config
 from .activity import ArchiveScanDebounce
 from .downloads import DownloadTickets, iter_zip_originals
-from .uploads import UploadQueue, CHUNK_MAX, UPLOAD_PREFIX, media_name, destination_folder
+from .uploads import (UploadQueue, CHUNK_MAX, UPLOAD_PREFIX, FILE_MAX, media_name,
+                      destination_folder, import_path, duplicate_status)
 from . import geo
 from . import logs
 from . import totp
@@ -1581,6 +1582,74 @@ async def upload_list(_: Session = Depends(require_admin)):
     return no_store(JSONResponse({"items": await run_in_threadpool(upload_queue.list)}))
 
 
+def _upload_size_comparison(folder: str, name: str, size: int, pending=None) -> dict:
+    """Сравнение с реальными файлами ПК без чтения их содержимого.
+
+    Учитываем целевую папку архива и уже принятые файлы в Restored;
+    проверяем актуальный размер через SMB stat, а не устаревший индекс.
+    """
+    folder, name = destination_folder(folder), media_name(name)
+    if type(size) is not int or not 0 < size <= FILE_MAX:
+        raise ValueError("недопустимый размер файла")
+    pending = upload_queue.pending_sizes() if pending is None else pending
+    remote = storage.file_size(import_path(folder, name))
+    waiting = pending.get((folder.casefold(), name.casefold()))
+    known = [v for v in (remote, waiting) if v is not None]
+    existing = max(known) if known else None
+    return {
+        "name": name, "size": size,
+        "status": duplicate_status(size, existing),
+        "existing_size": existing,
+    }
+
+
+@app.post("/api/upload/check", dependencies=[Depends(require_csrf)])
+async def upload_check(request: Request, _: Session = Depends(require_admin)):
+    """Проверить всю выбранную партию и показать конфликты ДО начала отправки."""
+    if not await PC.is_up():
+        raise HTTPException(409, "ПК выключен. Включите компьютер для загрузки.")
+    if not restorer.enabled:
+        raise HTTPException(409, "На сервере не настроена запись в Restored.")
+    data = await read_json(request, 800000)
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list) or not 0 < len(files) <= 3000:
+        raise HTTPException(400, "нужно от 1 до 3000 файлов")
+    try:
+        folder = destination_folder(data.get("folder", ""))
+        inputs = [(media_name(d.get("name")), d.get("size")) for d in files]
+        if any(type(sz) is not int or not 0 < sz <= FILE_MAX for _, sz in inputs):
+            raise ValueError("недопустимый размер файла")
+    except (AttributeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from None
+
+    def inspect():
+        pending = upload_queue.pending_sizes()
+        # Несколько одноимённых файлов в партии: пропустить меньшие/равные,
+        # оставить ровно один самый большой на выбранную папку.
+        largest = {}
+        for i, (name, size) in enumerate(inputs):
+            key = name.casefold()
+            if key not in largest or size > largest[key][1]:
+                largest[key] = (i, size)
+        out = []
+        for i, (name, size) in enumerate(inputs):
+            winner, max_size = largest[name.casefold()]
+            if i != winner:
+                out.append({"name": name, "size": size, "status": "duplicate",
+                            "existing_size": max_size, "in_selection": True})
+            else:
+                out.append(_upload_size_comparison(folder, name, size, pending))
+        return out
+
+    try:
+        result = await run_in_threadpool(inspect)
+    except (OSError, ConnectionError, TimeoutError) as exc:
+        raise HTTPException(503, f"Не удалось проверить файлы на ПК: {exc}") from None
+    return no_store(JSONResponse({"results": result, "total": len(result),
+                                  "larger_count": sum(x["status"] == "larger" for x in result),
+                                  "duplicate_count": sum(x["status"] == "duplicate" for x in result)}))
+
+
 @app.post("/api/upload/start", dependencies=[Depends(require_csrf)])
 async def upload_start(request: Request, s: Session = Depends(require_admin)):
     if not await PC.is_up():
@@ -1589,8 +1658,18 @@ async def upload_start(request: Request, s: Session = Depends(require_admin)):
         raise HTTPException(409, "На сервере не настроена запись в Restored.")
     data = await read_json(request, 4096)
     try:
-        item = await run_in_threadpool(upload_queue.start, s.user, data.get("name"),
-                                       data.get("folder", ""), data.get("size"), data.get("mtime", time.time()))
+        # Повторная проверка прямо перед открытием SMB-файла: нельзя
+        # обойти правило через прямой вызов API или устаревший предпросмотр.
+        decision = await run_in_threadpool(_upload_size_comparison,
+                                           data.get("folder", ""), data.get("name"), data.get("size"))
+        if decision["status"] == "duplicate":
+            raise HTTPException(409, f"Дубль: {decision['name']} уже есть, "
+                                "существующий файл не меньше загружаемого.")
+        if decision["status"] == "larger" and data.get("allow_larger") is not True:
+            raise HTTPException(409, f"Файл {decision['name']} больше одноимённого в архиве. "
+                                "Подтвердите загрузку.")
+        item = await run_in_threadpool(upload_queue.start, s.user, decision["name"],
+                                       data.get("folder", ""), decision["size"], data.get("mtime", time.time()))
     except (ValueError, FileExistsError) as e:
         raise HTTPException(400, str(e)) from None
     except (OSError, ConnectionError, TimeoutError) as e:

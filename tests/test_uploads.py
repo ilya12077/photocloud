@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.uploads import UploadQueue, destination_folder, media_name, import_path, UPLOAD_PREFIX
+from app.uploads import UploadQueue, destination_folder, media_name, import_path, UPLOAD_PREFIX, duplicate_status
+from app.storage import LocalStorage
 from test_offline import production_function
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,10 +103,65 @@ class DirectUploadTests(unittest.TestCase):
         self.assertFalse((base / "cancel.mp4.photocloud-part").exists())
         self.assertFalse((base / "manifest.json").exists())
 
+
+    def test_duplicate_classification_compares_same_name_by_size(self):
+        self.assertEqual(duplicate_status(2048, None), "new")
+        self.assertEqual(duplicate_status(2048, 4096), "duplicate")
+        self.assertEqual(duplicate_status(4096, 4096), "duplicate")
+        self.assertEqual(duplicate_status(8192, 4096), "larger")
+
+    def test_duplicate_metadata_check_does_not_read_media(self):
+        folder = self.pc / "Album"
+        folder.mkdir()
+        file = folder / "photo.jpg"
+        file.write_bytes(b"a" * 100)
+        storage = LocalStorage(str(self.pc))
+        self.assertEqual(storage.file_size("Album/photo.jpg"), 100)
+        self.assertIsNone(storage.file_size("Album/missing.jpg"))
+        with self.assertRaises(ValueError):
+            storage.file_size("../secrets.jpg")
+
+    def test_already_received_and_active_uploads_count_as_duplicates(self):
+        self.upload("Same.JPG", b"a" * 10, "Album")
+        active = self.queue.start("admin", "same.jpg", "ALBUM", 30, 1700000000)
+        pending = self.queue.pending_sizes()
+        self.assertEqual(pending[("album", "same.jpg")], 30)
+        self.queue.cancel(active["id"], "admin")
+        self.assertEqual(self.queue.pending_sizes()[("album", "same.jpg")], 10)
+
+    def test_duplicate_preflight_is_admin_only_and_rechecked_at_start(self):
+        src = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        check_fn = next(x for x in tree.body if isinstance(x, ast.AsyncFunctionDef)
+                        and x.name == "upload_check")
+        start_fn = next(x for x in tree.body if isinstance(x, ast.AsyncFunctionDef)
+                        and x.name == "upload_start")
+        check_source = ast.get_source_segment(src, check_fn)
+        start_source = ast.get_source_segment(src, start_fn)
+        self.assertIn("Depends(require_admin)", check_source)
+        self.assertIn("PC.is_up()", check_source)
+        self.assertIn("storage.file_size(", src)
+        self.assertIn("pending_sizes()", src)
+        self.assertIn('decision["status"] == "duplicate"', start_source)
+        self.assertIn('decision["status"] == "larger"', start_source)
+        self.assertIn("allow_larger", start_source)
+
+    def test_completed_upload_shows_result_not_stuck_at_100_percent(self):
+        js = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
+        html = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+        self.assertIn('id="up-result"', html)
+        self.assertIn('id="up-result-title"', html)
+        self.assertIn("function upShowResult(", js)
+        self.assertIn("$('up-progress-wrap').hidden = true", js)
+        self.assertIn("'Загрузка завершена'", js)
+        self.assertIn("upShowResult(UP.done, skips.length, errors, ctrl.signal.aborted)", js)
+        self.assertIn("Проверка SHA-256 на ПК", js)
+        self.assertIn("upResetResult();", js)
+
     def test_server_endpoints_require_admin_and_online_pc(self):
         src = (ROOT / "app/main.py").read_text(encoding="utf-8")
         t = ast.parse(src)
-        for name in ("upload_folders","upload_list","upload_start","upload_chunk",
+        for name in ("upload_folders","upload_list","upload_check","upload_start","upload_chunk",
                      "upload_finish","upload_cancel","upload_media","upload_thumb"):
             f = next(n for n in t.body if isinstance(n,ast.AsyncFunctionDef) and n.name==name)
             text = ast.get_source_segment(src,f)
