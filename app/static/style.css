@@ -410,3 +410,15 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
   .up-folder-row { flex-wrap: wrap; }
   .up-folder-row input { flex-basis: 100%; }
 }
+
+
+/* Ожидающие импорта медиа видны админу прямо над обычной галереей. */
+.up-feed { padding: 10px 16px 5px; border-bottom: 1px solid var(--line); }
+.up-feed-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.up-feed-head strong { font-size: 14px; }
+.up-feed-head button { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 5px 9px; cursor: pointer; }
+.up-feed-grid { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 6px; }
+.up-feed-card { width: 96px; flex: 0 0 96px; display: grid; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.up-feed-card img { width: 100%; aspect-ratio: 16/10; object-fit: cover; background: var(--tile); }
+.up-feed-card span { font-size: 11px; padding: 4px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
