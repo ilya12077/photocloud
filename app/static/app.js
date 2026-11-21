@@ -1283,8 +1283,9 @@ function buildRow(r) {
   for (const label of r.labels || []) {
     const d = el('div', 'dhead');
     d.dataset.start = label.start; d.dataset.n = label.n;
-    d.style.left = (label.col * (L.tileH + L.gap)) + 'px';
-    d.style.width = (label.span * (L.tileH + L.gap) - L.gap) + 'px';
+    const inset = label.col > 0 ? 8 : 0;
+    d.style.left = (label.col * (L.tileH + L.gap) + inset) + 'px';
+    d.style.width = (label.span * (L.tileH + L.gap) - L.gap - inset) + 'px';
     d.title = dayName(label.dayTs);
     const c = el('button', 'mcheck'); c.type = 'button';
     c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
@@ -1297,6 +1298,15 @@ function buildRow(r) {
   for (let i = r.start; i < r.end; i++) {
     const ph = st.list[i];
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
+    // Extra breathing room only where two different days share a row.
+    if (st.sort !== 'name') {
+      const left = i > r.start && dayKey(gdate(i - 1)) !== dayKey(gdate(i)) ? 8 : 0;
+      const right = i + 1 < r.end && dayKey(gdate(i + 1)) !== dayKey(gdate(i)) ? 8 : 0;
+      if (left || right) {
+        b.style.marginLeft = left + 'px';
+        b.style.width = `calc(100% - ${left + right}px)`;
+      }
+    }
     if (SEL.set.has(ph[0])) b.classList.add('sel');
     const img = el('img'); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.dataset.src = imgUrl(kind, ph);
     img.onload = () => { img.classList.add('ok'); img.dataset.loaded = '1'; b.classList.remove('broken'); };
