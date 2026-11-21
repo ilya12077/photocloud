@@ -4,6 +4,15 @@ from pathlib import Path
 import tempfile
 import unittest
 from test_offline import production_function
+import os
+
+
+def safe_rel(rel: str):
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") or "\\\\" in p or ":" in p or "\\x00" in p for p in parts):
+        raise ValueError("недопустимый путь")
+    return parts
+
 
 
 class MetadataOnlyDeletionTests(unittest.TestCase):
@@ -14,7 +23,7 @@ class MetadataOnlyDeletionTests(unittest.TestCase):
             path.write_bytes(b"not original")
             item = {"path": "photo.jpg", "size": path.stat().st_size,
                     "mtime": int(path.stat().st_mtime), "sha": "not-real-sha"}
-            check_file = production_function("pc/photocloud_pc.pyw", "check_file")
+            check_file = production_function("pc/photocloud_pc.pyw", "check_file", globals_={"safe_rel": lambda rel: safe_rel(rel), "os": os})
             state, found, _ = check_file(root, item)
             self.assertEqual(state, "ok")
             self.assertEqual(found, path)
@@ -24,7 +33,7 @@ class MetadataOnlyDeletionTests(unittest.TestCase):
             root = Path(directory)
             path = root / "photo.jpg"
             path.write_bytes(b"file")
-            fn = production_function("pc/photocloud_pc.pyw", "check_file")
+            fn = production_function("pc/photocloud_pc.pyw", "check_file", globals_={"safe_rel": lambda rel: safe_rel(rel), "os": os})
             self.assertEqual(fn(root, {"path": "photo.jpg",
                                        "size": 100, "mtime": int(path.stat().st_mtime)})[0], "changed")
             self.assertEqual(fn(root, {"path": "../photo.jpg", "size": 4, "mtime": 0})[0], "bad")
