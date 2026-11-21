@@ -1849,14 +1849,23 @@ const gridActive = () => !$('main').hidden && $('viewer').hidden;
 const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
 
 document.addEventListener('touchstart', (e) => {
-  if (e.touches.length === 2 && gridActive()) Z.pinch = { d0: dist(e.touches) || 1, c0: Z.cols };
+  if (e.touches.length === 2 && gridActive() && !Z.pinch) Z.pinch = { d0: dist(e.touches) || 1 };
 }, { passive: true });
 document.addEventListener('touchmove', (e) => {
   if (!Z.pinch || e.touches.length !== 2) return;
   if (!gridActive()) { Z.pinch = null; return; }     // открыли просмотр — щипок уже не про сетку
   e.preventDefault();
-  const s = dist(e.touches) / Z.pinch.d0;
-  setCols(Math.round(Z.pinch.c0 / s), (e.touches[0].clientX + e.touches[1].clientX) / 2, (e.touches[0].clientY + e.touches[1].clientY) / 2);
+  const d = dist(e.touches), change = d - Z.pinch.d0;
+  // Один жест не может перепрыгнуть несколько столбцов на одном событии touchmove.
+  // На плитке и на пустом месте работает одинаковая пошаговая схема.
+  const threshold = Math.max(18, Z.pinch.d0 * 0.12);
+  if (Math.abs(change) < threshold) return;
+  const next = clamp(Z.cols + (change > 0 ? -1 : 1), 1, maxCols());
+  if (next !== Z.cols) {
+    setCols(next, (e.touches[0].clientX + e.touches[1].clientX) / 2,
+      (e.touches[0].clientY + e.touches[1].clientY) / 2);
+    Z.pinch.d0 = d;
+  }
 }, { passive: false });
 document.addEventListener('touchend', (e) => { if (e.touches.length < 2) Z.pinch = null; });
 document.addEventListener('touchcancel', () => { Z.pinch = null; });
@@ -2008,7 +2017,6 @@ function show(i) {
     ? `${new Date(ph[3] * 1000).getFullYear()} год (по названию папки) · ${sizeStr(ph[5])}`
     : (fromMeta ? 'Снято ' : fromName ? 'Снято (по имени файла) ' : 'Дата файла ') + fmt.format(new Date(ph[3] * 1000)) + ' · ' + sizeStr(ph[5]);
   $('v-date').textContent = meta;
-  $('v-orig').href = origUrl(ph, false);
   $('v-dl').href = origUrl(ph, true); $('v-dl').setAttribute('download', ph[2]);
   const low = $('v-low'), hi = $('v-img');
   stopVideo();
