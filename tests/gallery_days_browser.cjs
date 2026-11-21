@@ -31,7 +31,7 @@ const assert=require('node:assert/strict');
        const label=g.querySelector('.day-spacer-text'), lines=[...g.querySelectorAll('.day-spacer-line')];
        const style=getComputedStyle(label);
        const first=lines[0],second=lines[1];
-       return lines.length===2 && /^\\d{1,2} [А-Яа-яЁё]+$/.test(first.textContent) &&
+       return lines.length===2 && /^\d{1,2} [А-Яа-яЁё]+$/.test(first.textContent) &&
          /^[А-ЯЁ][а-яё]+$/.test(second.textContent) &&
          style.textAlign==='right' && style.justifyContent==='center' &&
          lines.every(s=>s.scrollWidth<=s.clientWidth+1) &&
