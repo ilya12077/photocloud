@@ -1131,26 +1131,26 @@ function layout() {
       end = i + 1;
       while (end < list.length && monthKey(gdate(end)) === month) end++;
       rows.push({ h: true, kind: 'month', month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
-      // Дата стоит среди фотографий как отдельная подпись-ячейка: ряд не обрывается.
-      const cells = [];
-      const flush = () => {
-        if (!cells.length) return;
-        const content = cells.splice(0);
-        const firstPhoto = content.find(c => typeof c === 'number');
-        const start = firstPhoto == null ? content[0].start : firstPhoto;
-        rows.push({ h: false, start, month, cells: content, top: y, height: rowH });
-        y += rowH;
-      };
-      const push = c => { cells.push(c); if (cells.length === cols) flush(); };
+      // Подписи над снимками: ни дата, ни граница дня не занимают фото-ячейку.
+      const days = new Map();
       for (let s = i; s < end;) {
-        const day = dayKey(gdate(s)), dayTs = gdate(s);
+        const day = dayKey(gdate(s));
         let last = s + 1;
         while (last < end && dayKey(gdate(last)) === day) last++;
-        push({ kind: 'day', dayTs, start: s, n: last - s });
-        for (let k = s; k < last; k++) push(k);
+        days.set(s, { dayTs: gdate(s), start: s, n: last - s });
         s = last;
       }
-      flush();
+      for (let s = i; s < end; s += cols) {
+        const last = Math.min(end, s + cols), labels = [];
+        for (let k = s; k < last; k++) {
+          if (days.has(k)) labels.push({ ...days.get(k), col: k - s,
+            span: Math.min(days.get(k).n, last - k) });
+        }
+        const band = labels.length ? 30 : 0;
+        rows.push({ h: false, start: s, end: last, month, labels, band,
+          top: y, height: rowH + band });
+        y += rowH + band;
+      }
     } else {
       // Сортировка по имени остаётся без календарной группировки.
       for (let s = i; s < end; s += cols) {
@@ -1277,21 +1277,25 @@ function buildRow(r) {
     return h;
   }
   const row = el('div', 'trow');
-  row.style.transform = `translateY(${r.top}px)`; row.style.height = L.tileH + 'px'; row.style.gap = L.gap + 'px';
+  row.style.transform = `translateY(${r.top}px)`;
+  row.style.height = (L.tileH + (r.band || 0)) + 'px';
+  row.style.paddingTop = (r.band || 0) + 'px'; row.style.gap = L.gap + 'px';
+  for (const label of r.labels || []) {
+    const d = el('div', 'dhead');
+    d.dataset.start = label.start; d.dataset.n = label.n;
+    d.style.left = (label.col * (L.tileH + L.gap)) + 'px';
+    d.style.width = (label.span * (L.tileH + L.gap) - L.gap) + 'px';
+    d.title = dayName(label.dayTs);
+    const c = el('button', 'mcheck'); c.type = 'button';
+    c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
+    c.addEventListener('click', e => { e.stopPropagation(); selMonth(label.start, label.n); });
+    d.append(c, el('span', 'dhead-text', dayName(label.dayTs)));
+    if (SEL.on && monthAllSel(label.start, label.n)) d.classList.add('sel');
+    row.append(d);
+  }
   const kind = thumbKind();
-  for (const cell of r.cells || Array.from({length: r.end - r.start}, (_, j) => r.start + j)) {
-    if (typeof cell !== 'number') {
-      const d = el('div', 'dcell');
-      d.dataset.start = cell.start; d.dataset.n = cell.n;
-      const c = el('button', 'mcheck'); c.type = 'button';
-      c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
-      c.addEventListener('click', e => { e.stopPropagation(); selMonth(cell.start, cell.n); });
-      d.append(c, el('span', 'dcell-text', dayName(cell.dayTs)));
-      if (SEL.on && monthAllSel(cell.start, cell.n)) d.classList.add('sel');
-      row.append(d);
-      continue;
-    }
-    const i = cell, ph = st.list[i];
+  for (let i = r.start; i < r.end; i++) {
+    const ph = st.list[i];
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
     if (SEL.set.has(ph[0])) b.classList.add('sel');
     const img = el('img'); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.dataset.src = imgUrl(kind, ph);
@@ -1509,7 +1513,7 @@ function selUpdate() {
   $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
-  for (const h of $('grid').querySelectorAll('.mhead, .dcell')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
+  for (const h of $('grid').querySelectorAll('.mhead, .dhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {

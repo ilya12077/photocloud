@@ -19,6 +19,8 @@ on:
     paths: [app/VERSION]
 
 jobs:
+  gallery_layout:
+    uses: ./.github/workflows/gallery-layout.yml
   windows_agent:
     runs-on: windows-latest
     steps:
@@ -31,7 +33,7 @@ jobs:
       - run: python -m unittest discover -s tests -p test_backup_pipe.py -v
 
   push_to_registry:
-    needs: windows_agent
+    needs: [windows_agent, gallery_layout]
     name: Push Docker image to Docker Hub
     runs-on: ubuntu-latest
     steps:
