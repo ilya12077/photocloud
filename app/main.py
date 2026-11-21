@@ -1312,6 +1312,31 @@ async def pc_uploads(_: dict = Depends(require_pc)):
     }))
 
 
+@app.post("/api/pc/uploads/discard")
+async def pc_upload_discard(request: Request, _: dict = Depends(require_pc)):
+    """Удаление полученных веб-загрузок только агентом ПК, только из Restored."""
+    body = _pc_json(request)
+    entries = body.get("items")
+    if not isinstance(entries, list) or not 0 < len(entries) <= 200:
+        raise HTTPException(400, "укажите от 1 до 200 выбранных файлов")
+    if any(not isinstance(it, dict) or not isinstance(it.get("id"), str)
+           or not isinstance(it.get("sha"), str) for it in entries):
+        raise HTTPException(400, "неверный список файлов")
+    ids = [it["id"] for it in entries]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "повторяющиеся идентификаторы")
+    deleted, failures = [], []
+    for item in entries:
+        try:
+            await on_pc(upload_queue.discard, item["id"], item["sha"], timeout=60)
+            deleted.append(item["id"])
+        except (ValueError, OSError, ConnectionError, TimeoutError) as exc:
+            failures.append({"id":item["id"], "reason":str(exc)[:160]})
+    if deleted:
+        audit("upload_discard", "клиент ПК", ip_of(request), f"удалено из Restored: {len(deleted)}")
+    return no_store(JSONResponse({"ok":not failures,"deleted":deleted,"errors":failures}))
+
+
 @app.post("/api/pc/uploads/complete")
 async def pc_upload_complete(request: Request, _: dict = Depends(require_pc)):
     body = _pc_json(request)

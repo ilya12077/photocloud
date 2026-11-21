@@ -143,3 +143,53 @@ class StartupRestorePromptTests(unittest.TestCase):
         with patch.object(self.module["messagebox"], "askyesno", return_value=True):
             self.module["App"]._offer_startup_restores(app, api, "archive", ("good.jpg",))
         app.apply_restores.assert_called_once_with(only_paths={"good.jpg"})
+
+
+class UploadedFilesStartupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import sys
+        with patch.object(sys, "excepthook"):
+            cls.module = runpy.run_path(str(ROOT / "pc/photocloud_pc.pyw"))
+
+    def test_client_opens_upload_gallery_with_preview_and_delete_action(self):
+        source = (ROOT / "pc/photocloud_pc.pyw").read_text(encoding="utf-8")
+        for token in ('text="Плитки с превью"', 'command=self._up_delete',
+                      'def _up_card(', 'def _up_thumb(', 'def _up_tile_click(',
+                      'self.up_tree.selection_add', 'self.thumb_pool.submit(self._up_thumb'):
+            self.assertIn(token, source)
+
+    def test_startup_upload_notification_is_once_only(self):
+        api = self.module["App"]
+        mock_root = Mock()
+        object_under_test = SimpleNamespace(
+            _up_refreshing=True, up_tree=Mock(), up_folder_box={},
+            root=mock_root, upload_tab=Mock(), nb=Mock(), up_canvas=Mock(),
+            upload_items=[], upload_by_id={}, _uploads_known=None,
+            up_gen=1, _up_layout=Mock(), _up_selection_changed=Mock(),
+            up_status=Mock())
+        object_under_test.up_tree.selection.return_value = ()
+        object_under_test.up_tree.get_children.return_value = ()
+        loaded = [{"id": "0" * 32, "name": "test.jpg", "folder": "Photos",
+                   "size": 100, "user": "admin"}]
+        with patch.object(self.module["messagebox"], "showinfo") as shown:
+            api._up_show(object_under_test, loaded, [], "")
+            mock_root.after.assert_called_once()
+            callback = mock_root.after.call_args.args[1]
+            callback()
+            shown.assert_called_once()
+            self.assertIn("Загруженные", shown.call_args.args[1])
+            mock_root.after.reset_mock()
+            api._up_show(object_under_test, loaded, [], "")
+            mock_root.after.assert_not_called()
+
+    def test_delete_requires_confirmation_before_api_call(self):
+        cls = self.module["App"]
+        item = {"id": "a" * 32, "name": "photo.jpg", "sha": "b" * 64, "size": 100}
+        app = SimpleNamespace(up_tree=Mock(), upload_by_id={item["id"]: item},
+                              busy=False, api=Mock(), bg=Mock())
+        app.up_tree.selection.return_value = (item["id"],)
+        with patch.object(self.module["messagebox"], "askyesno", return_value=False):
+            cls._up_delete(app)
+        app.api.call.assert_not_called()
+        app.bg.assert_not_called()

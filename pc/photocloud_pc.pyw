@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.7"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.8"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -897,6 +897,14 @@ class App:
         self.upload_by_id = {}
         self._uploads_known = None
         self._up_refreshing = False
+        self.up_thumbs = {}                     # миниатюры загруженных фото по ID
+        self.up_no_thumb = set()               # видео/неподдерживаемые файлы
+        self.up_asked = set()
+        self.up_drawn = {}                     # изображения отображаемых плиток
+        self.up_visible = set()
+        self.up_cols = self.up_gen = 1
+        self._up_pending_render = False
+        self._up_last_tile = None
         self._build()
         h = _UiLog(self)
         log.addHandler(h)
@@ -945,6 +953,8 @@ class App:
         ttk.Button(actions, text="Выделить все", command=self._up_select_all).pack(side="left", padx=8)
         self.b_up_move = ttk.Button(actions, text="Перенести выбранные в фотоархив", command=self._up_move)
         self.b_up_move.pack(side="left")
+        self.b_up_delete = ttk.Button(actions, text="Удалить выбранные из загрузок", command=self._up_delete)
+        self.b_up_delete.pack(side="left", padx=(10, 0))
         self.up_status = ttk.Label(tab, text="Новые загрузки появятся здесь автоматически",
                                    padding=(12, 3, 12, 10))
         self.up_status.pack(fill="x")
@@ -960,14 +970,36 @@ class App:
 
         wrap = ttk.Frame(tab)
         wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        self.up_views = ttk.Notebook(wrap)
+        self.up_views.pack(fill="both", expand=True)
+
+        # По умолчанию — такие же карточки с миниатюрами и выделением,
+        # как на главной вкладке «Удаление». Список оставлен для удобства
+        # поиска имён и массового выделения.
+        gallery = ttk.Frame(self.up_views)
+        self.up_views.add(gallery, text="Плитки с превью")
+        self.up_canvas = tk.Canvas(gallery, highlightthickness=0, background=BG,
+                                   yscrollincrement=20)
+        upscroll = ttk.Scrollbar(gallery, orient="vertical", command=self.up_canvas.yview)
+        self.up_canvas.configure(yscrollcommand=lambda a, b: (upscroll.set(a, b), self._up_soon()))
+        upscroll.pack(side="right", fill="y")
+        self.up_canvas.pack(side="left", fill="both", expand=True)
+        self.up_canvas.bind("<Configure>", lambda _e: self._up_layout())
+        self.up_canvas.tag_bind("up-card", "<Button-1>", self._up_tile_click)
+        self.up_canvas.tag_bind("up-img", "<Double-Button-1>", self._up_tile_big)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.up_canvas.bind(sequence, self._up_wheel)
+
+        table = ttk.Frame(self.up_views)
+        self.up_views.add(table, text="Список")
         columns = ("name", "folder", "size", "sender")
-        self.up_tree = ttk.Treeview(wrap, columns=columns, show="headings",
+        self.up_tree = ttk.Treeview(table, columns=columns, show="headings",
                                     selectmode="extended")
-        for key, title, width in (("name","Файл",280),("folder","Целевая папка",290),
-                                   ("size","Размер",95),("sender","Загрузил",110)):
+        for key, title, width in (("name", "Файл", 280), ("folder", "Целевая папка", 290),
+                                   ("size", "Размер", 95), ("sender", "Загрузил", 110)):
             self.up_tree.heading(key, text=title)
-            self.up_tree.column(key, width=width, stretch=key in ("name","folder"))
-        scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.up_tree.yview)
+            self.up_tree.column(key, width=width, stretch=key in ("name", "folder"))
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.up_tree.yview)
         self.up_tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.up_tree.pack(side="left", fill="both", expand=True)
@@ -981,6 +1013,185 @@ class App:
         self._up_preview_img = None
         self.up_details = ttk.Label(preview, text="", wraplength=700)
         self.up_details.pack(side="left", fill="x", expand=True, padx=12)
+
+    # ---- сетка загруженных файлов: виртуализированные карточки и превью
+
+    def _up_wheel(self, event):
+        if not self.up_canvas.winfo_ismapped():
+            return
+        step = -1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4) else 1
+        self.up_canvas.yview_scroll(step * 3, "units")
+        self._up_soon()
+        return "break"
+
+    def _up_layout(self):
+        c = self.up_canvas
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        self.up_cols = max(1, (w - GAP) // (CARD_W + GAP))
+        rows = (len(self.upload_items) + self.up_cols - 1) // self.up_cols
+        c.configure(scrollregion=(0, 0, w, max(h, rows * (CARD_H + GAP) + GAP)))
+        c.delete("all")
+        self.up_drawn = {}
+        if not self.upload_items:
+            c.create_text(w // 2, 70, text="Нет загруженных файлов, ожидающих переноса.",
+                          fill=DIM, font=("Segoe UI", 12))
+        else:
+            self._up_render()
+
+    def _up_soon(self):
+        if not self._up_pending_render:
+            self._up_pending_render = True
+            self.root.after_idle(self._up_render)
+
+    def _up_render(self):
+        self._up_pending_render = False
+        if not self.upload_items:
+            return
+        c = self.up_canvas
+        top, h, rh = c.canvasy(0), max(1, c.winfo_height()), CARD_H + GAP
+        r0 = max(0, int((top - h) // rh))
+        r1 = int((top + 2 * h) // rh) + 1
+        visible = set(range(r0 * self.up_cols, min(len(self.upload_items), r1 * self.up_cols)))
+        for idx in list(self.up_drawn):
+            if idx not in visible:
+                c.delete(f"up{idx}")
+                self.up_drawn.pop(idx, None)
+        for idx in sorted(visible - self.up_drawn.keys()):
+            self._up_card(idx)
+        self.up_visible = {self.upload_items[i]["id"] for i in visible}
+        for idx in sorted(visible):
+            item = self.upload_items[idx]
+            ident = item["id"]
+            if ident not in self.up_thumbs and ident not in self.up_asked and ident not in self.up_no_thumb:
+                self.up_asked.add(ident)
+                self.thumb_pool.submit(self._up_thumb, ident, self.up_gen)
+
+    def _up_card(self, idx: int):
+        item, c, tag = self.upload_items[idx], self.up_canvas, f"up{idx}"
+        ident = item["id"]
+        selected = ident in self.up_tree.selection()
+        x, y = GAP + (idx % self.up_cols) * (CARD_W + GAP), GAP + (idx // self.up_cols) * (CARD_H + GAP)
+        c.create_rectangle(x, y, x + CARD_W, y + CARD_H,
+                           fill=CARD, outline=ACCENT if selected else "#d6d6d6",
+                           width=3 if selected else 1, tags=(tag, "up-card"))
+        ix, iy = x + (CARD_W - THUMB) // 2, y + 8
+        c.create_rectangle(ix, iy, ix + THUMB, iy + THUMB,
+                           fill=IMGBG, outline="", tags=(tag, "up-card", "up-img"))
+        picture = None
+        raw = self.up_thumbs.get(ident)
+        if raw and Image is not None and ImageTk is not None:
+            try:
+                im = Image.open(io.BytesIO(raw))
+                im.thumbnail((THUMB, THUMB))
+                picture = ImageTk.PhotoImage(im)
+            except (OSError, ValueError):
+                self.up_no_thumb.add(ident)
+        if picture is not None:
+            c.create_image(ix + THUMB // 2, iy + THUMB // 2, image=picture,
+                           tags=(tag, "up-card", "up-img"))
+        else:
+            is_video = item["name"].lower().endswith(
+                (".mp4", ".mov", ".m4v", ".3gp", ".webm", ".avi", ".mts", ".m2ts", ".mpg", ".mpeg", ".vob"))
+            c.create_text(ix + THUMB // 2, iy + THUMB // 2,
+                          text="▶ Видео" if is_video else "Нет превью" if ident in self.up_no_thumb else "Загружаю…",
+                          fill=DIM, font=("Segoe UI", 11), tags=(tag, "up-card", "up-img"))
+        ty = iy + THUMB + 6
+        c.create_text(x + 8, ty, text="☑" if selected else "☐", anchor="nw",
+                      fill=ACCENT if selected else TEXT, font=("Segoe UI Symbol", 14),
+                      tags=(tag, "up-card"))
+        name = item["name"]
+        c.create_text(x + 34, ty + 5, text=name[:23] + "…" if len(name) > 24 else name,
+                      anchor="nw", fill=TEXT, font=("Segoe UI", 9), tags=(tag, "up-card"))
+        folder = item.get("folder") or "Корень фотоархива"
+        info = f"{human(item['size'])} · {item.get('user', '')}\n→ {folder}"
+        c.create_text(x + 8, ty + 30, text=info, anchor="nw", width=CARD_W - 16,
+                      fill=DIM, font=("Segoe UI", 8), tags=(tag, "up-card"))
+        self.up_drawn[idx] = picture
+
+    def _up_redraw(self, ident: str):
+        if ident not in self.upload_by_id:
+            return
+        for idx in list(self.up_drawn):
+            if self.upload_items[idx]["id"] == ident:
+                self.up_canvas.delete(f"up{idx}")
+                self._up_card(idx)
+                break
+
+    def _up_thumb(self, ident: str, gen: int):
+        if gen != self.up_gen or ident not in self.up_visible:
+            self.up_asked.discard(ident)
+            return
+        try:
+            r = self.api.call("GET", f"/api/pc/uploads/{ident}/thumb")
+            if r.status_code == 200 and r.content:
+                self.up_thumbs[ident] = r.content
+            elif r.status_code == 404:
+                self.up_no_thumb.add(ident)
+            else:
+                self.up_asked.discard(ident)
+        except Exception:
+            self.up_asked.discard(ident)
+            return
+        self.ui(lambda: self._up_redraw(ident) if gen == self.up_gen else None)
+
+    def _up_hit(self):
+        for tag in self.up_canvas.gettags("current"):
+            if tag.startswith("up") and tag[2:].isdigit():
+                i = int(tag[2:])
+                if i < len(self.upload_items):
+                    return i
+        return None
+
+    def _up_tile_click(self, event):
+        idx = self._up_hit()
+        if idx is None:
+            return
+        ident = self.upload_items[idx]["id"]
+        previous = list(self.up_tree.selection())
+        if event.state & 0x0001 and self._up_last_tile is not None:
+            low, high = sorted((self._up_last_tile, idx))
+            chosen = [x["id"] for x in self.upload_items[low:high+1]]
+            self.up_tree.selection_set(list(dict.fromkeys(previous + chosen)))
+        elif ident in previous:
+            self.up_tree.selection_remove(ident)
+        else:
+            self.up_tree.selection_add(ident)
+        self._up_last_tile = idx
+        self._up_selection_changed()
+        return "break"
+
+    def _up_tile_big(self, _event):
+        idx = self._up_hit()
+        if idx is None:
+            return
+        ident = self.upload_items[idx]["id"]
+        window = tk.Toplevel(self.root)
+        window.title(self.upload_items[idx]["name"])
+        window.configure(bg="#000")
+        label = tk.Label(window, text="Загружаю превью…", bg="#000", fg="#ccc")
+        label.pack(fill="both", expand=True)
+        def load():
+            raw = self.up_thumbs.get(ident)
+            if raw is None:
+                try:
+                    r = self.api.call("GET", f"/api/pc/uploads/{ident}/thumb")
+                    raw = r.content if r.status_code == 200 else None
+                except Exception:
+                    raw = None
+            def show():
+                if raw and Image is not None and ImageTk is not None:
+                    try:
+                        im = Image.open(io.BytesIO(raw))
+                        im.thumbnail((self.root.winfo_screenwidth()-80, self.root.winfo_screenheight()-160))
+                        photo = ImageTk.PhotoImage(im)
+                        label.configure(image=photo, text="")
+                        label.image = photo
+                        return
+                    except (ValueError, OSError, tk.TclError):
+                        pass
+                label.configure(text="Для этого файла превью недоступно")
+            self.ui(show)
+        self.thumb_pool.submit(load)
 
     def _on_pc_tab_changed(self, _event=None) -> None:
         if self.nb.select() == str(self.upload_tab):
@@ -1020,9 +1231,18 @@ class App:
         self.upload_items = items
         self.upload_by_id = {item["id"]: item for item in items}
         present = set(self.upload_by_id)
-        if self._uploads_known is not None and present - self._uploads_known:
+        initial = self._uploads_known is None
+        if not initial and present - self._uploads_known:
             self.root.bell()
         self._uploads_known = present
+        if initial and items:
+            # Отдельное уведомление при запуске, не повторяется раз в 30 секунд.
+            count = len(items)
+            self.root.after(700, lambda: messagebox.showinfo(
+                APP, f"Есть новые загруженные файлы: {count}.\n\n"
+                     "Файлы находятся в Restored и ещё не добавлены в галерею.\n"
+                     "Открой вкладку «Загруженные»: там доступны превью, "
+                     "перенос по одному или группой и удаление ненужных файлов."))
         self.nb.tab(self.upload_tab, text=f"Загруженные ({len(items)})" if items else "Загруженные")
         self.up_tree.delete(*self.up_tree.get_children())
         self.up_folder_box["values"] = ["⟪Корень архива⟫"] + folders
@@ -1031,14 +1251,23 @@ class App:
                 item["name"], item["folder"] or "Корень архива",
                 human(item["size"]), item["user"]))
         self.up_tree.selection_set([ident for ident in old_selected if ident in present])
+        self.up_gen += 1
+        self.up_canvas.yview_moveto(0)
+        self._up_layout()
+        self._up_selection_changed()
         self.up_status.configure(text=f"Ожидают переноса: {len(items)} файл(ов). "
-                              "Файлы уже находятся в Restored; выбирай их и папку назначения.")
+                              "Выбери карточки и укажи папку, либо удали ненужное из Restored.")
 
     def _up_select_all(self):
         self.up_tree.selection_set(self.up_tree.get_children())
 
     def _up_selection_changed(self, _event=None):
         picked = [self.upload_by_id[k] for k in self.up_tree.selection() if k in self.upload_by_id]
+        for i in list(self.up_drawn):
+            self.up_canvas.delete(f"up{i}")
+            self._up_card(i)
+        for button in (self.b_up_move, self.b_up_delete):
+            button.state(["!disabled"] if picked and not self.busy else ["disabled"])
         if not picked:
             self.up_details.configure(text="")
             self.up_preview.configure(image="", text="Выбери файл для предпросмотра")
@@ -1053,11 +1282,15 @@ class App:
         self.up_preview.configure(image="", text="Загружаю превью…")
         self._up_preview_img = None
         def worker():
-            try:
-                r = self.api.call("GET", f"/api/pc/uploads/{item['id']}/thumb")
-                raw = r.content if r.status_code == 200 else b""
-            except Exception:
-                raw = b""
+            raw = self.up_thumbs.get(item["id"])
+            if raw is None:
+                try:
+                    r = self.api.call("GET", f"/api/pc/uploads/{item['id']}/thumb")
+                    raw = r.content if r.status_code == 200 else b""
+                    if raw:
+                        self.up_thumbs[item["id"]] = raw
+                except Exception:
+                    raw = b""
             def show():
                 if item["id"] not in self.up_tree.selection(): return
                 if not raw:
@@ -1087,6 +1320,56 @@ class App:
             return
         self.up_folder.set((parent + "/" if parent else "") + name)
 
+    def _up_delete(self) -> None:
+        """Подтверждённое удаление только полученных веб-загрузок из Restored."""
+        ids = [ident for ident in self.up_tree.selection() if ident in self.upload_by_id]
+        if self.busy or not ids:
+            messagebox.showinfo(APP, "Выдели одну или несколько загруженных карточек.")
+            return
+        total = sum(self.upload_by_id[ident]["size"] for ident in ids)
+        if not messagebox.askyesno(
+            APP, f"Удалить {len(ids)} загруженных файлов ({human(total)}) из Restored?\n\n"
+                 "Файлы будут удалены с ПК окончательно и НЕ попадут в основную галерею.\n"
+                 "Файлы основного архива и восстановленные копии затронуты не будут.\n\n"
+                 "Отменить это действие после удаления нельзя."
+        ):
+            return
+        entries = [{"id":ident, "sha":self.upload_by_id[ident]["sha"]} for ident in ids]
+        self.busy = True
+        self.b_up_delete.state(["disabled"])
+        self.b_up_move.state(["disabled"])
+
+        def go():
+            done, failures = [], []
+            for index in range(0, len(entries), 100):
+                batch = entries[index:index + 100]
+                try:
+                    r = self.api.call("POST", "/api/pc/uploads/discard", {"items": batch})
+                    if r.status_code != 200:
+                        raise ServerError(_err(r))
+                    data = r.json()
+                    done.extend(data.get("deleted", []))
+                    failures.extend(f"{it.get('id')}: {it.get('reason')}" for it in data.get("errors", []))
+                except Exception as exc:
+                    log.exception("удаление загруженных фото и видео")
+                    failures.extend(f"{it['id']}: {exc}" for it in batch)
+
+            def finish():
+                self.busy = False
+                for ident in done:
+                    self.up_thumbs.pop(ident, None)
+                    self.up_no_thumb.discard(ident)
+                    self.up_asked.discard(ident)
+                self.refresh_uploads()
+                self.b_up_delete.state(["!disabled"])
+                self.b_up_move.state(["!disabled"])
+                messagebox.showinfo(APP,
+                    f"Удалено из Restored: {len(done)} из {len(entries)}.\n"
+                    "Удалённые файлы не попадут в основную галерею."
+                    + ("\n\nНе удалось удалить:\n" + "\n".join(failures[:12]) if failures else ""))
+            self.ui(finish)
+        self.bg(go)
+
     def _up_move(self) -> None:
         ids = list(self.up_tree.selection())
         if self.busy or not ids:
@@ -1102,6 +1385,7 @@ class App:
             return
         self.busy = True
         self.b_up_move.state(["disabled"])
+        self.b_up_delete.state(["disabled"])
         def go():
             done, failures = 0, []
             for ident in ids:
@@ -1126,6 +1410,7 @@ class App:
             def finish():
                 self.busy = False
                 self.b_up_move.state(["!disabled"])
+                self.b_up_delete.state(["!disabled"])
                 self.refresh_uploads()
                 messagebox.showinfo(APP, f"Импортировано: {done} из {len(ids)}."
                     + ("\n\nОшибки:\n" + "\n".join(failures[:12]) if failures else "")
@@ -1510,6 +1795,8 @@ class App:
         if not self._restore_startup_checked:
             self._restore_startup_checked = True
             self.bg(self._check_startup_restores)
+            # Получить загрузки сразу после соединения, а не только через 13 сек.
+            self.root.after(350, self.refresh_uploads)
 
     def _check_startup_restores(self) -> None:
         """После первой загрузки проверяем только объявленные сервером и целые копии."""
@@ -1547,10 +1834,11 @@ class App:
             return
         n = len(paths)
         if messagebox.askyesno(
-            APP, f"Сервер сообщил о восстановленных файлах: {n}.\n"
-                 "Копии найдены в Restored, их SHA-256 совпадают с эталоном.\n\n"
-                 "Проверить актуальное разрешение сервера и заменить повреждённые оригиналы?\n"
-                 "Перед заменой оригиналы будут сохранены отдельно."
+            APP, f"При запуске обнаружены восстановленные файлы: {n}.\n"
+                 "Копии находятся в Restored и проверены по SHA-256.\n\n"
+                 "Посмотри вкладку «Удаление» → «Восстановление файлов».\n"
+                 "Применить восстановление сейчас? Перед заменой оригиналы "
+                 "будут сохранены отдельно."
         ):
             self.apply_restores(only_paths=set(paths))
 

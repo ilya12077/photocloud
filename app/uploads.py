@@ -352,10 +352,42 @@ class UploadQueue:
 
     def thumb(self, ident):
         from PIL import Image, ImageOps
+        from .storage import IMAGE_EXT, VIDEO_EXT
         item = self.get(ident)
         if not item:
             return b""
-        if Path(item["name"]).suffix.lower() not in (".jpg",".jpeg",".png",".webp",".gif",".bmp",".tif",".tiff",".heic",".heif"):
+        ext = Path(item["name"]).suffix.lower()
+        if ext in VIDEO_EXT:
+            # Превью видеозаписи из первых 4 МиБ. Нет полного файла
+            # или временного ролика на серверном диске; FFmpeg читает pipe.
+            from .video import DEMUXER, find_ffmpeg
+            import subprocess
+            ffmpeg = find_ffmpeg("")
+            demuxer = DEMUXER.get(ext)
+            if not ffmpeg or not demuxer:
+                return b""
+            try:
+                with self.open_received(ident)[1] as source:
+                    prefix = source.read(min(item["size"], 4 * 1024 * 1024))
+                if len(prefix) < 256:
+                    return b""
+                result = subprocess.run([
+                    ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-protocol_whitelist", "pipe", "-f", demuxer, "-i", "pipe:0",
+                    "-map", "0:v:0", "-frames:v", "1",
+                    "-vf", "scale=340:340:force_original_aspect_ratio=decrease",
+                    "-an", "-sn", "-dn", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+                ], input=prefix, capture_output=True, timeout=15)
+                if result.returncode != 0 or not result.stdout:
+                    return b""
+                with Image.open(io.BytesIO(result.stdout)) as img:
+                    img.thumbnail((380, 380))
+                    output = io.BytesIO()
+                    img.convert("RGB").save(output, "WEBP", quality=72)
+                    return output.getvalue()
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                return b""
+        if ext not in IMAGE_EXT:
             return b""
         size_limit = 24 * 1024 * 1024
         if item["size"] > size_limit:
@@ -377,6 +409,67 @@ class UploadQueue:
                 return buffer.getvalue()
         except (OSError, ValueError):
             return b""
+
+    def discard(self, ident: str, sha: str) -> bool:
+        """Стереть ТОЛЬКО подтверждённую веб-загрузку из Restored.
+
+        Отдельный ID и SHA защищают от устаревшего выбора; имя и путь берём
+        исключительно из проверенного манифеста на ПК, не из запроса клиента.
+        Ни исходные файлы галереи, ни другие копии из Restored не затрагиваем.
+        """
+        import stat
+        self._validate_id(ident)
+        if not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{64}", sha):
+            raise ValueError("некорректная контрольная сумма")
+        with self.mu:
+            item = self.get(ident)
+            if not item or item["state"] != "ready" or item["sha"] != sha:
+                raise ValueError("файл больше не ожидает переноса или версия изменилась")
+            parent, media, _part = self._roots(ident, item["name"])
+            manifest = (parent / "manifest.json" if self.writer.local
+                        else parent + "\\manifest.json")
+            # Проверяем ТЕКУЩИЙ манифест непосредственно на ПК, а не
+            # старый кэш (удаление не допускает доверия к локальному списку).
+            current = self._read_manifest(ident)
+            if not current or current["sha"] != sha or current["name"] != item["name"]:
+                raise ValueError("манифест изменился — обновите список")
+            try:
+                if self.writer.local:
+                    # Не следовать junction/symlink в каталоге отдельной загрузки.
+                    root = self.writer.storage.root.resolve()
+                    base = root / "Restored" / UPLOAD_PREFIX
+                    if (base.is_symlink() or parent.is_symlink()
+                            or (getattr(parent.lstat(), "st_file_attributes", 0) & 0x400)
+                            or parent.resolve() != base.resolve() / ident):
+                        raise ValueError("папка загрузки была перенаправлена")
+                    info = media.lstat()
+                    if (not stat.S_ISREG(info.st_mode) or media.is_symlink()
+                            or getattr(info, "st_file_attributes", 0) & 0x400):
+                        raise ValueError("загруженный файл больше не является обычным файлом")
+                    actual_size = info.st_size
+                else:
+                    info = self.writer._smb.stat(media, **self.writer._kw)
+                    if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                        raise ValueError("загруженный файл больше не является обычным файлом")
+                    actual_size = info.st_size
+                if actual_size != item["size"]:
+                    raise ValueError("файл изменился; удаление заблокировано")
+            except FileNotFoundError:
+                # Не оставить осиротевший манифест, если медиа уже отсутствует.
+                pass
+            else:
+                self._remove(media)          # удаляем только Restored/PhotoCloud-Uploads/{id}/{name}
+            self._remove(manifest)           # после медиа: при сбое возможен безопасный повтор
+            self.received.pop(ident, None)
+            self.last_refresh = 0.0
+            try:
+                if self.writer.local:
+                    parent.rmdir()
+                else:
+                    self.writer._smb.rmdir(parent, **self.writer._kw)
+            except OSError:
+                pass
+            return True
 
     def completed(self, ident, destination):
         with self.mu:

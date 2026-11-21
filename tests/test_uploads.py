@@ -74,6 +74,52 @@ class DirectUploadTests(unittest.TestCase):
         self.assertEqual(restarted.list(), [])
         self.assertFalse((self.pc / "Restored" / UPLOAD_PREFIX / ident / "manifest.json").exists())
 
+    def test_discard_received_upload_removes_only_restored_copy(self):
+        ident, item = self.upload("web.jpg", b"uploaded photo", "Album")
+        original = self.pc / "Album" / "web.jpg"
+        original.parent.mkdir()
+        original.write_bytes(b"KEEP ORIGINAL")
+        folder = self.pc / "Restored" / UPLOAD_PREFIX / ident
+        self.assertTrue((folder / "manifest.json").exists())
+        self.assertTrue(self.queue.discard(ident, item["sha"]))
+        self.assertFalse((folder / "web.jpg").exists())
+        self.assertFalse((folder / "manifest.json").exists())
+        self.assertEqual(original.read_bytes(), b"KEEP ORIGINAL")
+        self.assertEqual(self.queue.list(), [])
+
+    def test_discard_refuses_wrong_sha(self):
+        ident, item = self.upload("web.jpg", b"uploaded photo")
+        with self.assertRaises(ValueError):
+            self.queue.discard(ident, "0" * 64)
+        self.assertIsNotNone(self.queue.get(ident))
+        self.assertTrue((self.pc / "Restored" / UPLOAD_PREFIX / ident / "web.jpg").exists())
+
+    def test_discard_refuses_modified_size_or_symlink(self):
+        ident, item = self.upload("photo.jpg", b"original content")
+        path = self.pc / "Restored" / UPLOAD_PREFIX / ident / "photo.jpg"
+        path.write_bytes(b"changed length")
+        with self.assertRaises(ValueError):
+            self.queue.discard(ident, item["sha"])
+        self.assertTrue(path.exists())
+        path.unlink()
+        external = self.pc / "gallery_original.jpg"
+        external.write_bytes(b"outside")
+        try:
+            path.symlink_to(external)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks not allowed on this machine")
+        with self.assertRaises(ValueError):
+            self.queue.discard(ident, item["sha"])
+        self.assertEqual(external.read_bytes(), b"outside")
+
+    def test_pc_discard_endpoint_rejects_unsigned_users(self):
+        source = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "pc_upload_discard")
+        self.assertIn("Depends(require_pc)", ast.get_source_segment(source, fn))
+        self.assertIn("upload_queue.discard", ast.get_source_segment(source, fn))
+
     def test_offline_writer_rejects_upload_before_bytes(self):
         self.writer.enabled = False
         with self.assertRaises(ConnectionError):
