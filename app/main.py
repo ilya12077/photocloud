@@ -1456,7 +1456,7 @@ async def pc_deleted(request: Request, sess: dict = Depends(require_pc)):
 # У каждого свои: в ленте — одна обложка (первое выбранное), по нажатию группа раскрывается.
 
 @app.post("/api/group", dependencies=[Depends(require_csrf)])
-async def group_photos(request: Request, s: Session = Depends(require_user)):
+async def group_photos(request: Request, s: Session = Depends(require_admin)):
     """ids — по порядку в ленте: первый станет обложкой."""
     ps, _ = await _targets(request, s, with_live=False)
     ps = [p for p in ps if not (p.video and p.live)]
@@ -1476,7 +1476,7 @@ async def group_photos(request: Request, s: Session = Depends(require_user)):
 
 
 @app.post("/api/ungroup", dependencies=[Depends(require_csrf)])
-async def ungroup_photos(request: Request, s: Session = Depends(require_user)):
+async def ungroup_photos(request: Request, s: Session = Depends(require_admin)):
     """Разобрать свои группы, в которые входят эти файлы (целиком)."""
     ps, _ = await _targets(request, s, with_live=False)
     g = mine.groups.get(s.user, {})
@@ -1511,7 +1511,7 @@ async def starred_ids(s: Session = Depends(require_user)):
 
 
 @app.post("/api/star", dependencies=[Depends(require_csrf)])
-async def star_photos(request: Request, s: Session = Depends(require_user)):
+async def star_photos(request: Request, s: Session = Depends(require_admin)):
     ps, d = await _targets(request, s, with_live=False)
     on = d.get("on")
     if not isinstance(on, bool):

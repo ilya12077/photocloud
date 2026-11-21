@@ -311,14 +311,16 @@ async function enter() {
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
   $('menu-hidden').hidden = HID;
-  $('menu-starred').hidden = STARRED || HID;
+  $('menu-starred').hidden = STARRED || HID || me.role !== 'admin';
   $('menu-all').hidden = !HID && !STARRED;
   // «Удалить окончательно» доступно админу в основной галерее и на /hidden.
   // Сервер ставит пометку; физическое удаление делает клиент ПК.
   $('sel-hide').hidden = HID; $('sel-show').hidden = !HID; $('sel-del').hidden = STARRED || !me.can_delete;
-  $('sel-group').hidden = HID;
-  $('sel-star').hidden = HID || STARRED; $('sel-unstar').hidden = !STARRED;
-  $('v-star').hidden = HID;
+  const canCurate = me.role === 'admin';
+  $('sel-group').hidden = HID || !canCurate;
+  $('sel-star').hidden = HID || STARRED || !canCurate;
+  $('sel-unstar').hidden = !STARRED || !canCurate;
+  $('v-star').hidden = HID || !canCurate;
   if (HID || STARRED) {
     document.title = (HID ? 'Скрытые фото — ' : 'Избранное — ') + (me.name || 'Фотоархив');
     // название сайта в шапке ведёт на основную страницу
@@ -1007,7 +1009,7 @@ function selUpdate() {
   for (const id of ['sel-download', 'sel-hide', 'sel-show', 'sel-star', 'sel-unstar', 'sel-del']) $(id).disabled = !SEL.set.size;
   $('sel-group').disabled = selIds().length < 2;
   // «Разгруппировать» — если среди выбранных есть фото из группы
-  $('sel-ungroup').hidden = ![...SEL.set].some((id) => GX.byId.has(id));
+  $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
   for (const h of $('grid').querySelectorAll('.mhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
