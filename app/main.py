@@ -30,6 +30,7 @@ from PIL import Image, UnidentifiedImageError
 
 from . import config
 from .activity import ArchiveScanDebounce
+from .downloads import DownloadTickets, iter_zip_originals
 from . import geo
 from . import logs
 from . import totp
@@ -69,6 +70,7 @@ db.run("CREATE TABLE IF NOT EXISTS archive_events(id TEXT PRIMARY KEY, at REAL, 
 db.run("CREATE INDEX IF NOT EXISTS archive_events_received ON archive_events(received)")
 db.run("CREATE TABLE IF NOT EXISTS backup_deleted(path TEXT PRIMARY KEY, at REAL NOT NULL)")
 archive_scan = ArchiveScanDebounce(quiet_seconds=20, max_wait_seconds=180)   # объединяем события массового удаления
+download_tickets = DownloadTickets(ttl=180)
 pthumbs = ThumbStore(S.data_dir / "thumbs.db")      # эскизы фото 240/400 — отдельный файл
 library = Library(S.tz, S.meta_threads, db)
 FFMPEG = video.find_ffmpeg(S.ffmpeg)
@@ -2192,6 +2194,51 @@ async def original(request: Request, pid: str = PathParam(pattern=ID_RE), s: Ses
         "content-disposition": f"{disp}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(p.name)}",
         "cache-control": "private, max-age=3600",
         "content-security-policy": "default-src 'none'; sandbox",
+    })
+
+
+
+# ---------------------------------------------------------------- скачивание нескольких выбранных оригиналов
+# 1–50: браузер открывает обычные /img/o/{pid}?dl=1.
+# 51+: одноразовый билет выдаётся POST с защитой CSRF, сам ZIP передаётся
+# обычной GET-загрузкой браузера (без удержания всего архива в браузере/ОЗУ).
+
+@app.post("/api/download/prepare", dependencies=[Depends(require_csrf)])
+async def prepare_download(request: Request, s: Session = Depends(require_user)):
+    data = await read_json(request, limit=HIDE_MAX * 12 + 100)
+    ids = data.get("ids")
+    if not isinstance(ids, list) or not 50 < len(ids) <= HIDE_MAX or not all(
+        isinstance(pid, str) and re.fullmatch(ID_RE, pid) for pid in ids
+    ) or len(set(ids)) != len(ids):
+        raise HTTPException(400, "нужно выбрать от 51 до 10000 разных файлов")
+    # Перед выдачей ссылки проверить КАЖДЫЙ файл, не пропускать недоступные
+    # молча: размер архива и безопасность должны соответствовать запросу.
+    files = [library.get(pid) for pid in ids]
+    if any(not visible(s, p) for p in files):
+        raise HTTPException(404, "один из выбранных файлов больше недоступен")
+    ticket = download_tickets.issue(s.user, s.sid, ids)
+    return no_store(JSONResponse({"url": f"/api/download/zip/{ticket}", "count": len(ids)}))
+
+
+@app.get("/api/download/zip/{ticket}")
+async def download_zip(ticket: str = PathParam(pattern=r"^[A-Za-z0-9_-]{32}$"),
+                       s: Session = Depends(require_user)):
+    ids = download_tickets.take(s.user, s.sid, ticket)
+    if ids is None:
+        raise HTTPException(404, "ссылка на архив истекла или уже использована")
+    files = [library.get(pid) for pid in ids]
+    if any(not visible(s, p) for p in files):
+        raise HTTPException(404, "один из выбранных файлов больше недоступен")
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
+    # Синхронный генератор StreamingResponse выполняет чтение SMB в пуле
+    # потоков по одному куску за раз и учитывает backpressure браузера.
+    name = "photocloud-" + time.strftime("%Y%m%d-%H%M%S") + ".zip"
+    return StreamingResponse(iter_zip_originals(files, storage.open),
+                             media_type="application/zip", headers={
+        "content-disposition": f'attachment; filename="{name}"',
+        "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
     })
 
 
