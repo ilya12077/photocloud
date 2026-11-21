@@ -20,6 +20,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from fastapi.responses import FileResponse
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Request
@@ -31,6 +32,7 @@ from PIL import Image, UnidentifiedImageError
 from . import config
 from .activity import ArchiveScanDebounce
 from .downloads import DownloadTickets, iter_zip_originals
+from .uploads import UploadQueue, CHUNK_MAX, UPLOAD_PREFIX, import_path, media_name, destination_folder, thumbnail
 from . import geo
 from . import logs
 from . import totp
@@ -66,6 +68,7 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
+upload_queue = UploadQueue(db, S.data_dir / "incoming-uploads")
 db.run("CREATE TABLE IF NOT EXISTS archive_events(id TEXT PRIMARY KEY, at REAL, kind TEXT, src TEXT, dst TEXT, received REAL)")
 db.run("CREATE INDEX IF NOT EXISTS archive_events_received ON archive_events(received)")
 db.run("CREATE TABLE IF NOT EXISTS backup_deleted(path TEXT PRIMARY KEY, at REAL NOT NULL)")
@@ -222,6 +225,7 @@ async def lifespan(_app):
     log.info("Photocloud %s", config.app_version())
     await run_in_threadpool(library.load_snapshot)     # ПК может быть выключен — показать последний список
     bg(_pc_watch())
+    bg(_upload_stage_loop())
     if FFMPEG:
         log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
     else:
@@ -1299,6 +1303,66 @@ async def pc_changes(request: Request, _: dict = Depends(require_pc)):
     return no_store(JSONResponse({"ok": True}))
 
 
+# ---------------------------------------------------------------- импорт полученных с сайта медиа в архив ПК
+
+@app.get("/api/pc/uploads")
+async def pc_uploads(_: dict = Depends(require_pc)):
+    return no_store(JSONResponse({
+        "items": [x for x in await run_in_threadpool(upload_queue.list, ("ready",))],
+        "folders": sorted(f for f in library._folders if f),
+    }))
+
+
+@app.post("/api/pc/uploads/complete")
+async def pc_upload_complete(request: Request, _: dict = Depends(require_pc)):
+    body = _pc_json(request)
+    ident, destination = body.get("id"), body.get("destination")
+    item = upload_queue.get(ident)
+    if not item:
+        raise HTTPException(404, "загрузка отсутствует")
+    if item["state"] == "done" and item["destination"] == destination:
+        return no_store(JSONResponse({"ok":True,"id":ident,"already":True}))
+    if item["state"] != "ready" or not isinstance(destination, str):
+        raise HTTPException(409, "файл не готов")
+    try:
+        folder, _, filename = destination.rpartition("/")
+        destination_folder(folder)
+        media_name(filename)
+        if Path(filename).suffix.lower() != Path(item["name"]).suffix.lower():
+            raise ValueError("тип файла изменился")
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+    def confirm():
+        # Нельзя доверять одному ACK ПК: читаем получившийся оригинал
+        # из доступной только на чтение шары и сверяем SHA-256.
+        digest = hashlib.sha256()
+        total = 0
+        with storage.open(destination) as f:
+            for part in iter(lambda: f.read(2*1024*1024), b""):
+                total += len(part)
+                if total > item["size"]:
+                    raise ValueError("размер файла после переноса не совпал")
+                digest.update(part)
+        if total != item["size"] or digest.hexdigest() != item["sha"]:
+            raise ValueError("SHA-256 файла после переноса не совпал")
+        if not upload_queue.completed(ident, destination):
+            raise ValueError("состояние загрузки изменилось")
+    try:
+        await on_pc(confirm, timeout=300)
+    except (ValueError, OSError) as e:
+        raise HTTPException(409, str(e)) from None
+    audit("upload_imported", "клиент ПК", ip_of(request), destination)
+    # pc watcher также отправит moved, но не ждём его: форсируем новую версию
+    now = time.time()
+    await run_in_threadpool(db.run,
+        "INSERT OR IGNORE INTO archive_events(id,at,kind,src,dst,received) VALUES(?,?,?,?,?,?)",
+        (secrets.token_hex(16),now,"created","",destination,now))
+    archive_scan.note()
+    _notify("upload_imported", f"Импортировано в фотоархив: {clean(destination, 120)}")
+    return no_store(JSONResponse({"ok":True,"destination":destination}))
+
+
 @app.get("/api/pc/marks")
 async def pc_marks(_: dict = Depends(require_pc)):
     return no_store(JSONResponse({"items": await run_in_threadpool(_pc_marks), "share": S.smb_share,
@@ -1493,6 +1557,130 @@ async def ungroup_photos(request: Request, s: Session = Depends(require_admin)):
     await run_in_threadpool(go)
     audit("ungroup", s.user, ip_of(request), f"групп: {len(gids)}")
     return no_store(JSONResponse({"ok": True, "groups": len(gids)}))
+
+
+# ---------------------------------------------------------------- загрузка фото и видео (только администратор)
+# Браузер присылает части по 4 МиБ; до записи в Restored храним в /data.
+# Пока ПК выключен, не теряем файлы: state=queued ждёт фонового переноса.
+
+@app.get("/api/upload/folders")
+async def upload_folders(_: Session = Depends(require_admin)):
+    return no_store(JSONResponse({"folders": sorted(f for f in library._folders if f),
+                                  "ready": bool(restorer.enabled)}))
+
+
+@app.get("/api/upload/list")
+async def upload_list(_: Session = Depends(require_admin)):
+    return no_store(JSONResponse({"items": await run_in_threadpool(upload_queue.list)}))
+
+
+@app.post("/api/upload/start", dependencies=[Depends(require_csrf)])
+async def upload_start(request: Request, s: Session = Depends(require_admin)):
+    data = await read_json(request, 4096)
+    try:
+        item = await run_in_threadpool(upload_queue.start, s.user, data.get("name"),
+                                       data.get("folder", ""), data.get("size"), data.get("mtime", time.time()))
+    except (ValueError, FileExistsError) as e:
+        raise HTTPException(400, str(e)) from None
+    audit("upload_start", s.user, ip_of(request), item["id"])
+    return no_store(JSONResponse(item))
+
+
+@app.post("/api/upload/{ident}/chunk", dependencies=[Depends(require_csrf)])
+async def upload_chunk(request: Request, ident: str, s: Session = Depends(require_admin)):
+    offset_str = request.headers.get("x-upload-offset", "")
+    if not offset_str.isdecimal():
+        raise HTTPException(400, "нет смещения")
+    if int(offset_str) > 4 * 1024**3:
+        raise HTTPException(400)
+    cl = request.headers.get("content-length")
+    if cl and (not cl.isdecimal() or int(cl) > CHUNK_MAX):
+        raise HTTPException(413, "блок больше 4 МиБ")
+    # Не буферизовать запрос произвольного размера даже без Content-Length.
+    data = bytearray()
+    async for part in request.stream():
+        data.extend(part)
+        if len(data) > CHUNK_MAX:
+            raise HTTPException(413, "блок больше 4 МиБ")
+    try:
+        offset = await run_in_threadpool(upload_queue.chunk, ident, s.user,
+                                          int(offset_str), bytes(data))
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from None
+    return no_store(JSONResponse({"offset":offset}))
+
+
+@app.post("/api/upload/{ident}/finish", dependencies=[Depends(require_csrf)])
+async def upload_finish(ident: str, request: Request, s: Session = Depends(require_admin)):
+    try:
+        item = await run_in_threadpool(upload_queue.finish, ident, s.user)
+    except (ValueError, OSError) as e:
+        raise HTTPException(409, str(e)) from None
+    audit("upload_finished", s.user, ip_of(request), f"{item['name']} -> {item['folder']}")
+    bg(ha.notify("upload_received", f"PhotoCloud: загружен файл «{clean(item['name'], 100)}». "
+                 "Ожидается перенос в фотоархив клиентом ПК.", dedupe_s=5))
+    return no_store(JSONResponse({"ok":True,"id":ident,"state":item["state"]}))
+
+
+@app.post("/api/upload/{ident}/cancel", dependencies=[Depends(require_csrf)])
+async def upload_cancel(ident: str, s: Session = Depends(require_admin)):
+    if not await run_in_threadpool(upload_queue.cancel, ident, s.user):
+        raise HTTPException(409, "в эту очередь нельзя отменить загрузку")
+    return no_store(JSONResponse({"ok":True}))
+
+
+
+@app.get("/api/upload/{ident}/thumb")
+async def upload_thumb(ident: str, _: Session = Depends(require_admin)):
+    item = upload_queue.get(ident)
+    if not item or item["state"] not in ("queued","ready"):
+        raise HTTPException(404)
+    data = await run_in_threadpool(thumbnail, upload_queue.path(ident), item["name"])
+    if not data:
+        raise HTTPException(404)
+    return Response(data, media_type="image/webp",
+                    headers={"cache-control":"private, max-age=300","x-content-type-options":"nosniff"})
+
+
+@app.get("/api/pc/uploads/{ident}/thumb")
+async def pc_upload_thumb(ident: str, _: dict = Depends(require_pc)):
+    item = upload_queue.get(ident)
+    if not item or item["state"] != "ready":
+        raise HTTPException(404)
+    data = await run_in_threadpool(thumbnail, upload_queue.path(ident), item["name"])
+    if not data:
+        raise HTTPException(404)
+    return Response(data, media_type="image/webp", headers={"cache-control":"no-store"})
+
+
+@app.get("/api/upload/{ident}/media")
+async def upload_media(ident: str, _: Session = Depends(require_admin)):
+    item = await run_in_threadpool(upload_queue.get, ident)
+    if not item or item["state"] not in ("queued","ready"):
+        raise HTTPException(404)
+    path = upload_queue.path(ident)
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type=CONTENT_TYPES.get(Path(item["name"]).suffix.lower(),
+                        "application/octet-stream"),
+                        headers={"cache-control":"no-store","x-content-type-options":"nosniff"})
+
+
+async def _upload_stage_loop():
+    """Передавать из долговременного /data в Restored, когда ПК в сети."""
+    await asyncio.sleep(5)
+    while True:
+        try:
+            if restorer.enabled and upload_queue.next_to_stage() and await PC.is_up():
+                item = await on_pc(upload_queue.stage_one, restorer, timeout=300)
+                if item:
+                    log.info("Файл готов к импорту клиентом ПК: %s", item["name"])
+                    _notify("upload_ready", f"Новый файл «{clean(item['name'], 100)}» ждёт переноса на ПК")
+        except (OSError, ConnectionError, TimeoutError) as e:
+            log.info("Ожидание записи загрузки в Restored: %s", e)
+        except Exception:
+            log.exception("ошибка очереди загрузок")
+        await asyncio.sleep(8)
 
 
 # ---------------------------------------------------------------- избранное
