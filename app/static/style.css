@@ -74,13 +74,16 @@ a { color: inherit; text-decoration: none; }
 .banner.bad { background: color-mix(in srgb, var(--err) 14%, var(--bg)); }
 
 /* --- папки --- */
-.folders { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; padding: 14px 16px 4px; }
+/* Компактные карточки папок: примерно 35% от прежнего линейного размера;
+   форма и пропорция изображения 16:10 сохранены. Фиксированная ширина, без растяжения на всю строку. */
+.folders { display: grid; grid-template-columns: repeat(auto-fill, 54px); gap: 4px; padding: 6px 8px 2px; }
 .folder { display: grid; grid-template-rows: auto auto; background: var(--surface); border: 1px solid var(--line);
-  border-radius: 10px; overflow: hidden; cursor: pointer; }
+  border-radius: 4px; overflow: hidden; cursor: pointer; min-width: 0; }
 .folder .cover { aspect-ratio: 16/10; background: var(--tile); background-size: cover; background-position: center; }
 .folder .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.folder .fname { padding: 7px 10px 8px; font-size: 14px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 12px; }
+.folder .fname { padding: 2px 3px 3px; font-size: 9px; line-height: 1.25; font-weight: 550;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 8px; line-height: 1.2; }
 .folder:hover { border-color: var(--dim); }
 .summary { padding: 10px 16px 0; color: var(--dim); font-size: 13px; }
 
@@ -213,7 +216,7 @@ a { color: inherit; text-decoration: none; }
   .row { gap: 8px; padding: 6px 10px; }
   .brand.small .brand-name { display: none; }
   .crumbs { order: 3; flex-basis: 100%; }
-  .folders { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); padding: 10px 10px 2px; gap: 8px; }
+  .folders { grid-template-columns: repeat(auto-fill, 46px); padding: 5px 6px 2px; gap: 4px; }
 }
 
 /* щипок на сетке обрабатываем сами, браузерный зум страницы не нужен */
