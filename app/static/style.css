@@ -93,11 +93,13 @@ a { color: inherit; text-decoration: none; }
 .mhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
 .mhead { height: 46px; padding: 16px 0 0 4px; font-size: 15px; font-weight: 650; }
 .mhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 13px; }
-/* Дата стоит внутри пустой ячейки между соседними днями. */
-.day-spacer { width: 100%; height: 100%; padding: 10px 5px; min-width: 0;
+/* Дата в ячейке: её длинный текст не должен увеличивать высоту строки,
+   особенно на телефоне при большом числе колонок. */
+.day-spacer { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden;
+  padding: clamp(2px, calc(6px * var(--bs, 1)), 6px) clamp(1px, calc(4px * var(--bs, 1)), 4px);
   display: flex; flex-wrap: wrap; align-content: flex-start; align-items: flex-start;
-  gap: 5px; color: var(--fg); font-weight: 600;
-  font-size: clamp(10px, calc(13px * var(--bs, 1)), 13px); line-height: 1.3; }
+  gap: 3px; color: var(--fg); font-weight: 600;
+  font-size: clamp(8px, calc(12px * var(--bs, 1)), 12px); line-height: 1.15; }
 .day-spacer-text { overflow-wrap: anywhere; }
 .day-spacer .mcheck { flex: none; }
 /* Кружки выбора дня и месяца появляются только в режиме выбора. */
@@ -108,7 +110,7 @@ a { color: inherit; text-decoration: none; }
 .selmode .mhead .mcheck:hover, .selmode .day-spacer .mcheck:hover { border-color: var(--accent); }
 .selmode .mhead.sel .mcheck, .selmode .day-spacer.sel .mcheck { background: var(--accent); border-color: var(--accent); }
 .selmode .mhead.sel .mcheck::after, .selmode .day-spacer.sel .mcheck::after { content: "✓"; }
-.trow { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); }
+.trow { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); grid-template-rows: minmax(0, 1fr); }
 .tile { position: relative; background: var(--tile); overflow: hidden; cursor: pointer; border: 0; padding: 0; display: block; width: 100%; height: 100%; }
 .tile img { width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; transition: opacity .15s; }
 .tile img.ok { opacity: 1; }

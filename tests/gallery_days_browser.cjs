@@ -23,9 +23,9 @@ const assert=require('node:assert/strict');
     const dates=rows.flatMap(r=>r.slots||[]).filter(i=>typeof i==='object');
     return {idx, dates:dates.map(d=>[d.start,d.n]), count:st.list.length,
      rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,band:r.band||0})),
-     wrong:[...document.querySelectorAll('.tile')].some(t=>
-      Math.abs(t.getBoundingClientRect().height-L.tileH)>.5 ||
-      Math.abs(t.getBoundingClientRect().width-L.tileH)>.5),
+     wrongTiles:[...document.querySelectorAll('.tile')].map(t=>({i:t.dataset.i,
+       w:t.getBoundingClientRect().width,h:t.getBoundingClientRect().height,
+       expected:L.tileH})).filter(t=>Math.abs(t.w-t.expected)>.5||Math.abs(t.h-t.expected)>.5).slice(0,5),
      narrowDates:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
      datesWithLabels:[...document.querySelectorAll('.day-spacer')].every(g=>!!g.querySelector('.day-spacer-text')?.textContent),
      lingeringBands:document.querySelectorAll('.dhead').length,
@@ -35,7 +35,7 @@ const assert=require('node:assert/strict');
    assert.equal(data.dates.length,7,'every day has a label, including the first');
    assert(!data.lingeringBands,'no extra date rows');
    assert(data.rows.every(r=>!r.band),'no date-band height');
-   assert(!data.wrong,'photos must stay square');assert(!data.narrowDates);
+   assert.equal(data.wrongTiles.length,0,`photos must stay square at ${width}px/${cols} cols: ${JSON.stringify(data.wrongTiles)}`);assert(!data.narrowDates);
    assert(data.datesWithLabels);assert(data.mappings);
    assert(data.rows.slice(0,-1).every(r=>r.used===cols));
    results.push({width,cols,rows:data.rows.length});
