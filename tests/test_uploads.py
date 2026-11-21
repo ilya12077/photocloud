@@ -104,7 +104,7 @@ class PCUploadImportTests(unittest.TestCase):
                                         globals_={"safe_rel":self.safe_rel,
                                                   "restore_path":self.restore_path,
                                                   "restore_digest":self.restore_digest,
-                                                  "os":os, "re":re, "hashlib":hashlib})
+                                                  "os":os, "re":re, "hashlib":hashlib, "Path":Path})
 
     def item(self, payload=b"real photo bytes", name="first.jpg"):
         import uuid
