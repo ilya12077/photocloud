@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.5"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.6"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -642,6 +642,111 @@ def apply_restored(root: Path, item: dict) -> bool:
             stage.unlink(missing_ok=True)
 
 
+
+def import_uploaded(root: Path, item: dict, destination_folder: str = "") -> str:
+    """Без перезаписи импортировать подтверждённую сервером копию из Restored.
+
+    Сначала сверяем хеш источника, копируем в .tmp внутри папки назначения,
+    сверяем хеш получившейся копии и атомарно создаём неперезаписываемый
+    hardlink в конечное имя. Исходник удаляем только после ACK сервера.
+    """
+    import stat
+    import tempfile
+
+    ident = item.get("id", "")
+    if not isinstance(ident, str) or not re.fullmatch("[0-9a-f]{32}", ident):
+        raise ValueError("неверный номер загрузки")
+    name, staged = item.get("name", ""), item.get("staged", "")
+    if not isinstance(name, str) or len(name) > 200 or not isinstance(staged, str):
+        raise ValueError("неверное имя загрузки")
+    parts = safe_rel(staged)
+    if len(parts) != 3 or parts[0] != "PhotoCloud-Uploads" or parts[1] != ident:
+        raise ValueError("копия не в служебной папке загруженных")
+    safe_rel(name)  # имя без слешей или двоеточий
+    digest = item.get("sha", "")
+    size = item.get("size")
+    if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
+        raise ValueError("сервер не прислал SHA-256")
+    if not isinstance(size, int) or size < 1 or size > 4 * 1024**3:
+        raise ValueError("неверный размер")
+
+    src = restore_path(root, staged, restored=True)
+    if src.stat().st_size != size or restore_digest(src) != digest:
+        raise ValueError("файл в Restored не совпадает с серверной копией")
+
+    folder = destination_folder if destination_folder is not None else item.get("folder", "")
+    if not isinstance(folder, str) or len(folder) > 1500:
+        raise ValueError("неверная папка")
+    names = safe_rel(folder) if folder else []
+    if len(names) > 24 or any(part.casefold() in ("restored", ".photocloud", "photocloud-uploads") for part in names):
+        raise ValueError("служебная папка запрещена")
+    base = root.resolve()
+    parent = base
+    for part in names:
+        # Отдельная проверка для будущих путей: точки повторной обработки
+        # и symlink/junction не должны позволять выход из архива.
+        if (part.endswith((".", " ")) or any(ord(c) < 32 for c in part)
+            or any(c in part for c in '<>"|?*')
+            or part.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
+            or re.fullmatch(r"(?i)(COM|LPT)[0-9¹²³](?:\..*)?", part)):
+            raise ValueError("недопустимое имя папки")
+        parent = parent / part
+        parent.mkdir(exist_ok=True)
+        st = parent.lstat()
+        if not stat.S_ISDIR(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
+            raise ValueError("папка — ссылка или точка повторного анализа")
+    if parent.resolve() != base and base not in parent.resolve().parents:
+        raise ValueError("путь вышел за пределы архива")
+    if name.endswith((".", " ")) or any(ord(c) < 32 or c in '<>"|?*' for c in name):
+        raise ValueError("недопустимое имя файла")
+    stem, ext = os.path.splitext(name)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".photocloud-upload-", suffix=".tmp",
+                                         dir=parent, delete=False) as out:
+            temp = Path(out.name)
+            h = hashlib.sha256()
+            copied = 0
+            with src.open("rb") as f:
+                while True:
+                    part = f.read(4 * 1024 * 1024)
+                    if not part:
+                        break
+                    copied += len(part)
+                    if copied > size:
+                        raise ValueError("изменён размер загруженного файла")
+                    out.write(part)
+                    h.update(part)
+            out.flush()
+            os.fsync(out.fileno())
+        if copied != size or h.hexdigest() != digest:
+            raise ValueError("загруженная копия не прошла повторную проверку")
+        os.utime(temp, (item["mtime"], item["mtime"]))
+        for index in range(1, 100):
+            finalname = name if index == 1 else f"{stem} ({index}){ext}"
+            candidate = parent / finalname
+            try:
+                # На NTFS и POSIX link создаёт запись исключительно если её нет.
+                # Это исключает перезапись существующих фото даже при гонке.
+                os.link(temp, candidate)
+                return "/".join(names + [finalname])
+            except FileExistsError:
+                # Если ACK потерялся, при повторе распознаём уже импортированный
+                # файл с совпадающими размером и SHA-256.
+                try:
+                    st = candidate.lstat()
+                    if (stat.S_ISREG(st.st_mode) and not getattr(st, "st_file_attributes", 0) & 0x400
+                            and st.st_size == size and restore_digest(candidate) == digest):
+                        return "/".join(names + [finalname])
+                except OSError:
+                    pass
+        raise FileExistsError("слишком много файлов с одинаковым именем")
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+
 # ======================================================================== обновление с GitHub
 # Как у клиента бэкапа: последний коммит master, оттуда pc/photocloud_pc.pyw; если VERSION новее —
 # файл проверяется (компилируется), подменяет этот, программа перезапускается.
@@ -784,6 +889,10 @@ class App:
         self.busy, self.stop = False, False              # идёт удаление; просили остановить
         self._sorted_checks_gen = -1                     # проблемные файлы наверх после проверки всех
         self._restore_startup_checked = False           # проверка восстановленных копий один раз при запуске
+        self.upload_items = []
+        self.upload_by_id = {}
+        self._uploads_known = None
+        self._up_refreshing = False
         self._build()
         h = _UiLog(self)
         log.addHandler(h)
@@ -792,6 +901,7 @@ class App:
         self._watch_worker = None
         self._watch_scope = None
         self.root.after(1000, self._start_watch)
+        self.root.after(13000, self._poll_uploads)
 
     def _start_watch(self):
         if self.api and self.cfg.client_id and self.cfg.root and Path(self.cfg.root).is_dir():
@@ -808,6 +918,11 @@ class App:
         main = ttk.Frame(self.nb)
         self.nb.add(main, text="Удаление")
         self._build_main(main)
+        uploads = ttk.Frame(self.nb)
+        self.upload_tab = uploads
+        self.nb.add(uploads, text="Загруженные")
+        self._build_uploads(uploads)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_pc_tab_changed)
         lg = ttk.Frame(self.nb)
         self.nb.add(lg, text="Журнал")
         self._build_log(lg)
@@ -815,6 +930,205 @@ class App:
         self.nb.add(st, text="Настройки")
         self._build_settings(st)
         self._buttons(False)
+
+    # ---- новые файлы, загруженные администратором через браузер
+
+    def _build_uploads(self, tab) -> None:
+        actions = ttk.Frame(tab, padding=12)
+        actions.pack(fill="x")
+        self.b_up_refresh = ttk.Button(actions, text="Обновить", command=self.refresh_uploads)
+        self.b_up_refresh.pack(side="left")
+        ttk.Button(actions, text="Выделить все", command=self._up_select_all).pack(side="left", padx=8)
+        self.b_up_move = ttk.Button(actions, text="Перенести выбранные в фотоархив", command=self._up_move)
+        self.b_up_move.pack(side="left")
+        self.up_status = ttk.Label(tab, text="Новые загрузки появятся здесь автоматически",
+                                   padding=(12, 3, 12, 10))
+        self.up_status.pack(fill="x")
+        choices = ttk.Frame(tab, padding=(12, 0, 12, 8))
+        choices.pack(fill="x")
+        ttk.Label(choices, text="Папка для выбранных:").pack(side="left")
+        self.up_folder = tk.StringVar(value="")
+        self.up_folder_box = ttk.Combobox(choices, textvariable=self.up_folder, width=54)
+        self.up_folder_box.pack(side="left", padx=8, fill="x", expand=True)
+        ttk.Button(choices, text="Новая папка", command=self._up_new_folder).pack(side="left")
+        ttk.Label(tab, text="Папку можно изменить для одного файла или для всей выделенной группы.",
+                  padding=(12, 0, 12, 5), foreground="#777").pack(fill="x")
+
+        wrap = ttk.Frame(tab)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        columns = ("name", "folder", "size", "sender")
+        self.up_tree = ttk.Treeview(wrap, columns=columns, show="headings",
+                                    selectmode="extended")
+        for key, title, width in (("name","Файл",280),("folder","Целевая папка",290),
+                                   ("size","Размер",95),("sender","Загрузил",110)):
+            self.up_tree.heading(key, text=title)
+            self.up_tree.column(key, width=width, stretch=key in ("name","folder"))
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.up_tree.yview)
+        self.up_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.up_tree.pack(side="left", fill="both", expand=True)
+        self.up_tree.bind("<<TreeviewSelect>>", self._up_selection_changed)
+
+        preview = ttk.Frame(tab, padding=(12, 0, 12, 12))
+        preview.pack(fill="x")
+        self.up_preview = ttk.Label(preview, text="Выбери файл для предпросмотра",
+                                    width=34, anchor="center")
+        self.up_preview.pack(side="left")
+        self._up_preview_img = None
+        self.up_details = ttk.Label(preview, text="", wraplength=700)
+        self.up_details.pack(side="left", fill="x", expand=True, padx=12)
+
+    def _on_pc_tab_changed(self, _event=None) -> None:
+        if self.nb.select() == str(self.upload_tab):
+            self.refresh_uploads()
+
+    def _poll_uploads(self) -> None:
+        try:
+            if self.api and self.cfg.client_id and not self.busy:
+                self.refresh_uploads()
+        finally:
+            self.root.after(30000, self._poll_uploads)
+
+    def refresh_uploads(self) -> None:
+        if self._up_refreshing or not self.api or not self.cfg.client_id:
+            return
+        self._up_refreshing = True
+        def worker():
+            items, folders, error = [], [], ""
+            try:
+                r = self.api.call("GET", "/api/pc/uploads")
+                if r.status_code != 200:
+                    raise ServerError(_err(r))
+                d = r.json()
+                items, folders = d.get("items", []), d.get("folders", [])
+            except Exception as exc:
+                error = str(exc)
+                log.warning("очередь загрузок: %s", error)
+            self.ui(lambda: self._up_show(items, folders, error))
+        threading.Thread(target=worker, name="upload-poll", daemon=True).start()
+
+    def _up_show(self, items, folders, error: str = "") -> None:
+        self._up_refreshing = False
+        if error:
+            self.up_status.configure(text="Не удалось получить очередь: " + error)
+            return
+        old_selected = set(self.up_tree.selection())
+        self.upload_items = items
+        self.upload_by_id = {item["id"]: item for item in items}
+        present = set(self.upload_by_id)
+        if self._uploads_known is not None and present - self._uploads_known:
+            self.root.bell()
+        self._uploads_known = present
+        self.nb.tab(self.upload_tab, text=f"Загруженные ({len(items)})" if items else "Загруженные")
+        self.up_tree.delete(*self.up_tree.get_children())
+        self.up_folder_box["values"] = ["⟪Корень архива⟫"] + folders
+        for item in items:
+            self.up_tree.insert("", "end", iid=item["id"], values=(
+                item["name"], item["folder"] or "Корень архива",
+                human(item["size"]), item["user"]))
+        self.up_tree.selection_set([ident for ident in old_selected if ident in present])
+        self.up_status.configure(text=f"Ожидают переноса: {len(items)} файл(ов). "
+                              "Файлы уже находятся в Restored; выбирай их и папку назначения.")
+
+    def _up_select_all(self):
+        self.up_tree.selection_set(self.up_tree.get_children())
+
+    def _up_selection_changed(self, _event=None):
+        picked = [self.upload_by_id[k] for k in self.up_tree.selection() if k in self.upload_by_id]
+        if not picked:
+            self.up_details.configure(text="")
+            self.up_preview.configure(image="", text="Выбери файл для предпросмотра")
+            self._up_preview_img = None
+            return
+        folders = {item["folder"] for item in picked}
+        self.up_folder.set(next(iter(folders)) if len(folders) == 1 else "")
+        item = picked[0]
+        self.up_details.configure(text=f"{item['name']}\nЗагружено: {item['user']}\n"
+                                       f"Папка: {item['folder'] or 'корень'}\n"
+                                       f"Выделено: {len(picked)}")
+        self.up_preview.configure(image="", text="Загружаю превью…")
+        self._up_preview_img = None
+        def worker():
+            try:
+                r = self.api.call("GET", f"/api/pc/uploads/{item['id']}/thumb")
+                raw = r.content if r.status_code == 200 else b""
+            except Exception:
+                raw = b""
+            def show():
+                if item["id"] not in self.up_tree.selection(): return
+                if not raw:
+                    self.up_preview.configure(text="Видео или нет превью")
+                    return
+                try:
+                    img = Image.open(io.BytesIO(raw))
+                    img.thumbnail((200, 130))
+                    self._up_preview_img = ImageTk.PhotoImage(img)
+                    self.up_preview.configure(image=self._up_preview_img, text="")
+                except Exception:
+                    self.up_preview.configure(text="Превью недоступно")
+            self.ui(show)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _up_new_folder(self):
+        parent = self.up_folder.get().strip()
+        if parent == "⟪Корень архива⟫": parent = ""
+        name = ask_text(self.root, APP, "Название новой папки (внутри выбранной):")
+        if not name: return
+        try:
+            safe_rel(name)
+            if "/" in name or "\\" in name or name.endswith((".", " ")):
+                raise ValueError("недопустимое имя")
+        except ValueError:
+            messagebox.showerror(APP, "Имя содержит недопустимые символы")
+            return
+        self.up_folder.set((parent + "/" if parent else "") + name)
+
+    def _up_move(self) -> None:
+        ids = list(self.up_tree.selection())
+        if self.busy or not ids:
+            messagebox.showinfo(APP, "Выдели фотографии или видео для переноса.")
+            return
+        folder = self.up_folder.get().strip()
+        override = None if not folder else ("" if folder == "⟪Корень архива⟫" else folder)
+        if not messagebox.askyesno(APP,
+            f"Перенести {len(ids)} файл(ов) в фотоархив?\n"
+            + (f"Общая папка: {override or 'корень'}" if override is not None
+               else "Для каждого файла: выбранная при загрузке папка")
+            + "\n\nСуществующие файлы не будут заменены."):
+            return
+        self.busy = True
+        self.b_up_move.state(["disabled"])
+        def go():
+            done, failures = 0, []
+            for ident in ids:
+                item = self.upload_by_id.get(ident)
+                if not item: continue
+                foldername = item["folder"] if override is None else override
+                try:
+                    dst = import_uploaded(Path(self.cfg.root), item, foldername)
+                    r = self.api.call("POST", "/api/pc/uploads/complete",
+                                      {"id":item["id"],"destination":dst})
+                    if r.status_code != 200:
+                        raise ServerError(_err(r))
+                    # Только после подтверждения сервера удаляем копию из Restored.
+                    src = restore_path(Path(self.cfg.root), item["staged"], restored=True)
+                    src.unlink(missing_ok=True)
+                    try: src.parent.rmdir()
+                    except OSError: pass
+                    done += 1
+                except Exception as exc:
+                    log.exception("импорт загрузки %s", item["name"])
+                    failures.append(f"{item['name']}: {exc}")
+            def finish():
+                self.busy = False
+                self.b_up_move.state(["!disabled"])
+                self.refresh_uploads()
+                messagebox.showinfo(APP, f"Импортировано: {done} из {len(ids)}."
+                    + ("\n\nОшибки:\n" + "\n".join(failures[:12]) if failures else "")
+                    + "\n\nПосле переноса сервер автоматически обновит индекс.")
+            self.ui(finish)
+        self.bg(go)
+
 
     def _build_main(self, main) -> None:
         top = ttk.Frame(main, padding=(12, 8, 12, 4))

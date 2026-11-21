@@ -310,6 +310,7 @@ async function enter() {
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
+  $('up-button').hidden = me.role !== 'admin';
   $('menu-hidden').hidden = HID;
   $('menu-starred').hidden = STARRED || HID || me.role !== 'admin';
   $('menu-all').hidden = !HID && !STARRED;
@@ -339,6 +340,199 @@ async function enter() {
     catch (e) { if (e.message === 'auth') throw e; }
   }
 }
+
+// ---------------------------------------------------------------- загрузка новых фото/видео в Restored через очередь ПК
+const UP = { files: [], busy: false, abort: null, activeId: null, depth: 0, done: 0 };
+const UP_EXT = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif',
+  'mp4','mov','m4v','3gp','webm','mts','m2ts','avi','mpg','mpeg','vob']);
+const upMedia = file => UP_EXT.has(file.name.split('.').pop().toLowerCase());
+function upSafeName(name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= 200
+    && !/[\\/:*?"<>|\u0000-\u001f]/.test(name) && !/[. ]$/.test(name);
+}
+function upPrepare(files) {
+  if (!st.me || st.me.role !== 'admin') return;
+  const picked = Array.from(files || []).filter(file => upMedia(file) && upSafeName(file.name)
+    && file.size > 0 && file.size <= 4 * 1024 ** 3);
+  UP.files = picked;
+  $('up-selected').replaceChildren(...picked.slice(0, 60).map(file => {
+    const p = el('p'); p.textContent = file.name + ' · ' + (file.size / 1048576).toFixed(1) + ' МиБ'; return p;
+  }));
+  if (picked.length > 60) $('up-selected').append(el('p', null, '… ещё ' + (picked.length - 60)));
+  $('up-submit').disabled = !picked.length || UP.busy;
+  $('up-submit').textContent = picked.length ? 'Загрузить ' + picked.length : 'Загрузить';
+  $('up-status').textContent = picked.length !== (files || []).length
+    ? 'Часть файлов пропущена: неподдерживаемый формат, пустой файл или размер более 4 ГиБ.' : '';
+}
+async function upLoadFolders() {
+  try {
+    const r = await api('/api/upload/folders');
+    if (!r.ok) return;
+    const data = await r.json();
+    $('up-folder-list').replaceChildren(...data.folders.map(name => {
+      const item = el('option'); item.value = name; return item;
+    }));
+  } catch (_) {}
+}
+async function upLoadPending() {
+  if ($('up-modal').hidden) return;
+  try {
+    const r = await api('/api/upload/list');
+    if (!r.ok) return;
+    const data = await r.json();
+    const container = $('up-pending');
+    container.replaceChildren();
+    const items = data.items || [];
+    if (!items.length) { container.append(el('small', null, 'Новых загрузок пока нет.')); return; }
+    for (const item of items.slice(0, 70)) {
+      const row = el('div', 'up-pending-item');
+      const image = el('img'); image.alt = ''; image.loading = 'lazy';
+      image.src = '/api/upload/' + encodeURIComponent(item.id) + '/thumb';
+      image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
+      const details = el('div');
+      const status = item.state === 'queued' ? 'Ожидает включения ПК и записи в Restored' :
+        'Ожидает переноса клиентом ПК';
+      details.append(el('strong', null, item.name), el('small', null,
+        (item.folder || 'Корень') + ' · ' + status));
+      row.append(image, details);
+      container.append(row);
+    }
+    if (items.length > 70) container.append(el('small', null, 'Показаны первые 70 из ' + items.length));
+  } catch (_) {}
+}
+function upOpen(files) {
+  if (!st.me || st.me.role !== 'admin') return;
+  $('up-modal').hidden = false;
+  $('up-folder').value = st.folder || '';
+  if (files) upPrepare(files);
+  upLoadFolders();
+  upLoadPending();
+}
+function upClose() {
+  if (UP.busy) { if (!confirm('Остановить отправку файлов?')) return; UP.abort?.abort(); return; }
+  $('up-modal').hidden = true;
+}
+$('up-button').addEventListener('click', () => upOpen());
+$('up-close').addEventListener('click', upClose);
+$('up-modal').addEventListener('click', event => {
+  if (event.target === $('up-modal')) upClose();
+});
+$('up-files').addEventListener('change', event => upPrepare(event.target.files));
+$('up-refresh').addEventListener('click', upLoadPending);
+$('up-new-folder').addEventListener('click', () => {
+  const name = prompt('Название новой папки внутри выбранной:');
+  if (!name) return;
+  if (!upSafeName(name) || ['Restored','.photocloud','PhotoCloud-Uploads'].includes(name)) {
+    $('up-status').textContent = 'Недопустимое имя папки'; return;
+  }
+  const parent = $('up-folder').value.trim().replace(/\/+$/, '');
+  $('up-folder').value = (parent ? parent + '/' : '') + name;
+  $('up-status').textContent = 'Папка будет создана клиентом ПК при переносе.';
+});
+async function upPostJSON(path, body, signal) {
+  const response = await fetch(path, { method: 'POST', credentials: 'same-origin', signal,
+    headers: {'Content-Type':'application/json','X-Requested-With':'photocloud'},
+    body: JSON.stringify(body || {}) });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(json.detail || json.error || 'Ошибка сервера: ' + response.status);
+  return json;
+}
+async function upSendOne(file, folder, signal, onProgress) {
+  const task = await upPostJSON('/api/upload/start', {
+    name: file.name, folder, size: file.size, mtime: Math.floor(file.lastModified / 1000) || Date.now() / 1000
+  }, signal);
+  UP.activeId = task.id;
+  const max = 2 * 1024 * 1024;
+  try {
+    let sent = 0;
+    while (sent < file.size) {
+      const bytes = file.slice(sent, sent + max);
+      const response = await fetch('/api/upload/' + task.id + '/chunk', { method:'POST',
+        credentials:'same-origin', signal,
+        headers: {'X-Requested-With':'photocloud','X-Upload-Offset':String(sent),
+                  'Content-Type':'application/octet-stream'},
+        body: bytes });
+      if (!response.ok) {
+        const j = await response.json().catch(() => ({}));
+        throw new Error(j.detail || j.error || 'Ошибка передачи: ' + response.status);
+      }
+      sent += bytes.size;
+      onProgress(sent / file.size);
+    }
+    await upPostJSON('/api/upload/' + task.id + '/finish', {}, signal);
+  } catch (error) {
+    await upPostJSON('/api/upload/' + task.id + '/cancel', {}).catch(() => {});
+    throw error;
+  } finally {
+    UP.activeId = null;
+  }
+}
+$('up-submit').addEventListener('click', async () => {
+  if (!UP.files.length || UP.busy) return;
+  const folder = $('up-folder').value.trim().replace(/\/+$/, '');
+  if (folder && (!folder.split('/').every(upSafeName) || folder.split('/').some(
+      x => ['restored','.photocloud','photocloud-uploads'].includes(x.toLowerCase())))) {
+    $('up-status').textContent = 'Недопустимый путь папки'; return;
+  }
+  const files = [...UP.files], ctrl = new AbortController();
+  UP.busy = true; UP.abort = ctrl; UP.done = 0;
+  $('up-submit').disabled = true;
+  $('up-cancel').hidden = false;
+  $('up-progress-wrap').hidden = false;
+  const total = files.reduce((acc, f) => acc + f.size, 0);
+  let finished = 0, errors = [];
+  for (let i = 0; i < files.length; i++) {
+    if (ctrl.signal.aborted) break;
+    const f = files[i];
+    $('up-status').textContent = 'Передаю ' + (i + 1) + ' из ' + files.length + ': ' + f.name;
+    try {
+      await upSendOne(f, folder, ctrl.signal, progress => {
+        const p = total ? (finished + progress * f.size) / total : 0;
+        $('up-progress').value = p * 100;
+        $('up-progress-caption').textContent = Math.round(p * 100) + '% · ' + f.name;
+      });
+      UP.done++; finished += f.size;
+    } catch (error) {
+      if (ctrl.signal.aborted) break;
+      errors.push(f.name + ': ' + error.message);
+      finished += f.size;
+    }
+  }
+  UP.busy = false; UP.abort = null;
+  $('up-cancel').hidden = true;
+  $('up-submit').disabled = !UP.files.length;
+  $('up-status').textContent = 'Принято файлов: ' + UP.done +
+    (errors.length ? '. Ошибки: ' + errors.slice(0, 3).join(' · ') : '') +
+    (ctrl.signal.aborted ? '. Отправка остановлена.' : '.');
+  $('up-progress').value = 100;
+  UP.files = []; $('up-files').value = '';
+  $('up-selected').replaceChildren();
+  $('up-submit').disabled = true;
+  upLoadPending();
+});
+$('up-cancel').addEventListener('click', () => UP.abort?.abort());
+let upDragDepth = 0;
+function upFileDrag(e) { return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files'); }
+document.addEventListener('dragenter', e => {
+  if (!st.me || st.me.role !== 'admin' || !upFileDrag(e)) return;
+  e.preventDefault();
+  upDragDepth++;
+  $('up-drop').hidden = false;
+});
+document.addEventListener('dragover', e => {
+  if (!st.me || st.me.role !== 'admin' || !upFileDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+document.addEventListener('dragleave', e => {
+  if (!st.me || st.me.role !== 'admin') return;
+  if (--upDragDepth <= 0) { upDragDepth = 0; $('up-drop').hidden = true; }
+});
+document.addEventListener('drop', e => {
+  if (!st.me || st.me.role !== 'admin' || !upFileDrag(e)) return;
+  e.preventDefault(); upDragDepth = 0; $('up-drop').hidden = true;
+  if (e.dataTransfer.files.length) upOpen(e.dataTransfer.files);
+});
 
 // ================================================================== меню / настройки клиента
 
