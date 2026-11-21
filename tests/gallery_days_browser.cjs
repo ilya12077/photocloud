@@ -19,22 +19,24 @@ const assert=require('node:assert/strict');
    await page.evaluate(cols=>{Z.cols=cols;relayout(false)},cols);
    const data=await page.evaluate(()=>{
     const rows=L.rows.filter(r=>!r.h);
-    const idx=rows.flatMap(r=>r.slots||Array.from({length:r.end-r.start},(_,i)=>r.start+i)).filter(i=>i!==null);
-    const gaps=rows.flatMap(r=>r.slots||[]).filter(i=>i===null).length;
-    return {idx, gaps, count:st.list.length, labels:rows.flatMap(r=>r.labels||[]).map(x=>[x.start,x.n]),
-     rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,labels:(r.labels||[]).length,band:r.band})),
-     overlaps:[...document.querySelectorAll('.dhead')].some(h=>{
-      const tile=h.parentElement.querySelector('.tile'),a=h.getBoundingClientRect(),b=tile.getBoundingClientRect();return a.bottom>b.top+.5;
-     }), wrong:[...document.querySelectorAll('.tile')].some(t=>
+    const idx=rows.flatMap(r=>r.slots||Array.from({length:r.end-r.start},(_,i)=>r.start+i)).filter(i=>typeof i==='number');
+    const dates=rows.flatMap(r=>r.slots||[]).filter(i=>typeof i==='object');
+    return {idx, dates:dates.map(d=>[d.start,d.n]), count:st.list.length,
+     rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,band:r.band||0})),
+     wrong:[...document.querySelectorAll('.tile')].some(t=>
       Math.abs(t.getBoundingClientRect().height-L.tileH)>.5 ||
       Math.abs(t.getBoundingClientRect().width-L.tileH)>.5),
-     narrowGaps:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
+     narrowDates:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
+     datesWithLabels:[...document.querySelectorAll('.day-spacer')].every(g=>!!g.querySelector('.day-spacer-text')?.textContent),
+     lingeringBands:document.querySelectorAll('.dhead').length,
      mappings:idx.every(i=>{const r=L.rows[rowOfIndex(i)];return !r.h&&r.start<=i&&i<r.end})};
    });
-   assert.deepEqual(data.idx,Array.from({length:78},(_,i)=>i));assert.equal(data.labels.length,7);
-   assert.equal(data.gaps,6,'one full-size gap per day boundary');
-   assert(!data.overlaps);assert(!data.wrong,'photos must stay square');assert(!data.narrowGaps);
-   assert(data.mappings);
+   assert.deepEqual(data.idx,Array.from({length:78},(_,i)=>i));
+   assert.equal(data.dates.length,7,'every day has a label, including the first');
+   assert(!data.lingeringBands,'no extra date rows');
+   assert(data.rows.every(r=>!r.band),'no date-band height');
+   assert(!data.wrong,'photos must stay square');assert(!data.narrowDates);
+   assert(data.datesWithLabels);assert(data.mappings);
    assert(data.rows.slice(0,-1).every(r=>r.used===cols));
    results.push({width,cols,rows:data.rows.length});
   }
@@ -42,10 +44,10 @@ const assert=require('node:assert/strict');
  await page.setViewportSize({width:1100,height:850});await page.evaluate(()=>{Z.cols=5;relayout(false)});
  await page.waitForTimeout(1000);await page.screenshot({path:output+'/desktop.png'});
  await page.evaluate(()=>{selStart()});
- await page.locator('.dhead .mcheck').first().click();
+ await page.locator('.day-spacer .mcheck').first().click();
  assert(await page.evaluate(()=>SEL.set.size>0));
  await page.setViewportSize({width:390,height:850});await page.evaluate(()=>{selEnd();Z.cols=3;relayout(false)});
  await page.waitForTimeout(500);await page.screenshot({path:output+'/mobile.png'});
- await page.evaluate(()=>{st.sort='name';relayout(false)});assert.equal(await page.locator('.dhead').count(),0);
+ await page.evaluate(()=>{st.sort='name';relayout(false)});assert.equal(await page.locator('.day-spacer').count(),0);
  assert.equal(errors.length,0,errors.join('\n'));console.log(JSON.stringify(results));await browser.close();
 })().catch(e=>{console.error(e);process.exit(1)});

@@ -1131,7 +1131,8 @@ function layout() {
       end = i + 1;
       while (end < list.length && monthKey(gdate(end)) === month) end++;
       rows.push({ h: true, kind: 'month', month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
-      // Между днями — пустая ячейка шириной в целую плитку, без сжатия фотографий.
+      // Каждая дата расположена в ячейке шириной в плитку, а не над строкой.
+      // Размер соседних квадратных фотографий сохраняется.
       const days = new Map();
       for (let s = i; s < end;) {
         const day = dayKey(gdate(s));
@@ -1144,28 +1145,20 @@ function layout() {
       const flush = (nextIndex) => {
         if (!slots.length) return;
         const cells = slots; slots = [];
-        const photos = cells.filter(v => v !== null);
+        const photos = cells.filter(v => typeof v === 'number');
         const start = photos.length ? photos[0] : nextIndex;
         const last = photos.length ? photos[photos.length - 1] + 1 : nextIndex;
-        const labels = [];
-        for (let col = 0; col < cells.length; col++) {
-          const k = cells[col], label = k === null ? null : days.get(k);
-          if (!label) continue;
-          let span = 0;
-          for (let j = col; j < cells.length && cells[j] !== null && dayKey(gdate(cells[j])) === dayKey(label.dayTs); j++) span++;
-          labels.push({ ...label, col, span });
-        }
-        const band = labels.length ? 30 : 0;
-        rows.push({ h: false, start, end: last, month, slots: cells, labels, band,
-          top: y, height: rowH + band });
-        y += rowH + band;
+        rows.push({ h: false, start, end: last, month, slots: cells,
+          top: y, height: rowH });
+        y += rowH;
       };
       const push = (slot, nextIndex) => {
         slots.push(slot);
         if (slots.length === cols) flush(nextIndex);
       };
       for (let k = i; k < end; k++) {
-        if (k > i && dayKey(gdate(k)) !== dayKey(gdate(k - 1))) push(null, k);
+        // Первый день месяца тоже получает собственную подпись-ячейку.
+        if (days.has(k)) push(days.get(k), k);
         push(k, k + 1);
       }
       flush(end);
@@ -1296,26 +1289,19 @@ function buildRow(r) {
   }
   const row = el('div', 'trow');
   row.style.transform = `translateY(${r.top}px)`;
-  row.style.height = (L.tileH + (r.band || 0)) + 'px';
-  row.style.paddingTop = (r.band || 0) + 'px'; row.style.gap = L.gap + 'px';
-  for (const label of r.labels || []) {
-    const d = el('div', 'dhead');
-    d.dataset.start = label.start; d.dataset.n = label.n;
-    d.style.left = (label.col * (L.tileH + L.gap)) + 'px';
-    d.style.width = (label.span * (L.tileH + L.gap) - L.gap) + 'px';
-    d.title = dayName(label.dayTs);
-    const c = el('button', 'mcheck'); c.type = 'button';
-    c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
-    c.addEventListener('click', e => { e.stopPropagation(); selMonth(label.start, label.n); });
-    d.append(c, el('span', 'dhead-text', dayName(label.dayTs)));
-    if (SEL.on && monthAllSel(label.start, label.n)) d.classList.add('sel');
-    row.append(d);
-  }
+  row.style.height = L.tileH + 'px';
+  row.style.gap = L.gap + 'px';
   const kind = thumbKind();
   for (const slot of r.slots || Array.from({ length: r.end - r.start }, (_, offset) => r.start + offset)) {
-    if (slot === null) {
+    if (typeof slot !== 'number') {
       const spacer = el('div', 'day-spacer');
-      spacer.setAttribute('aria-hidden', 'true');
+      spacer.dataset.start = slot.start; spacer.dataset.n = slot.n;
+      spacer.title = dayName(slot.dayTs);
+      const c = el('button', 'mcheck'); c.type = 'button';
+      c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
+      c.addEventListener('click', e => { e.stopPropagation(); selMonth(slot.start, slot.n); });
+      spacer.append(c, el('span', 'day-spacer-text', dayName(slot.dayTs)));
+      if (SEL.on && monthAllSel(slot.start, slot.n)) spacer.classList.add('sel');
       row.append(spacer);
       continue;
     }
@@ -1537,7 +1523,7 @@ function selUpdate() {
   $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
-  for (const h of $('grid').querySelectorAll('.mhead, .dhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
+  for (const h of $('grid').querySelectorAll('.mhead, .day-spacer')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {

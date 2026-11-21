@@ -93,21 +93,22 @@ a { color: inherit; text-decoration: none; }
 .mhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
 .mhead { height: 46px; padding: 16px 0 0 4px; font-size: 15px; font-weight: 650; }
 .mhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 13px; }
-/* Даты занимают только короткую полосу над снимками, а не место плитки. */
-.dhead { position: absolute; top: 0; height: 30px; display: flex; align-items: center;
-  min-width: 0; padding: 0 3px; font-size: 12px; font-weight: 600; color: var(--fg); }
-.dhead-text { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.dhead .mcheck { flex-shrink: 0; }
-/* кружок «весь месяц» — только в режиме выбора, как у плиток */
-.mhead .mcheck, .dhead .mcheck { display: none; }
-.selmode .mhead .mcheck, .selmode .dhead .mcheck { display: inline-grid; place-items: center; width: 22px; height: 22px; margin: 0 8px 0 0; padding: 0;
+/* Дата стоит внутри пустой ячейки между соседними днями. */
+.day-spacer { width: 100%; height: 100%; padding: 10px 5px; min-width: 0;
+  display: flex; flex-wrap: wrap; align-content: flex-start; align-items: flex-start;
+  gap: 5px; color: var(--fg); font-weight: 600;
+  font-size: clamp(10px, calc(13px * var(--bs, 1)), 13px); line-height: 1.3; }
+.day-spacer-text { overflow-wrap: anywhere; }
+.day-spacer .mcheck { flex: none; }
+/* Кружки выбора дня и месяца появляются только в режиме выбора. */
+.mhead .mcheck, .day-spacer .mcheck { display: none; }
+.selmode .mhead .mcheck, .selmode .day-spacer .mcheck { display: inline-grid; place-items: center; width: 22px; height: 22px; margin: 0 8px 0 0; padding: 0;
   vertical-align: 0; border-radius: 50%; border: 2px solid var(--dim); background: none; cursor: pointer;
   color: var(--accent-fg); font-size: 13px; font-weight: 700; line-height: 1; }
-.selmode .mhead .mcheck:hover, .selmode .dhead .mcheck:hover { border-color: var(--accent); }
-.selmode .mhead.sel .mcheck, .selmode .dhead.sel .mcheck { background: var(--accent); border-color: var(--accent); }
-.selmode .mhead.sel .mcheck::after, .selmode .dhead.sel .mcheck::after { content: "✓"; }
+.selmode .mhead .mcheck:hover, .selmode .day-spacer .mcheck:hover { border-color: var(--accent); }
+.selmode .mhead.sel .mcheck, .selmode .day-spacer.sel .mcheck { background: var(--accent); border-color: var(--accent); }
+.selmode .mhead.sel .mcheck::after, .selmode .day-spacer.sel .mcheck::after { content: "✓"; }
 .trow { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); }
-.day-spacer { width: 100%; height: 100%; pointer-events: none; }
 .tile { position: relative; background: var(--tile); overflow: hidden; cursor: pointer; border: 0; padding: 0; display: block; width: 100%; height: 100%; }
 .tile img { width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; transition: opacity .15s; }
 .tile img.ok { opacity: 1; }
