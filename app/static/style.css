@@ -74,16 +74,16 @@ a { color: inherit; text-decoration: none; }
 .banner.bad { background: color-mix(in srgb, var(--err) 14%, var(--bg)); }
 
 /* --- папки --- */
-/* Карточки папок дополнительно увеличены на 20% (65 → 78 px);
-   форма и пропорция изображения 16:10 сохранены. Фиксированная ширина, без растяжения на всю строку. */
-.folders { display: grid; grid-template-columns: repeat(auto-fill, 78px); gap: 6px; padding: 7px 9px 3px; }
+/* Папки увеличены ещё на 20%: 78 → 94 px на компьютере и 55 → 66 px на телефоне.
+   Пропорции обложек 16:10 и фиксированные колонки сохранены. */
+.folders { display: grid; grid-template-columns: repeat(auto-fill, 94px); gap: 7px; padding: 7px 9px 3px; }
 .folder { display: grid; grid-template-rows: auto auto; background: var(--surface); border: 1px solid var(--line);
   border-radius: 4px; overflow: hidden; cursor: pointer; min-width: 0; }
 .folder .cover { aspect-ratio: 16/10; background: var(--tile); background-size: cover; background-position: center; }
 .folder .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.folder .fname { padding: 4px 5px 5px; font-size: 13px; line-height: 1.25; font-weight: 550;
+.folder .fname { padding: 5px 6px 6px; font-size: 15px; line-height: 1.25; font-weight: 550;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 12px; line-height: 1.2; }
+.folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 14px; line-height: 1.2; }
 .folder:hover { border-color: var(--dim); }
 .summary { padding: 10px 16px 0; color: var(--dim); font-size: 13px; }
 
@@ -223,13 +223,11 @@ a { color: inherit; text-decoration: none; }
   .row { gap: 8px; padding: 6px 10px; }
   .brand.small .brand-name { display: none; }
   .crumbs { order: 3; flex-basis: 100%; }
-  .folders { grid-template-columns: repeat(auto-fill, 55px); padding: 6px 7px 2px; gap: 5px; }
+  .folders { grid-template-columns: repeat(auto-fill, 66px); padding: 6px 7px 2px; gap: 6px; }
 }
 
 /* щипок на сетке обрабатываем сами, браузерный зум страницы не нужен */
 #main { touch-action: pan-x pan-y; }
-.zoom { display: inline-flex; gap: 4px; }
-@media (hover: none) { .zoom { display: none; } }
 
 /* --- админка --- */
 .adm .tabs { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; flex: 1; }
