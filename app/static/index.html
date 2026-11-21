@@ -158,9 +158,14 @@
 <div id="up-modal" class="up-overlay" role="dialog" aria-modal="true" aria-labelledby="up-title" hidden>
   <section class="up-dialog">
     <header class="up-head">
-      <div><h2 id="up-title">Загрузка фото и видео</h2><small>Только администратор. Файлы отправляются в очередь на ПК.</small></div>
+      <div><h2 id="up-title">Загрузка фото и видео</h2><small>Только администратор. Передача возможна только при включённом ПК.</small></div>
       <button id="up-close" type="button" class="icon" aria-label="Закрыть загрузку">✕</button>
     </header>
+    <div id="up-offline" class="up-offline" hidden role="status">
+      <strong>Компьютер недоступен</strong>
+      <span id="up-offline-text">Включите ПК с фотоархивом, чтобы загрузить файлы.</span>
+      <button id="up-recheck" type="button" class="txt">Проверить ПК</button>
+    </div>
     <label class="up-pick">
       <input id="up-files" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/bmp,image/tiff,image/heic,image/heif,video/mp4,video/quicktime,video/webm,video/x-msvideo,video/mpeg,video/mp2t,.jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff,.heic,.heif,.mp4,.mov,.m4v,.3gp,.webm,.mts,.m2ts,.avi,.mpg,.mpeg,.vob">
       <span>Выбрать файлы</span><small>Можно также перетащить файлы в окно галереи</small>
@@ -184,7 +189,7 @@
       <progress id="up-progress" max="100" value="0"></progress>
       <span id="up-progress-caption"></span>
     </div>
-    <div class="up-pending-head"><h3>Ожидают переноса в архив</h3><button id="up-refresh" class="txt" type="button">Обновить</button></div>
+    <div class="up-pending-head"><h3>Уже получены · ожидают переноса в архив</h3><button id="up-refresh" class="txt" type="button">Обновить</button></div>
     <div id="up-pending" class="up-pending"><small>Загружаю очередь…</small></div>
   </section>
 </div>

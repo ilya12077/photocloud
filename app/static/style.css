@@ -74,16 +74,16 @@ a { color: inherit; text-decoration: none; }
 .banner.bad { background: color-mix(in srgb, var(--err) 14%, var(--bg)); }
 
 /* --- папки --- */
-/* Компактные карточки папок: примерно 35% от прежнего линейного размера;
+/* Компактные карточки папок: размер увеличен на 20% от предыдущего варианта;
    форма и пропорция изображения 16:10 сохранены. Фиксированная ширина, без растяжения на всю строку. */
-.folders { display: grid; grid-template-columns: repeat(auto-fill, 54px); gap: 4px; padding: 6px 8px 2px; }
+.folders { display: grid; grid-template-columns: repeat(auto-fill, 65px); gap: 5px; padding: 7px 9px 3px; }
 .folder { display: grid; grid-template-rows: auto auto; background: var(--surface); border: 1px solid var(--line);
   border-radius: 4px; overflow: hidden; cursor: pointer; min-width: 0; }
 .folder .cover { aspect-ratio: 16/10; background: var(--tile); background-size: cover; background-position: center; }
 .folder .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.folder .fname { padding: 2px 3px 3px; font-size: 9px; line-height: 1.25; font-weight: 550;
+.folder .fname { padding: 3px 4px 4px; font-size: 11px; line-height: 1.25; font-weight: 550;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 8px; line-height: 1.2; }
+.folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 10px; line-height: 1.2; }
 .folder:hover { border-color: var(--dim); }
 .summary { padding: 10px 16px 0; color: var(--dim); font-size: 13px; }
 
@@ -216,7 +216,7 @@ a { color: inherit; text-decoration: none; }
   .row { gap: 8px; padding: 6px 10px; }
   .brand.small .brand-name { display: none; }
   .crumbs { order: 3; flex-basis: 100%; }
-  .folders { grid-template-columns: repeat(auto-fill, 46px); padding: 5px 6px 2px; gap: 4px; }
+  .folders { grid-template-columns: repeat(auto-fill, 55px); padding: 6px 7px 2px; gap: 5px; }
 }
 
 /* щипок на сетке обрабатываем сами, браузерный зум страницы не нужен */
@@ -422,3 +422,11 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
   border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .up-feed-card img { width: 100%; aspect-ratio: 16/10; object-fit: cover; background: var(--tile); }
 .up-feed-card span { font-size: 11px; padding: 4px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Уведомление о недоступности ПК: блокирует отправку, но не просмотр
+   уже записанных в Restored фотографий. */
+.up-offline { display: grid; gap: 8px; padding: 13px; margin-top: 12px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--tile); }
+.up-offline strong { font-size: 15px; }
+.up-offline span { font-size: 13px; color: var(--dim); }
+.up-offline .txt { justify-self: start; }

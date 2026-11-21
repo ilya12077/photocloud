@@ -372,7 +372,8 @@ async function upLoadFeed() {
 $('up-feed-open').addEventListener('click', () => upOpen());
 
 // ---------------------------------------------------------------- загрузка новых фото/видео в Restored через очередь ПК
-const UP = { files: [], busy: false, abort: null, activeId: null, depth: 0, done: 0 };
+const UP = { files: [], busy: false, abort: null, activeId: null, depth: 0, done: 0,
+  available: false, offlineMessage: 'Проверяем доступность компьютера…' };
 const UP_EXT = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif',
   'mp4','mov','m4v','3gp','webm','mts','m2ts','avi','mpg','mpeg','vob']);
 const upMedia = file => UP_EXT.has(file.name.split('.').pop().toLowerCase());
@@ -389,21 +390,43 @@ function upPrepare(files) {
     const p = el('p'); p.textContent = file.name + ' · ' + (file.size / 1048576).toFixed(1) + ' МиБ'; return p;
   }));
   if (picked.length > 60) $('up-selected').append(el('p', null, '… ещё ' + (picked.length - 60)));
-  $('up-submit').disabled = !picked.length || UP.busy;
+  $('up-submit').disabled = !picked.length || UP.busy || !UP.available;
   $('up-submit').textContent = picked.length ? 'Загрузить ' + picked.length : 'Загрузить';
-  $('up-status').textContent = picked.length !== (files || []).length
+  $('up-status').textContent = !UP.available ? UP.offlineMessage :
+    picked.length !== (files || []).length
     ? 'Часть файлов пропущена: неподдерживаемый формат, пустой файл или размер более 4 ГиБ.' : '';
 }
 async function upLoadFolders() {
+  UP.available = false;
+  $('up-submit').disabled = true;
+  $('up-status').textContent = 'Проверяю, включён ли компьютер с фотоархивом…';
   try {
     const r = await api('/api/upload/folders');
-    if (!r.ok) return;
+    if (!r.ok) throw new Error('Не удалось проверить состояние ПК.');
     const data = await r.json();
-    $('up-folder-list').replaceChildren(...data.folders.map(name => {
+    $('up-folder-list').replaceChildren(...(data.folders || []).map(name => {
       const item = el('option'); item.value = name; return item;
     }));
-  } catch (_) {}
+    UP.available = !!data.ready;
+    UP.offlineMessage = data.message ||
+      (UP.available ? '' : 'ПК выключен. Включите компьютер — загрузка недоступна.');
+    $('up-offline').hidden = UP.available;
+    $('up-offline-text').textContent = UP.offlineMessage;
+    $('up-submit').disabled = !UP.available || UP.busy || !UP.files.length;
+    $('up-status').textContent = UP.available
+      ? (UP.files.length ? 'ПК подключён. Файлы готовы к отправке.' : 'ПК подключён. Выберите файлы.')
+      : UP.offlineMessage;
+  } catch (_) {
+    UP.available = false;
+    UP.offlineMessage = 'Не удалось связаться с сервером и проверить ПК. Повторите проверку.';
+    $('up-offline').hidden = false;
+    $('up-offline-text').textContent = UP.offlineMessage;
+    $('up-status').textContent = UP.offlineMessage;
+    $('up-submit').disabled = true;
+  }
+  return UP.available;
 }
+$('up-recheck').addEventListener('click', () => upLoadFolders());
 async function upLoadPending() {
   if ($('up-modal').hidden) return;
   try {
@@ -420,9 +443,7 @@ async function upLoadPending() {
       image.src = '/api/upload/' + encodeURIComponent(item.id) + '/thumb';
       image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
       const details = el('div');
-      const status = item.state === 'queued' ? 'Ожидает включения ПК и записи в Restored' :
-        item.state === 'staging' ? 'Копируется в Restored…' :
-        'Ожидает переноса клиентом ПК';
+      const status = 'Уже записан в Restored · ожидает переноса клиентом ПК';
       details.append(el('strong', null, item.name), el('small', null,
         (item.folder || 'Корень') + ' · ' + status));
       row.append(image, details);
@@ -449,7 +470,7 @@ $('up-modal').addEventListener('click', event => {
   if (event.target === $('up-modal')) upClose();
 });
 $('up-files').addEventListener('change', event => upPrepare(event.target.files));
-$('up-refresh').addEventListener('click', upLoadPending);
+$('up-refresh').addEventListener('click', () => { upLoadPending(); upLoadFolders(); });
 $('up-new-folder').addEventListener('click', () => {
   const name = prompt('Название новой папки внутри выбранной:');
   if (!name) return;
@@ -499,7 +520,8 @@ async function upSendOne(file, folder, signal, onProgress) {
   }
 }
 $('up-submit').addEventListener('click', async () => {
-  if (!UP.files.length || UP.busy) return;
+  if (!UP.files.length || UP.busy || !UP.available) return;
+  if (!await upLoadFolders()) return;
   const folder = $('up-folder').value.trim().replace(/\/+$/, '');
   if (folder && (!folder.split('/').every(upSafeName) || folder.split('/').some(
       x => ['restored','.photocloud','photocloud-uploads'].includes(x.toLowerCase())))) {
@@ -527,6 +549,13 @@ $('up-submit').addEventListener('click', async () => {
       if (ctrl.signal.aborted) break;
       errors.push(f.name + ': ' + error.message);
       finished += f.size;
+      if (/ПК выключ|ПК выключился|Restored не настроена|Restored не настроен|компьютер.*недоступ|не удалось записать файл на ПК/i.test(error.message)) {
+        UP.available = false;
+        UP.offlineMessage = error.message;
+        $('up-offline').hidden = false;
+        $('up-offline-text').textContent = error.message + ' Включите ПК и повторите загрузку.';
+        break;  // остальные файлы не ставим в очередь при выключенном ПК
+      }
     }
   }
   UP.busy = false; UP.abort = null;
@@ -541,6 +570,7 @@ $('up-submit').addEventListener('click', async () => {
   $('up-submit').disabled = true;
   upLoadPending();
   upLoadFeed();
+  upLoadFolders();
 });
 $('up-cancel').addEventListener('click', () => UP.abort?.abort());
 let upDragDepth = 0;

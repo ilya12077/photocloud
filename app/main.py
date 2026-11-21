@@ -32,7 +32,7 @@ from PIL import Image, UnidentifiedImageError
 from . import config
 from .activity import ArchiveScanDebounce
 from .downloads import DownloadTickets, iter_zip_originals
-from .uploads import UploadQueue, CHUNK_MAX, UPLOAD_PREFIX, import_path, media_name, destination_folder, thumbnail
+from .uploads import UploadQueue, CHUNK_MAX, UPLOAD_PREFIX, media_name, destination_folder
 from . import geo
 from . import logs
 from . import totp
@@ -68,7 +68,6 @@ ID_RE = r"^[A-Za-z0-9_-]{8}$"
 
 storage = make_storage(S)
 db = DB(S.data_dir / "photocloud.db")
-upload_queue = UploadQueue(db, S.data_dir / "incoming-uploads")
 db.run("CREATE TABLE IF NOT EXISTS archive_events(id TEXT PRIMARY KEY, at REAL, kind TEXT, src TEXT, dst TEXT, received REAL)")
 db.run("CREATE INDEX IF NOT EXISTS archive_events_received ON archive_events(received)")
 db.run("CREATE TABLE IF NOT EXISTS backup_deleted(path TEXT PRIMARY KEY, at REAL NOT NULL)")
@@ -225,7 +224,6 @@ async def lifespan(_app):
     log.info("Photocloud %s", config.app_version())
     await run_in_threadpool(library.load_snapshot)     # ПК может быть выключен — показать последний список
     bg(_pc_watch())
-    bg(_upload_stage_loop())
     if FFMPEG:
         log.info("ffmpeg: %s · перекодирование видео: %s", FFMPEG, "да" if TRANSCODE else "нет")
     else:
@@ -1308,7 +1306,7 @@ async def pc_changes(request: Request, _: dict = Depends(require_pc)):
 @app.get("/api/pc/uploads")
 async def pc_uploads(_: dict = Depends(require_pc)):
     return no_store(JSONResponse({
-        "items": [x for x in await run_in_threadpool(upload_queue.list, ("ready",))],
+        "items": await run_in_threadpool(upload_queue.list, ("ready",)),
         "folders": sorted(f for f in library._folders if f),
     }))
 
@@ -1317,8 +1315,10 @@ async def pc_uploads(_: dict = Depends(require_pc)):
 async def pc_upload_complete(request: Request, _: dict = Depends(require_pc)):
     body = _pc_json(request)
     ident, destination = body.get("id"), body.get("destination")
-    item = upload_queue.get(ident)
+    item = await run_in_threadpool(upload_queue.get, ident)
     if not item:
+        if isinstance(destination, str) and upload_queue.done.get(ident) == destination:
+            return no_store(JSONResponse({"ok":True,"id":ident,"already":True}))
         raise HTTPException(404, "загрузка отсутствует")
     if item["state"] == "done" and item["destination"] == destination:
         return no_store(JSONResponse({"ok":True,"id":ident,"already":True}))
@@ -1559,35 +1559,51 @@ async def ungroup_photos(request: Request, s: Session = Depends(require_admin)):
     return no_store(JSONResponse({"ok": True, "groups": len(gids)}))
 
 
-# ---------------------------------------------------------------- загрузка фото и видео (только администратор)
-# Браузер присылает части по 4 МиБ; до записи в Restored храним в /data.
-# Пока ПК выключен, не теряем файлы: state=queued ждёт фонового переноса.
+# ---------------------------------------------------------------- прямая загрузка на включённый ПК (только администратор)
+# HTTP → в памяти только 4 МиБ блока → SMB Restored. Никаких медиа в DATA_DIR.
 
 @app.get("/api/upload/folders")
 async def upload_folders(_: Session = Depends(require_admin)):
-    return no_store(JSONResponse({"folders": sorted(f for f in library._folders if f),
-                                  "ready": bool(restorer.enabled)}))
+    online = await PC.is_up()
+    ready = online and bool(restorer.enabled)
+    return no_store(JSONResponse({
+        "folders": sorted(f for f in library._folders if f),
+        "pc_online": online, "ready": ready,
+        "message": ("" if ready else "ПК выключен. Включите компьютер с фотоархивом для загрузки."
+                    if not online else "На сервере не настроена запись в Restored."),
+    }))
 
 
 @app.get("/api/upload/list")
 async def upload_list(_: Session = Depends(require_admin)):
+    if not await PC.is_up():
+        return no_store(JSONResponse({"items": []}))
     return no_store(JSONResponse({"items": await run_in_threadpool(upload_queue.list)}))
 
 
 @app.post("/api/upload/start", dependencies=[Depends(require_csrf)])
 async def upload_start(request: Request, s: Session = Depends(require_admin)):
+    if not await PC.is_up():
+        raise HTTPException(409, "ПК выключен. Включите компьютер — загрузка недоступна.")
+    if not restorer.enabled:
+        raise HTTPException(409, "На сервере не настроена запись в Restored.")
     data = await read_json(request, 4096)
     try:
         item = await run_in_threadpool(upload_queue.start, s.user, data.get("name"),
                                        data.get("folder", ""), data.get("size"), data.get("mtime", time.time()))
     except (ValueError, FileExistsError) as e:
         raise HTTPException(400, str(e)) from None
+    except (OSError, ConnectionError, TimeoutError) as e:
+        raise HTTPException(503, f"ПК недоступен: {e}") from None
     audit("upload_start", s.user, ip_of(request), item["id"])
     return no_store(JSONResponse(item))
 
 
 @app.post("/api/upload/{ident}/chunk", dependencies=[Depends(require_csrf)])
 async def upload_chunk(request: Request, ident: str, s: Session = Depends(require_admin)):
+    if not await PC.is_up():
+        await run_in_threadpool(upload_queue.cancel, ident, s.user)
+        raise HTTPException(409, "ПК выключился. Загрузка прервана: включите его и начните заново.")
     offset_str = request.headers.get("x-upload-offset", "")
     if not offset_str.isdecimal():
         raise HTTPException(400, "нет смещения")
@@ -1596,7 +1612,6 @@ async def upload_chunk(request: Request, ident: str, s: Session = Depends(requir
     cl = request.headers.get("content-length")
     if cl and (not cl.isdecimal() or int(cl) > CHUNK_MAX):
         raise HTTPException(413, "блок больше 4 МиБ")
-    # Не буферизовать запрос произвольного размера даже без Content-Length.
     data = bytearray()
     async for part in request.stream():
         data.extend(part)
@@ -1607,35 +1622,41 @@ async def upload_chunk(request: Request, ident: str, s: Session = Depends(requir
                                           int(offset_str), bytes(data))
     except ValueError as e:
         raise HTTPException(409, str(e)) from None
-    return no_store(JSONResponse({"offset":offset}))
+    except (OSError, ConnectionError, TimeoutError) as e:
+        await run_in_threadpool(upload_queue.cancel, ident, s.user)
+        raise HTTPException(503, f"Связь с ПК прервана: {e}") from None
+    return no_store(JSONResponse({"offset": offset}))
 
 
 @app.post("/api/upload/{ident}/finish", dependencies=[Depends(require_csrf)])
 async def upload_finish(ident: str, request: Request, s: Session = Depends(require_admin)):
+    if not await PC.is_up():
+        await run_in_threadpool(upload_queue.cancel, ident, s.user)
+        raise HTTPException(409, "ПК выключился. Включите компьютер и повторите загрузку.")
     try:
-        item = await run_in_threadpool(upload_queue.finish, ident, s.user)
-    except (ValueError, OSError) as e:
-        raise HTTPException(409, str(e)) from None
+        # Результат 200 только после записи и проверки файла на самом ПК.
+        item = await on_pc(upload_queue.finish, ident, s.user, timeout=3600)
+    except (ValueError, OSError, ConnectionError, TimeoutError) as e:
+        await run_in_threadpool(upload_queue.cancel, ident, s.user)
+        raise HTTPException(409, f"Не удалось закончить передачу на ПК: {e}") from None
     audit("upload_finished", s.user, ip_of(request), f"{item['name']} -> {item['folder']}")
-    bg(ha.notify("upload_received", f"PhotoCloud: загружен файл «{clean(item['name'], 100)}». "
-                 "Ожидается перенос в фотоархив клиентом ПК.", dedupe_s=5))
+    bg(ha.notify("upload_received", f"PhotoCloud: файл «{clean(item['name'], 100)}» принят на ПК. "
+                 "Ожидает переноса в фотоархив.", dedupe_s=5))
     return no_store(JSONResponse({"ok":True,"id":ident,"state":item["state"]}))
 
 
 @app.post("/api/upload/{ident}/cancel", dependencies=[Depends(require_csrf)])
 async def upload_cancel(ident: str, s: Session = Depends(require_admin)):
     if not await run_in_threadpool(upload_queue.cancel, ident, s.user):
-        raise HTTPException(409, "в эту очередь нельзя отменить загрузку")
+        raise HTTPException(409, "нечего отменять")
     return no_store(JSONResponse({"ok":True}))
-
 
 
 @app.get("/api/upload/{ident}/thumb")
 async def upload_thumb(ident: str, _: Session = Depends(require_admin)):
-    item = upload_queue.get(ident)
-    if not item or item["state"] not in ("queued","staging","ready"):
-        raise HTTPException(404)
-    data = await run_in_threadpool(thumbnail, upload_queue.path(ident), item["name"])
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
+    data = await run_in_threadpool(upload_queue.thumb, ident)
     if not data:
         raise HTTPException(404)
     return Response(data, media_type="image/webp",
@@ -1644,10 +1665,7 @@ async def upload_thumb(ident: str, _: Session = Depends(require_admin)):
 
 @app.get("/api/pc/uploads/{ident}/thumb")
 async def pc_upload_thumb(ident: str, _: dict = Depends(require_pc)):
-    item = upload_queue.get(ident)
-    if not item or item["state"] != "ready":
-        raise HTTPException(404)
-    data = await run_in_threadpool(thumbnail, upload_queue.path(ident), item["name"])
+    data = await run_in_threadpool(upload_queue.thumb, ident)
     if not data:
         raise HTTPException(404)
     return Response(data, media_type="image/webp", headers={"cache-control":"no-store"})
@@ -1655,32 +1673,16 @@ async def pc_upload_thumb(ident: str, _: dict = Depends(require_pc)):
 
 @app.get("/api/upload/{ident}/media")
 async def upload_media(ident: str, _: Session = Depends(require_admin)):
+    if not await PC.is_up():
+        raise HTTPException(503, "pc")
     item = await run_in_threadpool(upload_queue.get, ident)
-    if not item or item["state"] not in ("queued","staging","ready"):
+    if not item:
         raise HTTPException(404)
-    path = upload_queue.path(ident)
-    if not path.is_file():
-        raise HTTPException(404)
-    return FileResponse(path, media_type=CONTENT_TYPES.get(Path(item["name"]).suffix.lower(),
-                        "application/octet-stream"),
-                        headers={"cache-control":"no-store","x-content-type-options":"nosniff"})
-
-
-async def _upload_stage_loop():
-    """Передавать из долговременного /data в Restored, когда ПК в сети."""
-    await asyncio.sleep(5)
-    while True:
-        try:
-            if restorer.enabled and upload_queue.next_to_stage() and await PC.is_up():
-                item = await on_pc(upload_queue.stage_one, restorer, timeout=3600)
-                if item:
-                    log.info("Файл готов к импорту клиентом ПК: %s", item["name"])
-                    _notify("upload_ready", f"Новый файл «{clean(item['name'], 100)}» ждёт переноса на ПК")
-        except (OSError, ConnectionError, TimeoutError) as e:
-            log.info("Ожидание записи загрузки в Restored: %s", e)
-        except Exception:
-            log.exception("ошибка очереди загрузок")
-        await asyncio.sleep(8)
+    # Без FileResponse: медиа не существует на серверном диске. Выдаём его с ПК.
+    return StreamingResponse(upload_queue.iter_media(ident),
+        media_type=CONTENT_TYPES.get(Path(item["name"]).suffix.lower(),
+                                    "application/octet-stream"),
+        headers={"cache-control":"private, no-store","x-content-type-options":"nosniff"})
 
 
 # ---------------------------------------------------------------- избранное
@@ -2495,6 +2497,7 @@ library.on_mismatch = _hash_mismatch
 # копией присылает её, и сервер кладёт её в Restored\<тот же путь> (оригинал не трогает).
 # Ты переносишь копию на место оригинала — сервер видит правильный хеш и закрывает запись.
 restorer = RestoreWriter(S, storage)
+upload_queue = UploadQueue(restorer)  # только память сервера; медиа и манифесты — на ПК
 DAMAGE_TEXT = {"found": "ждёт копию от клиента бэкапа", "nosource": "правильной копии нет ни у одного клиента (спросит и у новых)",
                "restored": "копия лежит в Restored — перенеси её на место оригинала",
                "lost": "копию из Restored удалили, а оригинал не исправлен",

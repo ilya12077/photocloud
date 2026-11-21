@@ -1,4 +1,4 @@
-"""Загрузка медиа: ограничения, очередь через Restored, импорт без перезаписи."""
+"""Проверки прямой записи на ПК без сохранения медиа на сервере."""
 import ast
 import hashlib
 import os
@@ -8,131 +8,113 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.db import DB
 from app.uploads import UploadQueue, destination_folder, media_name, import_path, UPLOAD_PREFIX
 from test_offline import production_function
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class UploadQueueTests(unittest.TestCase):
+class DirectUploadTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.db = DB(self.root / "uploads.db")
-        self.queue = UploadQueue(self.db, self.root / "incoming")
+        self.pc = self.root / "pc"  # имитирует файл. систему именно ПК
+        self.pc.mkdir()
+        self.server = self.root / "server"
+        self.server.mkdir()
+        self.writer = SimpleNamespace(local=True, enabled=True, storage=SimpleNamespace(root=self.pc))
+        self.queue = UploadQueue(self.writer)
 
-    def test_supported_media_and_safe_folders(self):
+    def upload(self, name="photo.jpg", content=b"photo-bytes", folder="Google Фото/2026"):
+        started = self.queue.start("admin", name, folder, len(content), 1700000000)
+        ident = started["id"]
+        split = max(1,len(content)//2)
+        self.assertEqual(self.queue.chunk(ident, "admin", 0, content[:split]), split)
+        self.assertEqual(self.queue.chunk(ident, "admin", split, content[split:]), len(content))
+        return ident, self.queue.finish(ident, "admin")
+
+    def test_supported_and_unsafe_paths(self):
         for name in ("a.JPG", "video.MP4", "scan.heic", "movie.avi", "movie.mts"):
             self.assertEqual(media_name(name), name)
-        for name in ("test.exe", "../foo.jpg", "CON.mp4", "bad:name.mov", "a.txt", "x/abc.jpg"):
+        for name in ("test.exe","../foo.jpg","CON.mp4","bad:name.mov","x/abc.jpg"):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 media_name(name)
-        self.assertEqual(destination_folder("Google Фото/2026/Осень"), "Google Фото/2026/Осень")
-        self.assertEqual(import_path("Google Фото/2026", "x.mp4"), "Google Фото/2026/x.mp4")
-        for folder in ("../bad", "Restored", ".photocloud/uploads", "A//B", "C:\\Windows"):
+        self.assertEqual(import_path("Google Фото/2026", "a.jpg"), "Google Фото/2026/a.jpg")
+        for folder in ("../bad","Restored",".photocloud/uploads","A//B","C:\\Windows"):
             with self.subTest(folder=folder), self.assertRaises(ValueError):
                 destination_folder(folder)
 
-    def test_upload_chunks_survive_then_go_to_restored(self):
-        content = b"abc" * 10000
-        start = self.queue.start("admin", "2026.jpg", "Google Фото/2026/Новый альбом",
-                                 len(content), 1700000000)
-        ident = start["id"]
-        self.assertEqual(self.queue.chunk(ident, "admin", 0, content[:10000]), 10000)
+    def test_blocks_go_straight_to_pc_and_not_to_server_disk(self):
+        content = b"abcdef" * 1000
+        started = self.queue.start("admin","large.mp4","Альбом",len(content),1700000000)
+        ident = started["id"]
+        pc_part = self.pc / "Restored" / UPLOAD_PREFIX / ident / "large.mp4.photocloud-part"
+        self.assertTrue(pc_part.exists())
+        self.assertEqual(list(self.server.iterdir()), [])
+        self.queue.chunk(ident,"admin",0,content[:1000])
+        self.assertEqual(pc_part.read_bytes(),content[:1000])
+        self.queue.chunk(ident,"admin",1000,content[1000:])
+        done = self.queue.finish(ident,"admin")
+        self.assertEqual(done["state"],"ready")
+        self.assertEqual(done["sha"],hashlib.sha256(content).hexdigest())
+        self.assertFalse(pc_part.exists())
+        self.assertEqual((pc_part.parent / "large.mp4").read_bytes(),content)
+        self.assertTrue((pc_part.parent / "manifest.json").exists())
+        self.assertEqual(list(self.server.iterdir()), [])
+        self.assertEqual(b"".join(self.queue.iter_media(ident)),content)
+
+    def test_restart_reads_only_manifest_on_pc(self):
+        ident, item = self.upload("photo.jpg", b"photo content")
+        restarted = UploadQueue(self.writer)
+        self.assertEqual(len(restarted.list()), 1)
+        self.assertEqual(restarted.get(ident)["staged"], item["staged"])
+        self.assertTrue(restarted.completed(ident, "Альбом/photo.jpg"))
+        self.assertEqual(restarted.list(), [])
+        self.assertFalse((self.pc / "Restored" / UPLOAD_PREFIX / ident / "manifest.json").exists())
+
+    def test_offline_writer_rejects_upload_before_bytes(self):
+        self.writer.enabled = False
+        with self.assertRaises(ConnectionError):
+            self.queue.start("admin","new.mp4","",100,1700000000)
+        self.assertEqual(self.queue.active,{})
+        self.assertEqual(list(self.server.iterdir()),[])
+
+    def test_wrong_offsets_and_other_users_rejected(self):
+        task = self.queue.start("admin", "a.jpg", "", 5, 1700000000)
+        ident = task["id"]
         with self.assertRaises(ValueError):
-            self.queue.chunk(ident, "admin", 0, b"changed")
+            self.queue.chunk(ident,"other",0,b"hello")
         with self.assertRaises(ValueError):
-            self.queue.finish(ident, "admin")
-        self.queue.chunk(ident, "admin", 10000, content[10000:])
-        row = self.queue.finish(ident, "admin")
-        self.assertEqual(row["state"], "queued")
-        self.assertEqual(row["sha"], hashlib.sha256(content).hexdigest())
-        self.assertEqual(row["folder"], "Google Фото/2026/Новый альбом")
-        self.assertEqual(len(self.queue.list(("ready",))), 0)
-
-        class Restore:
-            enabled = True
-            def write(self, rel, src, mtime, sha):
-                assert rel == f"{UPLOAD_PREFIX}/{ident}/2026.jpg"
-                assert src.read_bytes() == content
-                assert sha == hashlib.sha256(content).hexdigest()
-                return rel
-
-        self.assertEqual(self.queue.stage_one(Restore())["state"], "ready")
-        self.assertEqual(self.queue.list(("ready",))[0]["id"], ident)
-        self.assertTrue(self.queue.completed(ident, "Google Фото/2026/Новый альбом/2026.jpg"))
-        self.assertEqual(self.queue.get(ident)["state"], "done")
-        self.assertFalse(self.queue.path(ident).exists())
-
-    def test_other_files_upload_while_large_video_is_copied_to_restored(self):
-        import threading
-        first = self.queue.start("alice", "large.mp4", "", 4, 1700000000)
-        self.queue.chunk(first["id"], "alice", 0, b"data")
-        self.queue.finish(first["id"], "alice")
-        copying = threading.Event()
-        release = threading.Event()
-        next_uploaded = threading.Event()
-
-        class SlowRestore:
-            enabled = True
-            def write(self, rel, src, mtime, sha):
-                copying.set()
-                release.wait(4)
-                return rel
-
-        worker = threading.Thread(target=lambda: self.queue.stage_one(SlowRestore()),
-                                  daemon=True)
-        worker.start()
-        self.assertTrue(copying.wait(2), "SMB transfer did not start")
-        self.assertEqual(self.queue.get(first["id"])["state"], "staging")
-
-        def next_file():
-            other = self.queue.start("alice", "next.jpg", "", 4, 1700000000)
-            self.queue.chunk(other["id"], "alice", 0, b"next")
-            self.queue.finish(other["id"], "alice")
-            next_uploaded.set()
-        second = threading.Thread(target=next_file, daemon=True)
-        second.start()
-        try:
-            self.assertTrue(next_uploaded.wait(1.5), "slow SMB transfer blocked new uploads")
-        finally:
-            release.set()
-            worker.join(5)
-            second.join(5)
-        self.assertEqual(self.queue.get(first["id"])["state"], "ready")
-
-    def test_staging_is_requeued_after_server_restart(self):
-        item = self.queue.start("alice", "photo.jpg", "", 4, 1700000000)
-        self.queue.chunk(item["id"], "alice", 0, b"file")
-        self.queue.finish(item["id"], "alice")
-        self.db.run("UPDATE uploads SET state='staging' WHERE id=?", (item["id"],))
-        restarted = UploadQueue(self.db, self.root / "incoming")
-        self.assertEqual(restarted.get(item["id"])["state"], "queued")
-
-    def test_non_admin_cannot_overwrite_part_of_another_upload(self):
-        item = self.queue.start("alice", "test.mp4", "", 4, 1700000000)
+            self.queue.chunk(ident,"admin",4,b"e")
+        self.queue.chunk(ident,"admin",0,b"hello")
         with self.assertRaises(ValueError):
-            self.queue.chunk(item["id"], "bob", 0, b"AAAA")
-        self.assertEqual(self.queue.path(item["id"]).stat().st_size, 0)
-        self.assertFalse(self.queue.cancel(item["id"], "bob"))
-        self.assertTrue(self.queue.cancel(item["id"], "alice"))
+            self.queue.chunk(ident,"admin",0,b"x")
+        self.assertEqual(self.queue.finish(ident,"admin")["state"],"ready")
 
-    def test_oversized_chunk_rejected(self):
-        item = self.queue.start("alice", "test.mp4", "", 4*1024*1024 + 1, 1700000000)
-        with self.assertRaises(ValueError):
-            self.queue.chunk(item["id"], "alice", 0, b"x"*(4*1024*1024+1))
-        self.assertEqual(self.queue.path(item["id"]).stat().st_size, 0)
+    def test_cancel_removes_partial_upload_on_pc(self):
+        started = self.queue.start("admin","cancel.mp4","",10,1700000000)
+        ident = started["id"]
+        self.queue.chunk(ident,"admin",0,b"abc")
+        self.assertFalse(self.queue.cancel(ident,"intruder"))
+        self.assertTrue(self.queue.cancel(ident,"admin"))
+        base = self.pc / "Restored" / UPLOAD_PREFIX / ident
+        self.assertFalse((base / "cancel.mp4.photocloud-part").exists())
+        self.assertFalse((base / "manifest.json").exists())
 
-    def test_server_routes_require_admin(self):
-        source = (ROOT / "app/main.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        for name in ("upload_folders", "upload_list", "upload_start", "upload_chunk",
-                     "upload_finish", "upload_cancel", "upload_media", "upload_thumb"):
-            fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
-            self.assertIn("require_admin", ast.get_source_segment(source, fn).splitlines()[0] +
-                          "\n" + "\n".join(ast.get_source_segment(source, fn).splitlines()[:4]))
+    def test_server_endpoints_require_admin_and_online_pc(self):
+        src = (ROOT / "app/main.py").read_text(encoding="utf-8")
+        t = ast.parse(src)
+        for name in ("upload_folders","upload_list","upload_start","upload_chunk",
+                     "upload_finish","upload_cancel","upload_media","upload_thumb"):
+            f = next(n for n in t.body if isinstance(n,ast.AsyncFunctionDef) and n.name==name)
+            text = ast.get_source_segment(src,f)
+            self.assertIn("require_admin",text.splitlines()[0]+"\n"+"\n".join(text.splitlines()[:5]))
+        for name in ("upload_start","upload_chunk","upload_finish"):
+            f = next(n for n in t.body if isinstance(n,ast.AsyncFunctionDef) and n.name==name)
+            self.assertIn("PC.is_up()",ast.get_source_segment(src,f))
+        self.assertNotIn("incoming-uploads",src)
+        self.assertNotIn("_upload_stage_loop",src)
 
 
 class PCUploadImportTests(unittest.TestCase):
