@@ -1119,6 +1119,8 @@ function layout() {
   L.tileH = (W - L.gap * (cols - 1)) / cols;
   // значки на плитках — в масштабе плитки: полный размер от 160 px, мельче — пропорционально (не меньше 55%)
   $('grid').style.setProperty('--bs', Math.max(0.55, Math.min(1, L.tileH / 160)).toFixed(3));
+  // Дата масштабируется вместе с размером плитки, а не остаётся мелкой подписью.
+  $('grid').style.setProperty('--date-size', (Math.max(8, L.tileH * 0.22)).toFixed(2) + 'px');
   const rowH = L.tileH + L.gap;
   const rows = []; let y = 0;
   const byMonth = st.sort !== 'name';
@@ -1300,7 +1302,13 @@ function buildRow(r) {
       const c = el('button', 'mcheck'); c.type = 'button';
       c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
       c.addEventListener('click', e => { e.stopPropagation(); selMonth(slot.start, slot.n); });
-      spacer.append(c, el('span', 'day-spacer-text', dayName(slot.dayTs)));
+      const date = new Date(slot.dayTs * 1000);
+      const label = el('span', 'day-spacer-text');
+      label.append(
+        el('span', 'day-spacer-line', `${date.getDate()} ${MONTHS_SHORT[date.getMonth()]},`),
+        el('span', 'day-spacer-line', WEEKDAYS_SHORT[date.getDay()])
+      );
+      spacer.append(c, label);
       if (SEL.on && monthAllSel(slot.start, slot.n)) spacer.classList.add('sel');
       row.append(spacer);
       continue;

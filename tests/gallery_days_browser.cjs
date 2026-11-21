@@ -27,7 +27,12 @@ const assert=require('node:assert/strict');
        w:t.getBoundingClientRect().width,h:t.getBoundingClientRect().height,
        expected:L.tileH})).filter(t=>Math.abs(t.w-t.expected)>.5||Math.abs(t.h-t.expected)>.5).slice(0,5),
      narrowDates:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
-     datesWithLabels:[...document.querySelectorAll('.day-spacer')].every(g=>!!g.querySelector('.day-spacer-text')?.textContent),
+     datesWithLabels:[...document.querySelectorAll('.day-spacer')].every(g=>{
+       const label=g.querySelector('.day-spacer-text'), lines=[...g.querySelectorAll('.day-spacer-line')];
+       return lines.length===2 && lines.every(s=>!!s.textContent) &&
+         getComputedStyle(label).textAlign==='right' &&
+         lines.every(s=>s.scrollWidth<=s.clientWidth+1);
+     }),
      lingeringBands:document.querySelectorAll('.dhead').length,
      mappings:idx.every(i=>{const r=L.rows[rowOfIndex(i)];return !r.h&&r.start<=i&&i<r.end})};
    });
@@ -36,7 +41,7 @@ const assert=require('node:assert/strict');
    assert(!data.lingeringBands,'no extra date rows');
    assert(data.rows.every(r=>!r.band),'no date-band height');
    assert.equal(data.wrongTiles.length,0,`photos must stay square at ${width}px/${cols} cols: ${JSON.stringify(data.wrongTiles)}`);assert(!data.narrowDates);
-   assert(data.datesWithLabels);assert(data.mappings);
+   assert(data.datesWithLabels,`two aligned, unclipped date lines at ${width}px/${cols} columns`);assert(data.mappings);
    assert(data.rows.slice(0,-1).every(r=>r.used===cols));
    results.push({width,cols,rows:data.rows.length});
   }

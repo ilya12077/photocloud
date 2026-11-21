@@ -93,15 +93,17 @@ a { color: inherit; text-decoration: none; }
 .mhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
 .mhead { height: 46px; padding: 16px 0 0 4px; font-size: 15px; font-weight: 650; }
 .mhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 13px; }
-/* Дата в ячейке: её длинный текст не должен увеличивать высоту строки,
-   особенно на телефоне при большом числе колонок. */
-.day-spacer { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden;
-  padding: clamp(2px, calc(6px * var(--bs, 1)), 6px) clamp(1px, calc(4px * var(--bs, 1)), 4px);
-  display: flex; flex-wrap: wrap; align-content: flex-start; align-items: flex-start;
-  gap: 3px; color: var(--fg); font-weight: 600;
-  font-size: clamp(8px, calc(12px * var(--bs, 1)), 12px); line-height: 1.15; }
-.day-spacer-text { overflow-wrap: anywhere; }
-.day-spacer .mcheck { flex: none; }
+/* Большая дата ровно в две строки, по правому краю и на полную высоту ячейки.
+   Контейнер не может растянуть строку сетки ни при каком масштабе. */
+.day-spacer { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden;
+  padding: clamp(2px, calc(var(--date-size, 16px) * .14), 16px);
+  display: flex; justify-content: flex-end; align-items: stretch; color: var(--fg); }
+.day-spacer-text { min-width: 0; width: 100%; height: 100%; display: flex; flex-direction: column;
+  align-items: flex-end; justify-content: space-between; text-align: right;
+  font-size: var(--date-size, 16px); font-weight: 750; line-height: 1;
+  letter-spacing: -.035em; white-space: nowrap; }
+.day-spacer-line { display: block; max-width: 100%; overflow: hidden; }
+.day-spacer .mcheck { position: absolute; left: 3px; top: 3px; z-index: 1; }
 /* Кружки выбора дня и месяца появляются только в режиме выбора. */
 .mhead .mcheck, .day-spacer .mcheck { display: none; }
 .selmode .mhead .mcheck, .selmode .day-spacer .mcheck { display: inline-grid; place-items: center; width: 22px; height: 22px; margin: 0 8px 0 0; padding: 0;
