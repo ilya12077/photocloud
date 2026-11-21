@@ -127,7 +127,13 @@ class LiveRestoreTests(unittest.TestCase):
             self.assertFalse(list(self.media.glob('.photocloud-restore-*')))
 
     def test_auth_revision_and_unannounced_file(self):
-        self.assertIn('Применить восстановленные копии', self.http.get('/admin').text)
+        # В админке после сокращения пояснений остаётся управление
+        # повреждёнными файлами, а кнопка восстановления — в клиенте ПК.
+        admin_html = self.http.get('/admin').text
+        self.assertIn('id="dmg"', admin_html)
+        self.assertIn('id="dmg-check"', admin_html)
+        agent_code = (Path(__file__).resolve().parents[1] / 'pc/photocloud_pc.pyw').read_text(encoding='utf-8')
+        self.assertIn('Применить восстановленные копии', agent_code)
         it = self.item('stale.jpg')
         self.assertEqual(self.http.get('/api/pc/restored').status_code, 401)
         self.assertEqual(self.http.post('/api/pc/restored/complete', json=self.body(it)).status_code, 401)
