@@ -167,8 +167,8 @@ class UploadedFilesStartupTests(unittest.TestCase):
             root=mock_root, upload_tab=Mock(), nb=Mock(), up_canvas=Mock(),
             upload_items=[], upload_by_id={}, _uploads_known=None,
             _up_active_id=None,
-            up_gen=1, _up_layout=Mock(), _up_selection_changed=Mock(),
-            up_status=Mock())
+            up_gen=1, _up_layout=Mock(), _up_render=Mock(),
+            _up_selection_changed=Mock(), up_status=Mock())
         object_under_test.up_tree.selection.return_value = ()
         object_under_test.up_tree.get_children.return_value = ()
         object_under_test.up_canvas.yview.return_value = (0.0, 1.0)
