@@ -1283,7 +1283,7 @@ function buildRow(r) {
   for (const label of r.labels || []) {
     const d = el('div', 'dhead');
     d.dataset.start = label.start; d.dataset.n = label.n;
-    const inset = label.col > 0 ? 8 : 0;
+    const inset = label.col > 0 ? L.tileH / 4 : 0;
     d.style.left = (label.col * (L.tileH + L.gap) + inset) + 'px';
     d.style.width = (label.span * (L.tileH + L.gap) - L.gap - inset) + 'px';
     d.title = dayName(label.dayTs);
@@ -1300,8 +1300,8 @@ function buildRow(r) {
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
     // Extra breathing room only where two different days share a row.
     if (st.sort !== 'name') {
-      const left = i > r.start && dayKey(gdate(i - 1)) !== dayKey(gdate(i)) ? 8 : 0;
-      const right = i + 1 < r.end && dayKey(gdate(i + 1)) !== dayKey(gdate(i)) ? 8 : 0;
+      const left = i > r.start && dayKey(gdate(i - 1)) !== dayKey(gdate(i)) ? L.tileH / 4 : 0;
+      const right = i + 1 < r.end && dayKey(gdate(i + 1)) !== dayKey(gdate(i)) ? L.tileH / 4 : 0;
       if (left || right) {
         b.style.marginLeft = left + 'px';
         b.style.width = `calc(100% - ${left + right}px)`;
