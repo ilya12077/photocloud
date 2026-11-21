@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.6"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.7"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -481,7 +481,11 @@ class Api:
              "x-pc-mac": hmac.new(skey, msg, hashlib.sha256).hexdigest()}
         if body is not None:
             h["content-type"] = "application/json"
-        r = self.c.request(method, path, content=data if body is not None else None, headers=h)
+        # Подтверждение большого видео может требовать длительного чтения
+        # исходника по SMB, поэтому не обрываем его через 60 секунд.
+        timeout = 3600 if path == "/api/pc/uploads/complete" else 60
+        r = self.c.request(method, path, content=data if body is not None else None,
+                           headers=h, timeout=timeout)
         if r.status_code == 401 and _again:          # сеанс истёк или сервер перезапускался — новый сеанс
             with self.mu:
                 self.sid = ""

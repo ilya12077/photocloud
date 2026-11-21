@@ -391,6 +391,7 @@ async function upLoadPending() {
       image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
       const details = el('div');
       const status = item.state === 'queued' ? 'Ожидает включения ПК и записи в Restored' :
+        item.state === 'staging' ? 'Копируется в Restored…' :
         'Ожидает переноса клиентом ПК';
       details.append(el('strong', null, item.name), el('small', null,
         (item.folder || 'Корень') + ' · ' + status));

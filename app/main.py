@@ -1349,7 +1349,7 @@ async def pc_upload_complete(request: Request, _: dict = Depends(require_pc)):
         if not upload_queue.completed(ident, destination):
             raise ValueError("состояние загрузки изменилось")
     try:
-        await on_pc(confirm, timeout=300)
+        await on_pc(confirm, timeout=3600)
     except (ValueError, OSError) as e:
         raise HTTPException(409, str(e)) from None
     audit("upload_imported", "клиент ПК", ip_of(request), destination)
@@ -1633,7 +1633,7 @@ async def upload_cancel(ident: str, s: Session = Depends(require_admin)):
 @app.get("/api/upload/{ident}/thumb")
 async def upload_thumb(ident: str, _: Session = Depends(require_admin)):
     item = upload_queue.get(ident)
-    if not item or item["state"] not in ("queued","ready"):
+    if not item or item["state"] not in ("queued","staging","ready"):
         raise HTTPException(404)
     data = await run_in_threadpool(thumbnail, upload_queue.path(ident), item["name"])
     if not data:
@@ -1656,7 +1656,7 @@ async def pc_upload_thumb(ident: str, _: dict = Depends(require_pc)):
 @app.get("/api/upload/{ident}/media")
 async def upload_media(ident: str, _: Session = Depends(require_admin)):
     item = await run_in_threadpool(upload_queue.get, ident)
-    if not item or item["state"] not in ("queued","ready"):
+    if not item or item["state"] not in ("queued","staging","ready"):
         raise HTTPException(404)
     path = upload_queue.path(ident)
     if not path.is_file():
@@ -1672,7 +1672,7 @@ async def _upload_stage_loop():
     while True:
         try:
             if restorer.enabled and upload_queue.next_to_stage() and await PC.is_up():
-                item = await on_pc(upload_queue.stage_one, restorer, timeout=300)
+                item = await on_pc(upload_queue.stage_one, restorer, timeout=3600)
                 if item:
                     log.info("Файл готов к импорту клиентом ПК: %s", item["name"])
                     _notify("upload_ready", f"Новый файл «{clean(item['name'], 100)}» ждёт переноса на ПК")
