@@ -90,20 +90,22 @@ a { color: inherit; text-decoration: none; }
 /* --- сетка (виртуальная: в DOM только строки около экрана) --- */
 .vgrid { position: relative; margin: 6px 3px 0; contain: layout; }
 @media (min-width: 700px) { .vgrid { margin: 6px 16px 0; } }
-.mhead, .dhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+.mhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
 .mhead { height: 46px; padding: 16px 0 0 4px; font-size: 15px; font-weight: 650; }
 .mhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 13px; }
-/* Beta: календарный день — компактный вложенный заголовок внутри месяца. */
-.dhead { height: 36px; padding: 9px 0 0 12px; font-size: 13px; font-weight: 600; color: var(--fg); }
-.dhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 12px; }
+/* Beta: короткая дата стоит между плитками, не разрывая общий ряд. */
+.dcell { display: flex; min-width: 0; flex-wrap: wrap; align-content: flex-start;
+  gap: 6px; padding: 7px 4px; font-size: clamp(10px, 1.8vw, 13px);
+  font-weight: 600; line-height: 1.35; color: var(--fg); }
+.dcell-text { overflow-wrap: anywhere; }
 /* кружок «весь месяц» — только в режиме выбора, как у плиток */
-.mhead .mcheck, .dhead .mcheck { display: none; }
-.selmode .mhead .mcheck, .selmode .dhead .mcheck { display: inline-grid; place-items: center; width: 22px; height: 22px; margin: 0 8px 0 0; padding: 0;
+.mhead .mcheck, .dcell .mcheck { display: none; }
+.selmode .mhead .mcheck, .selmode .dcell .mcheck { display: inline-grid; place-items: center; width: 22px; height: 22px; margin: 0 8px 0 0; padding: 0;
   vertical-align: 0; border-radius: 50%; border: 2px solid var(--dim); background: none; cursor: pointer;
   color: var(--accent-fg); font-size: 13px; font-weight: 700; line-height: 1; }
-.selmode .mhead .mcheck:hover, .selmode .dhead .mcheck:hover { border-color: var(--accent); }
-.selmode .mhead.sel .mcheck, .selmode .dhead.sel .mcheck { background: var(--accent); border-color: var(--accent); }
-.selmode .mhead.sel .mcheck::after, .selmode .dhead.sel .mcheck::after { content: "✓"; }
+.selmode .mhead .mcheck:hover, .selmode .dcell .mcheck:hover { border-color: var(--accent); }
+.selmode .mhead.sel .mcheck, .selmode .dcell.sel .mcheck { background: var(--accent); border-color: var(--accent); }
+.selmode .mhead.sel .mcheck::after, .selmode .dcell.sel .mcheck::after { content: "✓"; }
 .trow { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); }
 .tile { position: relative; background: var(--tile); overflow: hidden; cursor: pointer; border: 0; padding: 0; display: block; width: 100%; height: 100%; }
 .tile img { width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; transition: opacity .15s; }

@@ -20,7 +20,6 @@ const $ = (id) => document.getElementById(id);
 const MONTHS = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
 const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
 const HEAD_H = 46;          // высота заголовка месяца, px
-const DAY_H = 36;           // высота заголовка дня в beta, px
 const BUFFER = 1.2;         // сколько экранов рендерим сверху/снизу
 const F_VIDEO = 1, F_TAKEN = 2, F_NAME = 4, F_NOPLAY = 8, F_LIVE = 16, F_FOLDER = 32;
 // /hidden — та же галерея, но только скрытые фото (тем, кто может скрывать; сервер отдаёт их
@@ -1102,11 +1101,10 @@ const dayKey = (ts) => {
   return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
 };
 const monthName = (k) => `${MONTHS[k % 12]} ${Math.floor(k / 12)}`;
-const dayDateFormat = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' });
-const dayWeekdayFormat = new Intl.DateTimeFormat('ru-RU', { weekday: 'long' });
+const WEEKDAYS_SHORT = ['Вс.', 'Пн.', 'Вт.', 'Ср.', 'Чт.', 'Пт.', 'Сб.'];
 const dayName = (ts) => {
   const d = new Date(ts * 1000);
-  return `${dayDateFormat.format(d)} · ${dayWeekdayFormat.format(d)}`;
+  return `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]}, ${WEEKDAYS_SHORT[d.getDay()]}`;
 };
 
 // ================================================================== виртуальная сетка
@@ -1133,18 +1131,26 @@ function layout() {
       end = i + 1;
       while (end < list.length && monthKey(gdate(end)) === month) end++;
       rows.push({ h: true, kind: 'month', month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
-      // Beta: внутри месяца — самостоятельный заголовок каждой календарной даты.
-      // Сохраняем «строки» в одном виртуальном списке: поиск строки и прокрутка не меняются.
+      // Дата стоит среди фотографий как отдельная подпись-ячейка: ряд не обрывается.
+      const cells = [];
+      const flush = () => {
+        if (!cells.length) return;
+        const content = cells.splice(0);
+        const firstPhoto = content.find(c => typeof c === 'number');
+        const start = firstPhoto == null ? content[0].start : firstPhoto;
+        rows.push({ h: false, start, month, cells: content, top: y, height: rowH });
+        y += rowH;
+      };
+      const push = c => { cells.push(c); if (cells.length === cols) flush(); };
       for (let s = i; s < end;) {
         const day = dayKey(gdate(s)), dayTs = gdate(s);
         let last = s + 1;
         while (last < end && dayKey(gdate(last)) === day) last++;
-        rows.push({ h: true, kind: 'day', month, day, dayTs, n: last - s, start: s, top: y, height: DAY_H }); y += DAY_H;
-        for (let k = s; k < last; k += cols) {
-          rows.push({ h: false, start: k, end: Math.min(last, k + cols), month, top: y, height: rowH }); y += rowH;
-        }
+        push({ kind: 'day', dayTs, start: s, n: last - s });
+        for (let k = s; k < last; k++) push(k);
         s = last;
       }
+      flush();
     } else {
       // Сортировка по имени остаётся без календарной группировки.
       for (let s = i; s < end; s += cols) {
@@ -1258,15 +1264,12 @@ function draw(force) {
 
 function buildRow(r) {
   if (r.h) {
-    const isDay = r.kind === 'day';
-    const label = isDay ? dayName(r.dayTs) : monthName(r.month);
-    const h = el('div', isDay ? 'dhead' : 'mhead', label);
+    const h = el('div', 'mhead', monthName(r.month));
     h.append(el('span', null, r.n.toLocaleString('ru')));
-    // И для месяца, и для дня можно выбрать сразу все фотографии группы.
     h.dataset.start = r.start; h.dataset.n = r.n;
     const c = el('button', 'mcheck'); c.type = 'button';
-    c.setAttribute('aria-label', isDay ? 'Выбрать весь день' : 'Выбрать весь месяц');
-    c.title = c.getAttribute('aria-label');
+    c.setAttribute('aria-label', 'Выбрать весь месяц');
+    c.title = 'Выбрать весь месяц';
     c.addEventListener('click', (e) => { e.stopPropagation(); selMonth(r.start, r.n); });
     h.prepend(c);
     if (SEL.on && monthAllSel(r.start, r.n)) h.classList.add('sel');
@@ -1276,8 +1279,19 @@ function buildRow(r) {
   const row = el('div', 'trow');
   row.style.transform = `translateY(${r.top}px)`; row.style.height = L.tileH + 'px'; row.style.gap = L.gap + 'px';
   const kind = thumbKind();
-  for (let i = r.start; i < r.end; i++) {
-    const ph = st.list[i];
+  for (const cell of r.cells || Array.from({length: r.end - r.start}, (_, j) => r.start + j)) {
+    if (typeof cell !== 'number') {
+      const d = el('div', 'dcell');
+      d.dataset.start = cell.start; d.dataset.n = cell.n;
+      const c = el('button', 'mcheck'); c.type = 'button';
+      c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
+      c.addEventListener('click', e => { e.stopPropagation(); selMonth(cell.start, cell.n); });
+      d.append(c, el('span', 'dcell-text', dayName(cell.dayTs)));
+      if (SEL.on && monthAllSel(cell.start, cell.n)) d.classList.add('sel');
+      row.append(d);
+      continue;
+    }
+    const i = cell, ph = st.list[i];
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
     if (SEL.set.has(ph[0])) b.classList.add('sel');
     const img = el('img'); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.dataset.src = imgUrl(kind, ph);
@@ -1495,7 +1509,7 @@ function selUpdate() {
   $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
-  for (const h of $('grid').querySelectorAll('.mhead, .dhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
+  for (const h of $('grid').querySelectorAll('.mhead, .dcell')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {
