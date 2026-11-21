@@ -1004,7 +1004,7 @@ function selUpdate() {
   row.hidden = SEL.on;
   $('grid').classList.toggle('selmode', SEL.on);
   $('sel-n').textContent = `Выбрано: ${SEL.set.size.toLocaleString('ru')}`;
-  for (const id of ['sel-hide', 'sel-show', 'sel-star', 'sel-unstar', 'sel-del']) $(id).disabled = !SEL.set.size;
+  for (const id of ['sel-download', 'sel-hide', 'sel-show', 'sel-star', 'sel-unstar', 'sel-del']) $(id).disabled = !SEL.set.size;
   $('sel-group').disabled = selIds().length < 2;
   // «Разгруппировать» — если среди выбранных есть фото из группы
   $('sel-ungroup').hidden = ![...SEL.set].some((id) => GX.byId.has(id));
@@ -1047,6 +1047,49 @@ function selMonth(start, n) {
 }
 $('menu-select').addEventListener('click', () => selStart());
 $('sel-x').addEventListener('click', () => selEnd());
+// Скачиваем оригиналы, не превью. От 51 файла браузер получает один
+// потоковый ZIP: POST выдаёт привязанный к сессии одноразовый адрес, GET
+// скачивается самим браузером без буферизации всего архива в JS.
+function clickDownload(url, filename) {
+  const link = document.createElement('a');
+  link.href = url;
+  if (filename) link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+async function selDownload() {
+  const ids = selIds();              // учесть скрытых участников свёрнутых групп
+  if (!ids.length) return;
+  const btn = $('sel-download');
+  btn.disabled = true;
+  try {
+    if (ids.length <= 50) {
+      const names = new Map(st.list.map((ph) => [ph[0], ph[2]]));
+      for (const members of GX.of.values()) for (const ph of members) names.set(ph[0], ph[2]);
+      // Все клики внутри исходного нажатия: браузер может попросить разрешить
+      // несколько скачиваний подряд, поэтому не используем setTimeout.
+      for (const id of ids) clickDownload('/img/o/' + encodeURIComponent(id) + '?dl=1', names.get(id));
+      banner('Скачивание ' + count(ids.length) + ' отдельно. Если браузер спросит — разреши несколько загрузок.');
+    } else {
+      const response = await api('/api/download/prepare', { method: 'POST', body: { ids } });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        banner(error.detail || 'Не удалось подготовить ZIP (' + response.status + ')', null, null, true);
+        return;
+      }
+      const data = await response.json();
+      clickDownload(data.url);
+      banner('Создаётся ZIP-архив из ' + count(data.count) + '. Загрузка начнётся автоматически.');
+    }
+  } catch (_error) {
+    banner('Не удалось начать скачивание', null, null, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('sel-download').addEventListener('click', selDownload);
+
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && SEL.on && gridActive()) selEnd(); });
 
 async function selApply(hide) {
