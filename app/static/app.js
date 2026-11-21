@@ -566,7 +566,7 @@ function render() {
   const kids = HID || STARRED ? st.children[fi].filter((c) => st.totals[c] > 0) : st.children[fi];
   for (const c of kids) {
     const path = lib.folders[c];
-    const card = el('a', 'folder'); card.href = '#/';
+    const card = el('a', 'folder'); card.href = '#/'; card.title = path;
     card.onclick = (e) => { e.preventDefault(); go(path); };
     const cover = el('div', 'cover');
     if (st.cover[c]) { const im = el('img'); im.loading = 'lazy'; im.decoding = 'async'; im.alt = ''; im.onerror = () => im.remove(); im.src = imgUrl('s', st.cover[c]); cover.append(im); }
