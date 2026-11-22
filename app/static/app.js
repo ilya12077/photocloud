@@ -1106,24 +1106,6 @@ const dayName = (ts) => {
   const d = new Date(ts * 1000);
   return `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]}, ${WEEKDAYS_SHORT[d.getDay()]}`;
 };
-const DAY_DATE_FORMAT = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' });
-const DAY_WEEKDAY_FORMAT = new Intl.DateTimeFormat('ru-RU', { weekday: 'long' });
-const DAY_TEXT_MEASURER = document.createElement('canvas').getContext('2d');
-// Общий размер шрифта для всех дат при одном масштабе сетки.
-// Учитываем длинные месяцы и дни недели, а не только текущую подпись.
-const DAY_FONT_REFERENCES = [
-  ...MONTHS.flatMap(month => [11, 28, 30, 31].map(day => `${day} ${month.toLowerCase()}`)),
-  'Воскресенье', 'Понедельник', 'Вторник', 'Среда',
-  'Четверг', 'Пятница', 'Суббота'
-];
-function dateTileFontSize(tileWidth, padding) {
-  const available = Math.max(1, tileWidth - padding * 2);
-  if (!DAY_TEXT_MEASURER) return Math.max(4, Math.min(tileWidth * 0.14, available / 7));
-  DAY_TEXT_MEASURER.font = '750 100px system-ui';
-  const widest = Math.max(1, ...DAY_FONT_REFERENCES.map(line => DAY_TEXT_MEASURER.measureText(line).width));
-  const size = Math.min(tileWidth * 0.41, available * 100 / widest * 0.92, available / 2.25);
-  return Math.max(4, Math.floor(size * 10) / 10);
-}
 
 // ================================================================== виртуальная сетка
 // В DOM только строки около экрана: десятки тысяч фото не тормозят ни телефон, ни комп.
@@ -1137,10 +1119,6 @@ function layout() {
   L.tileH = (W - L.gap * (cols - 1)) / cols;
   // значки на плитках — в масштабе плитки: полный размер от 160 px, мельче — пропорционально (не меньше 55%)
   $('grid').style.setProperty('--bs', Math.max(0.55, Math.min(1, L.tileH / 160)).toFixed(3));
-  // Общий размер и отступ для всех подписей, обновляются только при изменении сетки.
-  const datePadding = Math.max(1, Math.min(12, L.tileH * 0.04));
-  $('grid').style.setProperty('--date-pad', datePadding.toFixed(2) + 'px');
-  $('grid').style.setProperty('--date-size', dateTileFontSize(L.tileH, datePadding) + 'px');
   const rowH = L.tileH + L.gap;
   const rows = []; let y = 0;
   const byMonth = st.sort !== 'name';
@@ -1153,8 +1131,7 @@ function layout() {
       end = i + 1;
       while (end < list.length && monthKey(gdate(end)) === month) end++;
       rows.push({ h: true, kind: 'month', month, n: end - i, start: i, top: y, height: HEAD_H }); y += HEAD_H;
-      // Каждая дата расположена в ячейке шириной в плитку, а не над строкой.
-      // Размер соседних квадратных фотографий сохраняется.
+      // Подписи дней остаются над фото, пустые разделительные плитки больше не создаются.
       const days = new Map();
       for (let s = i; s < end;) {
         const day = dayKey(gdate(s));
@@ -1167,22 +1144,27 @@ function layout() {
       const flush = (nextIndex) => {
         if (!slots.length) return;
         const cells = slots; slots = [];
-        const photos = cells.filter(v => typeof v === 'number');
-        const start = photos.length ? photos[0] : nextIndex;
-        const last = photos.length ? photos[photos.length - 1] + 1 : nextIndex;
-        rows.push({ h: false, start, end: last, month, slots: cells,
-          top: y, height: rowH });
-        y += rowH;
+        const start = cells[0];
+        const last = cells[cells.length - 1] + 1;
+        const labels = [];
+        for (let col = 0; col < cells.length; col++) {
+          const k = cells[col], label = days.get(k);
+          if (!label) continue;
+          let span = 0;
+          for (let j = col; j < cells.length && dayKey(gdate(cells[j])) === dayKey(label.dayTs); j++) span++;
+          labels.push({ ...label, col, span });
+        }
+        const band = labels.length ? 30 : 0;
+        rows.push({ h: false, start, end: last, month, slots: cells, labels, band,
+          top: y, height: rowH + band });
+        y += rowH + band;
       };
       const push = (slot, nextIndex) => {
         slots.push(slot);
         if (slots.length === cols) flush(nextIndex);
       };
-      for (let k = i; k < end; k++) {
-        // Первый день месяца тоже получает собственную подпись-ячейку.
-        if (days.has(k)) push(days.get(k), k);
-        push(k, k + 1);
-      }
+      // Фотографии соседних дней занимают последовательные ячейки без разделителей.
+      for (let k = i; k < end; k++) push(k, k + 1);
       flush(end);
     } else {
       // Сортировка по имени остаётся без календарной группировки.
@@ -1311,31 +1293,23 @@ function buildRow(r) {
   }
   const row = el('div', 'trow');
   row.style.transform = `translateY(${r.top}px)`;
-  row.style.height = L.tileH + 'px';
-  row.style.gap = L.gap + 'px';
+  row.style.height = (L.tileH + (r.band || 0)) + 'px';
+  row.style.paddingTop = (r.band || 0) + 'px'; row.style.gap = L.gap + 'px';
+  for (const label of r.labels || []) {
+    const d = el('div', 'dhead');
+    d.dataset.start = label.start; d.dataset.n = label.n;
+    d.style.left = (label.col * (L.tileH + L.gap)) + 'px';
+    d.style.width = (label.span * (L.tileH + L.gap) - L.gap) + 'px';
+    d.title = dayName(label.dayTs);
+    const c = el('button', 'mcheck'); c.type = 'button';
+    c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
+    c.addEventListener('click', e => { e.stopPropagation(); selMonth(label.start, label.n); });
+    d.append(c, el('span', 'dhead-text', dayName(label.dayTs)));
+    if (SEL.on && monthAllSel(label.start, label.n)) d.classList.add('sel');
+    row.append(d);
+  }
   const kind = thumbKind();
   for (const slot of r.slots || Array.from({ length: r.end - r.start }, (_, offset) => r.start + offset)) {
-    if (typeof slot !== 'number') {
-      const spacer = el('div', 'day-spacer');
-      spacer.dataset.start = slot.start; spacer.dataset.n = slot.n;
-      spacer.title = dayName(slot.dayTs);
-      const c = el('button', 'mcheck'); c.type = 'button';
-      c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
-      c.addEventListener('click', e => { e.stopPropagation(); selMonth(slot.start, slot.n); });
-      const date = new Date(slot.dayTs * 1000);
-      const firstLine = DAY_DATE_FORMAT.format(date);
-      const weekday = DAY_WEEKDAY_FORMAT.format(date);
-      const secondLine = weekday.charAt(0).toUpperCase() + weekday.slice(1);
-      const label = el('span', 'day-spacer-text');
-      label.append(
-        el('span', 'day-spacer-line', firstLine),
-        el('span', 'day-spacer-line', secondLine)
-      );
-      spacer.append(c, label);
-      if (SEL.on && monthAllSel(slot.start, slot.n)) spacer.classList.add('sel');
-      row.append(spacer);
-      continue;
-    }
     const i = slot, ph = st.list[i];
     const b = el('button', 'tile'); b.type = 'button'; b.dataset.i = i; b.title = ph[2];
     if (SEL.set.has(ph[0])) b.classList.add('sel');
@@ -1554,7 +1528,7 @@ function selUpdate() {
   $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
-  for (const h of $('grid').querySelectorAll('.mhead, .day-spacer')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
+  for (const h of $('grid').querySelectorAll('.mhead, .dhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
 }
 function selStart() { if (!st.me) return false; SEL.on = true; hideMenu(); selUpdate(); return true; }
 function selEnd() {
