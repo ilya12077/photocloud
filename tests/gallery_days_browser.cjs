@@ -22,17 +22,10 @@ const assert=require('node:assert/strict');
     const idx=rows.flatMap(r=>r.slots||Array.from({length:r.end-r.start},(_,i)=>r.start+i)).filter(i=>i!==null);
     const gaps=rows.flatMap(r=>r.slots||[]).filter(i=>i===null).length;
     return {idx, gaps, count:st.list.length, labels:rows.flatMap(r=>r.labels||[]).map(x=>[x.start,x.n]),
-     rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,labels:(r.labels||[]).length,band:r.band||0})),
-     overlayProblems:[...document.querySelectorAll('.dhead')].filter(h=>{
-       const tile=h.parentElement.querySelector('.tile[data-i="'+h.dataset.start+'"]');
-       if(!tile) return true;
-       const a=h.getBoundingClientRect(),b=tile.getBoundingClientRect(),style=getComputedStyle(h);
-       return Math.abs(a.left-b.left)>.8 || a.top<b.top-.8 || a.right>b.right+.8 ||
-         a.bottom>b.bottom+.8 || style.pointerEvents!=='none';
-     }).map(h=>h.dataset.start),
-     wrongVerticalGaps:L.rows.some((r,i)=>!r.h && i+1<L.rows.length &&
-       !L.rows[i+1].h && Math.abs(L.rows[i+1].top-r.top-L.tileH-L.gap)>.5),
-     wrong:[...document.querySelectorAll('.tile')].some(t=>
+     rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,labels:(r.labels||[]).length,band:r.band})),
+     overlaps:[...document.querySelectorAll('.dhead')].some(h=>{
+      const tile=h.parentElement.querySelector('.tile'),a=h.getBoundingClientRect(),b=tile.getBoundingClientRect();return a.bottom>b.top+.5;
+     }), wrong:[...document.querySelectorAll('.tile')].some(t=>
       Math.abs(t.getBoundingClientRect().height-L.tileH)>.5 ||
       Math.abs(t.getBoundingClientRect().width-L.tileH)>.5),
      narrowGaps:[...document.querySelectorAll('.day-spacer')].some(g=>Math.abs(g.getBoundingClientRect().width-L.tileH)>.5),
@@ -40,10 +33,7 @@ const assert=require('node:assert/strict');
    });
    assert.deepEqual(data.idx,Array.from({length:78},(_,i)=>i));assert.equal(data.labels.length,7);
    assert.equal(data.gaps,0,'no empty tiles between days');
-   assert(data.rows.every(r=>r.band===0),'no extra date bands above rows');
-   assert(!data.wrongVerticalGaps,'only the normal tile gap between horizontal photo rows');
-   assert.deepEqual(data.overlayProblems,[],'date overlay must stay inside the first photo');
-   assert(!data.wrong,'photos must stay square');assert(!data.narrowGaps);
+   assert(!data.overlaps);assert(!data.wrong,'photos must stay square');assert(!data.narrowGaps);
    assert.equal(await page.locator('.day-spacer').count(),0,'no blank spacer nodes');
    assert(data.mappings);
    assert(data.rows.slice(0,-1).every(r=>r.used===cols));

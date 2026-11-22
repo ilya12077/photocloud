@@ -93,15 +93,11 @@ a { color: inherit; text-decoration: none; }
 .mhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
 .mhead { height: 46px; padding: 16px 0 0 4px; font-size: 15px; font-weight: 650; }
 .mhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 13px; }
-/* Подписи наложены поверх первого фото дня, а не в полосах между рядами. */
-.dhead { position: absolute; top: 3px; height: auto; min-width: 0; z-index: 3;
-  display: flex; align-items: flex-start; overflow: hidden; padding: 0;
-  color: #fff; pointer-events: none; }
-.dhead-text { min-width: 0; display: inline-block; max-width: 100%; padding: 3px 5px;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
-  background: #000b; border-radius: 4px; font-size: clamp(9px, calc(12px * var(--bs, 1)), 12px);
-  font-weight: 650; line-height: 1.25; text-shadow: 0 1px 2px #000; }
-.dhead .mcheck { flex-shrink: 0; pointer-events: auto; }
+/* Даты занимают только короткую полосу над снимками, а не место плитки. */
+.dhead { position: absolute; top: 0; height: 30px; display: flex; align-items: center;
+  min-width: 0; padding: 0 3px; font-size: 12px; font-weight: 600; color: var(--fg); }
+.dhead-text { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.dhead .mcheck { flex-shrink: 0; }
 /* кружок «весь месяц» — только в режиме выбора, как у плиток */
 .mhead .mcheck, .dhead .mcheck { display: none; }
 .selmode .mhead .mcheck, .selmode .dhead .mcheck { display: inline-grid; place-items: center; width: 22px; height: 22px; margin: 0 8px 0 0; padding: 0;

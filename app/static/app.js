@@ -1154,10 +1154,10 @@ function layout() {
           for (let j = col; j < cells.length && dayKey(gdate(cells[j])) === dayKey(label.dayTs); j++) span++;
           labels.push({ ...label, col, span });
         }
-        // Накладки с датой лежат прямо на фотографиях, не создавая лишних полос.
-        rows.push({ h: false, start, end: last, month, slots: cells, labels,
-          top: y, height: rowH });
-        y += rowH;
+        const band = labels.length ? 30 : 0;
+        rows.push({ h: false, start, end: last, month, slots: cells, labels, band,
+          top: y, height: rowH + band });
+        y += rowH + band;
       };
       const push = (slot, nextIndex) => {
         slots.push(slot);
@@ -1293,13 +1293,13 @@ function buildRow(r) {
   }
   const row = el('div', 'trow');
   row.style.transform = `translateY(${r.top}px)`;
-  row.style.height = L.tileH + 'px';
-  row.style.gap = L.gap + 'px';
+  row.style.height = (L.tileH + (r.band || 0)) + 'px';
+  row.style.paddingTop = (r.band || 0) + 'px'; row.style.gap = L.gap + 'px';
   for (const label of r.labels || []) {
     const d = el('div', 'dhead');
     d.dataset.start = label.start; d.dataset.n = label.n;
     d.style.left = (label.col * (L.tileH + L.gap)) + 'px';
-    d.style.width = L.tileH + 'px'; // поверх первой фотографии дня
+    d.style.width = (label.span * (L.tileH + L.gap) - L.gap) + 'px';
     d.title = dayName(label.dayTs);
     const c = el('button', 'mcheck'); c.type = 'button';
     c.setAttribute('aria-label', 'Выбрать весь день'); c.title = 'Выбрать весь день';
