@@ -21,7 +21,9 @@ const assert=require('node:assert/strict');
     const rows=L.rows.filter(r=>!r.h);
     const idx=rows.flatMap(r=>r.slots||Array.from({length:r.end-r.start},(_,i)=>r.start+i)).filter(i=>typeof i==='number');
     const dates=rows.flatMap(r=>r.slots||[]).filter(i=>typeof i==='object');
-    return {idx, dates:dates.map(d=>[d.start,d.n]), count:st.list.length,
+    const visibleDates=[...document.querySelectorAll('.day-spacer')];
+    const dateSizes=[...new Set(visibleDates.map(g=>getComputedStyle(g.querySelector('.day-spacer-text')).fontSize))];
+    return {idx, dates:dates.map(d=>[d.start,d.n]), dateSizes, count:st.list.length,
      rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,band:r.band||0})),
      wrongTiles:[...document.querySelectorAll('.tile')].map(t=>({i:t.dataset.i,
        w:t.getBoundingClientRect().width,h:t.getBoundingClientRect().height,
@@ -31,9 +33,11 @@ const assert=require('node:assert/strict');
        const label=g.querySelector('.day-spacer-text'), lines=[...g.querySelectorAll('.day-spacer-line')];
        const style=getComputedStyle(label);
        const first=lines[0],second=lines[1];
+       const box=g.getBoundingClientRect(), textBox=label.getBoundingClientRect();
        return lines.length===2 && /^\d{1,2} [А-Яа-яЁё]+$/.test(first.textContent) &&
          /^[А-ЯЁ][а-яё]+$/.test(second.textContent) &&
-         style.textAlign==='right' && style.justifyContent==='center' &&
+         style.textAlign==='right' && style.alignItems==='flex-end' &&
+         style.justifyContent==='flex-start' && textBox.top-box.top<=15 &&
          lines.every(s=>s.scrollWidth<=s.clientWidth+1) &&
          (second.getBoundingClientRect().top-first.getBoundingClientRect().bottom)<Math.max(4,parseFloat(style.fontSize)*.2);
      }),
@@ -45,7 +49,8 @@ const assert=require('node:assert/strict');
    assert(!data.lingeringBands,'no extra date rows');
    assert(data.rows.every(r=>!r.band),'no date-band height');
    assert.equal(data.wrongTiles.length,0,`photos must stay square at ${width}px/${cols} cols: ${JSON.stringify(data.wrongTiles)}`);assert(!data.narrowDates);
-   assert(data.datesWithLabels,`two aligned, unclipped date lines at ${width}px/${cols} columns`);assert(data.mappings);
+   assert.equal(data.dateSizes.length,1,`different date font sizes at ${width}px/${cols}: ${data.dateSizes}`);
+   assert(data.datesWithLabels,`two top-right aligned, unclipped date lines at ${width}px/${cols} columns`);assert(data.mappings);
    assert(data.rows.slice(0,-1).every(r=>r.used===cols));
    results.push({width,cols,rows:data.rows.length});
   }

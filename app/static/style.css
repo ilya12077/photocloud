@@ -93,14 +93,13 @@ a { color: inherit; text-decoration: none; }
 .mhead, .trow { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
 .mhead { height: 46px; padding: 16px 0 0 4px; font-size: 15px; font-weight: 650; }
 .mhead span { color: var(--dim); font-weight: 400; margin-left: 6px; font-size: 13px; }
-/* Полная дата и день недели: две большие соседние строки, прижатые вправо.
-   Размер подстраивается под ширину ячейки, не затрагивая размеры фотографий. */
+/* Одинаковый размер подписей на текущем масштабе; две строки вверху справа. */
 .day-spacer { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden;
   padding: var(--date-pad, 4px); display: flex; justify-content: flex-end;
-  align-items: center; color: var(--fg); }
+  align-items: flex-start; color: var(--fg); }
 .day-spacer-text { min-width: 0; width: 100%; display: flex; flex-direction: column;
-  align-items: flex-end; justify-content: center; text-align: right;
-  gap: .08em; font-weight: 750; line-height: 1.04;
+  align-items: flex-end; justify-content: flex-start; text-align: right;
+  gap: .08em; font-size: var(--date-size, 14px); font-weight: 750; line-height: 1.04;
   letter-spacing: -.025em; white-space: nowrap; }
 .day-spacer-line { display: block; max-width: 100%; overflow: hidden; }
 .day-spacer .mcheck { position: absolute; left: 3px; top: 3px; z-index: 1; }

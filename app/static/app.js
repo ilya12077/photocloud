@@ -1109,14 +1109,19 @@ const dayName = (ts) => {
 const DAY_DATE_FORMAT = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' });
 const DAY_WEEKDAY_FORMAT = new Intl.DateTimeFormat('ru-RU', { weekday: 'long' });
 const DAY_TEXT_MEASURER = document.createElement('canvas').getContext('2d');
-function dateTileFontSize(lines, tileWidth, padding) {
-  // Подгоняем шрифт под обе ПОЛНЫЕ строки, чтобы длинные месяцы не обрезались
-  // при большом количестве столбцов на телефоне.
-  if (!DAY_TEXT_MEASURER) return Math.max(5, tileWidth * 0.17);
-  DAY_TEXT_MEASURER.font = '750 100px system-ui';
-  const widest = Math.max(1, ...lines.map(line => DAY_TEXT_MEASURER.measureText(line).width));
+// Общий размер шрифта для всех дат при одном масштабе сетки.
+// Учитываем длинные месяцы и дни недели, а не только текущую подпись.
+const DAY_FONT_REFERENCES = [
+  ...MONTHS.flatMap(month => [11, 28, 30, 31].map(day => `${day} ${month.toLowerCase()}`)),
+  'Воскресенье', 'Понедельник', 'Вторник', 'Среда',
+  'Четверг', 'Пятница', 'Суббота'
+];
+function dateTileFontSize(tileWidth, padding) {
   const available = Math.max(1, tileWidth - padding * 2);
-  const size = Math.min(tileWidth * 0.41, available * 100 / widest * 0.96, available / 2.25);
+  if (!DAY_TEXT_MEASURER) return Math.max(4, Math.min(tileWidth * 0.14, available / 7));
+  DAY_TEXT_MEASURER.font = '750 100px system-ui';
+  const widest = Math.max(1, ...DAY_FONT_REFERENCES.map(line => DAY_TEXT_MEASURER.measureText(line).width));
+  const size = Math.min(tileWidth * 0.41, available * 100 / widest * 0.92, available / 2.25);
   return Math.max(4, Math.floor(size * 10) / 10);
 }
 
@@ -1132,7 +1137,10 @@ function layout() {
   L.tileH = (W - L.gap * (cols - 1)) / cols;
   // значки на плитках — в масштабе плитки: полный размер от 160 px, мельче — пропорционально (не меньше 55%)
   $('grid').style.setProperty('--bs', Math.max(0.55, Math.min(1, L.tileH / 160)).toFixed(3));
-  // Размер шрифта дат определяется по фактической ширине обеих строк в каждой ячейке.
+  // Общий размер и отступ для всех подписей, обновляются только при изменении сетки.
+  const datePadding = Math.max(1, Math.min(12, L.tileH * 0.04));
+  $('grid').style.setProperty('--date-pad', datePadding.toFixed(2) + 'px');
+  $('grid').style.setProperty('--date-size', dateTileFontSize(L.tileH, datePadding) + 'px');
   const rowH = L.tileH + L.gap;
   const rows = []; let y = 0;
   const byMonth = st.sort !== 'name';
@@ -1319,9 +1327,6 @@ function buildRow(r) {
       const weekday = DAY_WEEKDAY_FORMAT.format(date);
       const secondLine = weekday.charAt(0).toUpperCase() + weekday.slice(1);
       const label = el('span', 'day-spacer-text');
-      const padding = Math.max(1, Math.min(12, L.tileH * 0.04));
-      spacer.style.setProperty('--date-pad', padding.toFixed(2) + 'px');
-      label.style.fontSize = dateTileFontSize([firstLine, secondLine], L.tileH, padding) + 'px';
       label.append(
         el('span', 'day-spacer-line', firstLine),
         el('span', 'day-spacer-line', secondLine)
