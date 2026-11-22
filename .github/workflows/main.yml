@@ -12,11 +12,13 @@ name: Publish Docker image
 on:
   release:
     types: [published]
-  # сборка и при изменении app/VERSION (версия сервера) — новая версия без релиза в интерфейсе.
-  # master -> теги <версия> и latest; ветка beta -> только тег beta (основные не трогает)
+  # Изменение интерфейса тоже запускает сборку, даже при возврате к старой версии.
+  # master -> теги <версия> и latest; beta -> только beta.
   push:
     branches: [master, beta]
-    paths: [app/VERSION]
+    paths:
+      - app/VERSION
+      - app/static/**
 
 jobs:
   gallery_layout:
