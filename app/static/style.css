@@ -82,7 +82,7 @@ a { color: inherit; text-decoration: none; }
 .folder .cover { aspect-ratio: 16/10; background: var(--tile); background-size: cover; background-position: center; }
 .folder .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .folder .fname { padding: 5px 6px 6px; font-size: 15px; line-height: 1.25; font-weight: 550;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  white-space: normal; overflow-wrap: anywhere; }
 .folder .fname small { display: block; color: var(--dim); font-weight: 400; font-size: 14px; line-height: 1.2; }
 .folder:hover { border-color: var(--dim); }
 .summary { padding: 10px 16px 0; color: var(--dim); font-size: 13px; }
