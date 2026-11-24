@@ -15,13 +15,16 @@ const assert=require('node:assert/strict');
  const results=[];
  for(const width of [390,768,1100]){
   await page.setViewportSize({width,height:850});
+  // Приложение реагирует на смену ширины с debounce 150 мс.
+  // Сначала дожидаемся его relayout, затем устанавливаем тестовые столбцы.
+  await page.waitForFunction(()=>lastW===window.innerWidth,null,{timeout:5000});
   for(const cols of [2,3,5,8]){
    await page.evaluate(cols=>{Z.cols=cols;relayout(false)},cols);
    const data=await page.evaluate(()=>{
     const rows=L.rows.filter(r=>!r.h);
     const idx=rows.flatMap(r=>r.slots||Array.from({length:r.end-r.start},(_,i)=>r.start+i)).filter(i=>i!==null);
     const gaps=rows.flatMap(r=>r.slots||[]).filter(i=>i===null).length;
-    return {idx, gaps, count:st.list.length, labels:rows.flatMap(r=>r.labels||[]).map(x=>[x.start,x.n]),
+    return {idx, gaps, cols:Z.cols, count:st.list.length, labels:rows.flatMap(r=>r.labels||[]).map(x=>[x.start,x.n]),
      rows:rows.map(r=>({n:r.end-r.start,used:r.slots?.length??r.end-r.start,labels:(r.labels||[]).length,band:r.band})),
      overlaps:[...document.querySelectorAll('.dhead')].some(h=>{
       const tile=h.parentElement.querySelector('.tile'),a=h.getBoundingClientRect(),b=tile.getBoundingClientRect();return a.bottom>b.top+.5;
@@ -36,11 +39,31 @@ const assert=require('node:assert/strict');
    assert(!data.overlaps);assert(!data.wrong,'photos must stay square');assert(!data.narrowGaps);
    assert.equal(await page.locator('.day-spacer').count(),0,'no blank spacer nodes');
    assert(data.mappings);
-   assert(data.rows.slice(0,-1).every(r=>r.used===cols));
+   assert.equal(data.cols,cols,`unexpected zoom after viewport resize: ${width}px`);
+   assert(data.rows.slice(0,-1).every(r=>r.used===cols),
+     `incomplete row at ${width}px/${cols} cols: ${JSON.stringify(data.rows.filter((r,i)=>i<data.rows.length-1&&r.used!==cols))}`);
+   // Проверяем реальные стили папки с длинным названием на этом экране.
+   const folder=await page.evaluate(()=>{
+     const root=document.querySelector('#folders');
+     const card=document.createElement('a');card.className='folder';
+     const cover=document.createElement('div');cover.className='cover';
+     const name=document.createElement('div');name.className='fname';
+     name.append(document.createTextNode('Очень длинное название фотоархива за ноябрь 2026 года'));
+     const total=document.createElement('small');total.textContent='2 419 файлов';
+     name.append(total);card.append(cover,name);root.append(card);
+     const rect=name.getBoundingClientRect(),countRect=total.getBoundingClientRect(),style=getComputedStyle(name);
+     const ok=style.whiteSpace==='normal'&&style.overflowWrap==='anywhere' &&
+       rect.height>parseFloat(style.lineHeight)*2 && countRect.bottom<=rect.bottom+1 &&
+       name.scrollWidth<=name.clientWidth+1;
+     card.remove();
+     return {ok,whiteSpace:style.whiteSpace,wrap:style.overflowWrap,height:rect.height};
+   });
+   assert(folder.ok,`folder title is clipped at ${width}px: ${JSON.stringify(folder)}`);
    results.push({width,cols,rows:data.rows.length});
   }
  }
- await page.setViewportSize({width:1100,height:850});await page.evaluate(()=>{Z.cols=5;relayout(false)});
+ await page.setViewportSize({width:1100,height:850});
+ await page.waitForFunction(()=>lastW===window.innerWidth,null,{timeout:5000});await page.evaluate(()=>{Z.cols=5;relayout(false)});
  await page.waitForTimeout(1000);await page.screenshot({path:output+'/desktop.png'});
  await page.evaluate(()=>{selStart()});
  await page.locator('.dhead .mcheck').first().click();

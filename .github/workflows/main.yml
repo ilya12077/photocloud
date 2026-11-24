@@ -19,6 +19,8 @@ on:
     paths:
       - app/VERSION
       - app/static/**
+      - tests/gallery_days_browser.cjs
+      - .github/workflows/main.yml
 
 jobs:
   gallery_layout:
