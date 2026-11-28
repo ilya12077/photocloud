@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import re
@@ -349,66 +348,6 @@ class UploadQueue:
                 if not chunk:
                     break
                 yield chunk
-
-    def thumb(self, ident):
-        from PIL import Image, ImageOps
-        from .storage import IMAGE_EXT, VIDEO_EXT
-        item = self.get(ident)
-        if not item:
-            return b""
-        ext = Path(item["name"]).suffix.lower()
-        if ext in VIDEO_EXT:
-            # Превью видеозаписи из первых 4 МиБ. Нет полного файла
-            # или временного ролика на серверном диске; FFmpeg читает pipe.
-            from .video import DEMUXER, find_ffmpeg
-            import subprocess
-            ffmpeg = find_ffmpeg("")
-            demuxer = DEMUXER.get(ext)
-            if not ffmpeg or not demuxer:
-                return b""
-            try:
-                with self.open_received(ident)[1] as source:
-                    prefix = source.read(min(item["size"], 4 * 1024 * 1024))
-                if len(prefix) < 256:
-                    return b""
-                result = subprocess.run([
-                    ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
-                    "-protocol_whitelist", "pipe", "-f", demuxer, "-i", "pipe:0",
-                    "-map", "0:v:0", "-frames:v", "1",
-                    "-vf", "scale=340:340:force_original_aspect_ratio=decrease",
-                    "-an", "-sn", "-dn", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
-                ], input=prefix, capture_output=True, timeout=15)
-                if result.returncode != 0 or not result.stdout:
-                    return b""
-                with Image.open(io.BytesIO(result.stdout)) as img:
-                    img.thumbnail((380, 380))
-                    output = io.BytesIO()
-                    img.convert("RGB").save(output, "WEBP", quality=72)
-                    return output.getvalue()
-            except (OSError, ValueError, subprocess.TimeoutExpired):
-                return b""
-        if ext not in IMAGE_EXT:
-            return b""
-        size_limit = 24 * 1024 * 1024
-        if item["size"] > size_limit:
-            return b""
-        try:
-            with self.open_received(ident)[1] as f:
-                data = f.read(size_limit + 1)
-            if len(data) > size_limit:
-                return b""
-            with Image.open(io.BytesIO(data)) as img:
-                if img.width * img.height > 75_000_000:
-                    return b""
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((380, 380))
-                if img.mode not in ("RGB", "RGBA"):
-                    img = img.convert("RGB")
-                buffer = io.BytesIO()
-                img.save(buffer, "WEBP", quality=72, method=2)
-                return buffer.getvalue()
-        except (OSError, ValueError):
-            return b""
 
     def discard(self, ident: str, sha: str) -> bool:
         """Стереть ТОЛЬКО подтверждённую веб-загрузку из Restored.

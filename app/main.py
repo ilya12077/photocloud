@@ -47,7 +47,7 @@ from .google_auth import GoogleAuth, GoogleError
 from .yandex_auth import YandexAuth, YandexError
 from .passkeys import Passkeys, PasskeyError, rp_for
 from .pc import PcAuth, PcError, delete_message
-from .library import Library, folder_ok
+from .library import Library, Photo, folder_ok
 from .sched import PRIO_GRID, PRIO_PREFETCH, PRIO_QUICK, PRIO_VIEWER, Gone, Scheduler
 from .storage import RESTORED, RestoreWriter, is_missing, is_read_error, make_storage
 
@@ -1757,37 +1757,84 @@ async def upload_cancel(ident: str, s: Session = Depends(require_admin)):
     return no_store(JSONResponse({"ok":True}))
 
 
-@app.get("/api/upload/{ident}/thumb")
-async def upload_thumb(ident: str, _: Session = Depends(require_admin)):
+async def _pending_photo(ident: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", ident):
+        raise HTTPException(404)
     if not await PC.is_up():
         raise HTTPException(503, "pc")
-    data = await run_in_threadpool(upload_queue.thumb, ident)
-    if not data:
+    try:
+        item = await on_pc(upload_queue.get, ident, timeout=30)
+    except (OSError, ConnectionError, TimeoutError):
+        raise HTTPException(503, "pc") from None
+    if not item or item["state"] != "ready":
         raise HTTPException(404)
-    return Response(data, media_type="image/webp",
+    p = Photo("upload:" + ident, item["staged"], 0, item["name"],
+              item["size"], item["mtime"], Path(item["name"]).suffix.lower())
+    return item, p
+
+
+def _pending_video_src(ident):
+    host = "127.0.0.1" if S.bind in ("0.0.0.0", "127.0.0.1") else S.bind
+    return f"http://{host}:{S.port}/internal/upload/{ident}?k={INTERNAL_TOKEN}", "http,tcp"
+
+
+def _pending_open(ident):
+    return upload_queue.open_received(ident)[1]
+
+
+async def _pending_thumb(ident):
+    item, p = await _pending_photo(ident)
+    key = ("upload", ident, item["sha"], S.thumb_size, S.image_format, S.thumb_quality)
+    data = thumb_cache.get(key)
+    if data is not None:
+        return data
+    task = inflight.get(key)
+    if task is None:
+        async def make():
+            lane = sched_video if p.video else sched
+            try:
+                await lane.acquire(PRIO_GRID)
+                try:
+                    data = await on_pc(_produce, p, S.thumb_size, S.thumb_quality,
+                                       None, lambda: _pending_open(ident),
+                                       _pending_video_src(ident), timeout=240 if p.video else 60)
+                finally:
+                    lane.release()
+                thumb_cache.put(key, data)
+                return data
+            finally:
+                inflight.pop(key, None)
+        task = asyncio.create_task(make())
+        task.add_done_callback(lambda f: f.cancelled() or f.exception())
+        inflight[key] = task
+    try:
+        return await asyncio.shield(task)
+    except (OSError, ConnectionError, TimeoutError):
+        raise HTTPException(503, "pc") from None
+    except (ValueError, TooLarge):
+        raise HTTPException(404, "thumbnail unavailable") from None
+
+
+@app.get("/api/upload/{ident}/thumb")
+async def upload_thumb(ident: str, _: Session = Depends(require_admin)):
+    data = await _pending_thumb(ident)
+    return Response(data, media_type="image/webp" if S.image_format == "webp" else "image/jpeg",
                     headers={"cache-control":"private, max-age=300","x-content-type-options":"nosniff"})
 
 
 @app.get("/api/pc/uploads/{ident}/thumb")
 async def pc_upload_thumb(ident: str, _: dict = Depends(require_pc)):
-    data = await run_in_threadpool(upload_queue.thumb, ident)
-    if not data:
-        raise HTTPException(404)
-    return Response(data, media_type="image/webp", headers={"cache-control":"no-store"})
+    data = await _pending_thumb(ident)
+    return Response(data, media_type="image/webp" if S.image_format == "webp" else "image/jpeg",
+                    headers={"cache-control":"no-store"})
 
 
 @app.get("/api/upload/{ident}/media")
-async def upload_media(ident: str, _: Session = Depends(require_admin)):
-    if not await PC.is_up():
-        raise HTTPException(503, "pc")
-    item = await run_in_threadpool(upload_queue.get, ident)
-    if not item:
-        raise HTTPException(404)
-    # Без FileResponse: медиа не существует на серверном диске. Выдаём его с ПК.
-    return StreamingResponse(upload_queue.iter_media(ident),
-        media_type=CONTENT_TYPES.get(Path(item["name"]).suffix.lower(),
-                                    "application/octet-stream"),
-        headers={"cache-control":"private, no-store","x-content-type-options":"nosniff"})
+async def upload_media(ident: str, request: Request, _: Session = Depends(require_admin)):
+    _item, p = await _pending_photo(ident)
+    return await serve_file(request, p, {"cache-control":"private, no-store",
+                                        "x-content-type-options":"nosniff"},
+                            opener=lambda: _pending_open(ident))
 
 
 # ---------------------------------------------------------------- избранное
@@ -1843,12 +1890,13 @@ def _video_src(p) -> tuple[str, str]:
     return f"http://{host}:{S.port}/internal/raw/{p.id}?k={INTERNAL_TOKEN}", "http,tcp"
 
 
-def _produce(p, box: int, quality: int, tm: dict | None = None) -> bytes:
+def _produce(p, box: int, quality: int, tm: dict | None = None,
+             opener=None, video_source=None) -> bytes:
     tm = {} if tm is None else tm
     if p.video:
         if not FFMPEG:
             raise ValueError("no ffmpeg")
-        src, protocols = _video_src(p)
+        src, protocols = video_source or _video_src(p)
         t = time.perf_counter()
         frame = video.frame(FFMPEG, src, protocols, p.ext, box, 90)
         tm["decode"] = (time.perf_counter() - t) * 1000        # ffmpeg: чтение + декод кадра
@@ -1857,7 +1905,7 @@ def _produce(p, box: int, quality: int, tm: dict | None = None) -> bytes:
     small = box <= S.thumb_size                 # для эскизов пробуем встроенный готовый эскиз
     t = time.perf_counter()
     try:
-        with storage.open(p.rel) as f:
+        with (opener() if opener else storage.open(p.rel)) as f:
             if small and p.ext in (".jpg", ".jpeg"):
                 # сначала только начало файла: по сети это в разы быстрее, чем тянуть все 4–10 МБ
                 head = read_head(f)
@@ -2175,15 +2223,17 @@ def _size(f) -> int:
     return n
 
 
-async def serve_file(request: Request, p, extra: dict) -> Response:
+async def serve_file(request: Request, p, extra: dict, opener=None) -> Response:
     """Отдача оригинала с поддержкой Range (нужно для перемотки видео и iOS Safari)."""
     if not await PC.is_up():
         raise HTTPException(503, "pc")
     try:
-        f = await on_pc(storage.open, p.rel, timeout=30)
+        f = await on_pc(opener, timeout=30) if opener else await on_pc(storage.open, p.rel, timeout=30)
         size = await on_pc(_size, f, timeout=30)
     except Exception as e:  # noqa: BLE001
         if is_missing(e):
+            if opener is not None:
+                raise HTTPException(404, "upload gone") from None
             raise _gone(p) from None             # удалили на ПК: 404, а не «компьютер выключен»
         PC.suspect()
         raise HTTPException(503, "pc") from None
@@ -3492,6 +3542,15 @@ def bytes_response(request: Request, data: bytes, ctype: str) -> Response:
         headers["content-range"] = f"bytes {start}-{end}/{size}"
         return Response(data[start:end + 1], status_code=206, media_type=ctype, headers=headers)
     return Response(data, media_type=ctype, headers=headers)
+
+
+@app.get("/internal/upload/{ident}")
+async def internal_upload(request: Request, ident: str):
+    if not secrets.compare_digest(request.query_params.get("k", ""), INTERNAL_TOKEN):
+        raise HTTPException(404)
+    _item, p = await _pending_photo(ident)
+    return await serve_file(request, p, {"cache-control": "no-store"},
+                            opener=lambda: _pending_open(ident))
 
 
 @app.get("/internal/raw/{pid}")

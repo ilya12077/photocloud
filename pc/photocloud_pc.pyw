@@ -75,7 +75,7 @@ try:
 except ImportError:
     ec = None
 
-VERSION = "1.2.9"           # по этой строке программа сравнивает себя с версией на GitHub
+VERSION = "1.2.10"           # по этой строке программа сравнивает себя с версией на GitHub
 DEPS = (("watchdog", "watchdog>=4"), ("httpx", "httpx>=0.27"), ("PIL", "pillow>=10"), ("cryptography", "cryptography>=42"))
 KEY_NAME = "photocloud-pc"
 APP = "Photocloud — удаление"
@@ -483,7 +483,8 @@ class Api:
             h["content-type"] = "application/json"
         # Подтверждение большого видео может требовать длительного чтения
         # исходника по SMB, поэтому не обрываем его через 60 секунд.
-        timeout = 3600 if path == "/api/pc/uploads/complete" else 60
+        timeout = (3600 if path == "/api/pc/uploads/complete" else
+                   300 if path.startswith("/api/pc/uploads/") and path.endswith("/thumb") else 60)
         r = self.c.request(method, path, content=data if body is not None else None,
                            headers=h, timeout=timeout)
         if r.status_code == 401 and _again:          # сеанс истёк или сервер перезапускался — новый сеанс
@@ -1113,7 +1114,7 @@ class App:
             is_video = item["name"].lower().endswith(
                 (".mp4", ".mov", ".m4v", ".3gp", ".webm", ".avi", ".mts", ".m2ts", ".mpg", ".mpeg", ".vob"))
             c.create_text(ix + THUMB // 2, iy + THUMB // 2,
-                          text="▶ Видео" if is_video else "Нет превью" if ident in self.up_no_thumb else "Загружаю…",
+                          text="Нет превью" if ident in self.up_no_thumb else "Загружаю…",
                           fill=DIM, font=("Segoe UI", 11), tags=(tag, "up-card", "up-img"))
         ty = iy + THUMB + 6
         c.create_text(x + 8, ty, text="☑" if selected else "☐", anchor="nw",
@@ -1152,7 +1153,7 @@ class App:
         except Exception:
             self.up_asked.discard(ident)
             return
-        self.ui(lambda: self._up_redraw(ident) if gen == self.up_gen else None)
+        self.ui(lambda: self._up_redraw(ident) if ident in self.up_visible else None)
 
     def _up_hit(self):
         for tag in self.up_canvas.gettags("current"):
@@ -1265,6 +1266,10 @@ class App:
                             (it.get("name") or "").casefold()))
         self.upload_by_id = {item["id"]: item for item in self.upload_items}
         present = set(self.upload_by_id)
+        self.up_thumbs = {ident: raw for ident, raw in self.up_thumbs.items() if ident in present}
+        self.up_asked.difference_update(self.up_no_thumb)
+        self.up_no_thumb.clear()
+        self.up_asked.intersection_update(present)
         initial = self._uploads_known is None
         if not initial and present - self._uploads_known:
             self.root.bell()
@@ -1357,7 +1362,7 @@ class App:
                 if item["id"] != self._up_active_id or item["id"] not in self.up_tree.selection():
                     return  # устаревшая загрузка превью уже неактуальна
                 if not raw:
-                    self.up_preview.configure(text="Видео или нет превью")
+                    self.up_preview.configure(text="Превью недоступно")
                     return
                 try:
                     img = Image.open(io.BytesIO(raw))

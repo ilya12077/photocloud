@@ -35,6 +35,16 @@ class DirectUploadTests(unittest.TestCase):
         self.assertEqual(self.queue.chunk(ident, "admin", split, content[split:]), len(content))
         return ident, self.queue.finish(ident, "admin")
 
+    def test_uploaded_video_is_seekable_at_end(self):
+        content = b"start" + b"x" * (5 * 1024 * 1024) + b"moov-at-end"
+        ident, item = self.upload("clip.mp4", content)
+        received, source = self.queue.open_received(ident)
+        with source:
+            self.assertEqual(source.seek(-11, 2), len(content) - 11)
+            self.assertEqual(source.read(), b"moov-at-end")
+        self.assertEqual(received["sha"], hashlib.sha256(content).hexdigest())
+        self.assertEqual(list(self.server.iterdir()), [])
+
     def test_supported_and_unsafe_paths(self):
         for name in ("a.JPG", "video.MP4", "scan.heic", "movie.avi", "movie.mts"):
             self.assertEqual(media_name(name), name)
