@@ -38,11 +38,17 @@ jobs:
 
   push_to_registry:
     needs: [windows_agent, gallery_layout]
-    name: Push Docker image to Docker Hub
+    name: Build and publish to GHCR
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       
       - uses: actions/setup-python@v5
         with:
@@ -65,12 +71,13 @@ jobs:
           grep -q 'id="bk-tokens"' "$RUNNER_TEMP/admin.html"
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18099/api/pc/marks)" = 401
 
-      - name: Log in to Docker Hub
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Read version
         id: ver
         run: echo "version=$(tr -d ' \r\n' < app/VERSION)" >> "$GITHUB_OUTPUT"
@@ -79,7 +86,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
         with:
-          images: ilya1207/photocloud
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=tag
             type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -89,6 +96,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
       
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
         with:
           context: .
@@ -98,3 +106,40 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.ver.outputs.version }}
+
+  mirror_to_dockerhub:
+    name: Optional mirror to Docker Hub
+    needs: push_to_registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Copy the tested image without rebuilding
+        env:
+          SOURCE_IMAGE: ghcr.io/${{ github.repository }}@${{ needs.push_to_registry.outputs.digest }}
+          SOURCE_TAGS: ${{ needs.push_to_registry.outputs.tags }}
+        run: |
+          docker pull "$SOURCE_IMAGE"
+          while IFS= read -r source_tag; do
+            [ -n "$source_tag" ] || continue
+            target="ilya1207/photocloud:${source_tag##*:}"
+            docker tag "$SOURCE_IMAGE" "$target"
+            docker push "$target"
+          done <<< "$SOURCE_TAGS"
+      - name: Report mirror failure
+        if: failure()
+        run: echo '::warning::Docker Hub mirror failed. The tested image is already available in GHCR.'
