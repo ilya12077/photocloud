@@ -537,13 +537,29 @@ async function upLoadPending() {
     if (!items.length) { container.append(el('small', null, 'Новых загрузок пока нет.')); return; }
     for (const item of items.slice(0, 70)) {
       const row = el('div', 'up-pending-item');
+      const thumb = el('span', 'up-pending-thumb');
+      const fallback = el('span', 'up-pending-placeholder', PENDING_VIDEO.test(item.name) ? '▶' : '…');
       const image = el('img'); image.alt = ''; image.loading = 'lazy';
-      image.src = '/api/upload/' + encodeURIComponent(item.id) + '/thumb';
-      image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
+      const url = '/api/upload/' + encodeURIComponent(item.id) + '/thumb?v=' + Math.floor(item.mtime);
+      let attempt = 0;
+      const delays = [2000, 5000, 10000];
+      image.onload = () => { image.style.visibility = 'visible'; fallback.hidden = true; };
+      image.onerror = () => {
+        image.style.visibility = 'hidden'; fallback.hidden = false;
+        if (attempt >= delays.length) { thumb.title = 'Превью недоступно'; return; }
+        const delay = delays[attempt++];
+        setTimeout(() => {
+          if (!row.isConnected || $('up-modal').hidden) return;
+          image.src = url + '&retry=' + Date.now();
+        }, delay);
+      };
+      image.style.visibility = 'hidden';
+      thumb.append(fallback, image);
+      image.src = url;
       const details = el('div');
       details.append(el('strong', null, item.name));
       if (item.folder) details.append(el('small', null, item.folder));
-      row.append(image, details);
+      row.append(thumb, details);
       container.append(row);
     }
     if (items.length > 70) container.append(el('small', null, 'Показаны первые 70 из ' + items.length));

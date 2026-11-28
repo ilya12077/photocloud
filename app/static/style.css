@@ -399,7 +399,9 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .up-pending-head h3 { font-size: 15px; margin: 0; }
 .up-pending { max-height: 250px; overflow-y: auto; display: grid; gap: 8px; margin: 10px 0 0; }
 .up-pending-item { display: flex; gap: 10px; align-items: center; padding: 7px; border: 1px solid var(--line); border-radius: 9px; }
-.up-pending-item img { flex: none; width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: var(--tile); }
+.up-pending-thumb { position: relative; display: grid; place-items: center; flex: none; width: 48px; height: 48px; border-radius: 6px; overflow: hidden; background: var(--tile); }
+.up-pending-placeholder { color: var(--dim); font-size: 15px; }
+.up-pending-item img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .up-pending-item div { flex: 1; min-width: 0; }
 .up-pending-item strong { font-weight: 550; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .up-pending-item small { display: block; color: var(--dim); overflow-wrap: anywhere; }

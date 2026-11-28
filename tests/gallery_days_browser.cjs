@@ -205,6 +205,21 @@ const assert=require('node:assert/strict');
  assert.equal(image.toString('ascii',8,12),'WEBP');
  const again=await page.request.get(thumbUrl);
  assert.deepEqual(await again.body(),image);
+ // The upload dialog must retry a transient thumbnail failure, not leave a blank tile.
+ let pendingThumbRequests=0;
+ const pattern='**/api/upload/'+uploadId+'/thumb*';
+ await page.route(pattern,route=>{
+   pendingThumbRequests++;
+   return pendingThumbRequests===1 ? route.abort('failed') : route.continue();
+ });
+ await page.evaluate(()=>upLoadPending());
+ const pendingRow=page.locator('.up-pending-item').filter({hasText:'pending-fixture.mp4'});
+ await pendingRow.locator('img').scrollIntoViewIfNeeded();
+ await page.waitForFunction(()=>[...document.querySelectorAll('.up-pending-item')].some(row=>
+   row.textContent.includes('pending-fixture.mp4') && row.querySelector('img')?.naturalWidth>0
+   && row.querySelector('img').style.visibility==='visible'),null,{timeout:30000});
+ assert(pendingThumbRequests>=2);
+ await page.unroute(pattern);
  fs.unlinkSync(videoPath);
  await page.screenshot({path:output+'/mobile-upload.png'});
  assert.equal(errors.length,0,errors.join('\n'));console.log(JSON.stringify(results));await browser.close();
