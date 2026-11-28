@@ -108,6 +108,8 @@ jobs:
             VERSION=${{ steps.ver.outputs.version }}
 
   mirror_to_dockerhub:
+    # Зеркало отключено; для возобновления публикации убрать условие if.
+    if: ${{ false }}
     name: Optional mirror to Docker Hub
     needs: push_to_registry
     runs-on: ubuntu-latest
