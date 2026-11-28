@@ -35,6 +35,26 @@ class DirectUploadTests(unittest.TestCase):
         self.assertEqual(self.queue.chunk(ident, "admin", split, content[split:]), len(content))
         return ident, self.queue.finish(ident, "admin")
 
+    def test_upload_preview_survives_database_reopen_and_index_pruning(self):
+        from app.db import DB
+        from app.library import Photo
+        db = DB(self.server / "preview.db")
+        ident, sha, data = "a" * 32, "b" * 64, b"thumbnail"
+        db.run("INSERT INTO upload_previews VALUES(?,?,?,?)", (ident, sha, "webp:400:60", data))
+        db.run("INSERT INTO upload_imports VALUES(?,?,?,?,?,?)",
+               (ident, sha, "album/new.jpg", 123, 1700000000, 1700000001))
+        db.vthumbs_prune(set())
+        db.con.close()
+        db = DB(self.server / "preview.db")
+        try:
+            self.assertEqual(db.run("SELECT data FROM upload_previews WHERE id=?", (ident,)), [(data,)])
+            self.assertEqual(db.run("SELECT destination FROM upload_imports WHERE id=?", (ident,)),
+                             [("album/new.jpg",)])
+            p = Photo("abc", "album/new.jpg", 0, "new.jpg", 123, 1700000000, ".jpg")
+            self.assertEqual(p.cache_key(), "album/new.jpg\0" + "123\0" + "1700000000")
+        finally:
+            db.con.close()
+
     def test_uploaded_video_is_seekable_at_end(self):
         content = b"start" + b"x" * (5 * 1024 * 1024) + b"moov-at-end"
         ident, item = self.upload("clip.mp4", content)

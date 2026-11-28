@@ -80,6 +80,13 @@ SCHEMA = [
          guid TEXT NOT NULL DEFAULT '', revoked INTEGER NOT NULL DEFAULT 0)""",
     """CREATE TABLE IF NOT EXISTS vthumbs (
         key TEXT PRIMARY KEY, fmt TEXT NOT NULL, data BLOB NOT NULL) WITHOUT ROWID""",
+    # Эскизы принятого файла живут отдельно от индекса до подтверждённого переноса.
+    """CREATE TABLE IF NOT EXISTS upload_previews (
+        id TEXT NOT NULL, sha TEXT NOT NULL, kind TEXT NOT NULL, data BLOB NOT NULL,
+        PRIMARY KEY (id, sha, kind)) WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS upload_imports (
+        id TEXT PRIMARY KEY, sha TEXT NOT NULL, destination TEXT NOT NULL,
+        size INTEGER NOT NULL, mtime INTEGER NOT NULL, created REAL NOT NULL)""",
     # избранное: у каждого пользователя своё
     """CREATE TABLE IF NOT EXISTS starred (
         user TEXT NOT NULL, path TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (user, path))

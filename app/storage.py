@@ -166,7 +166,11 @@ class LocalStorage:
         return open(self.local_path(rel), "rb")
 
     def file_size(self, rel: str) -> int | None:
-        """Актуальный размер файла по метаданным, без чтения всего содержимого."""
+        stamp = self.file_stamp(rel)
+        return stamp[0] if stamp is not None else None
+
+    def file_stamp(self, rel: str) -> tuple[int, float] | None:
+        """Актуальные размер и mtime файла без чтения содержимого."""
         try:
             path = self.local_path(rel)
             st = path.lstat()
@@ -174,7 +178,7 @@ class LocalStorage:
             return None
         if not statmod.S_ISREG(st.st_mode) or getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
             return None
-        return st.st_size
+        return st.st_size, st.st_mtime
 
 
 # Одно SMB-соединение обслуживает все потоки. Windows выдаёт ему ограниченное число
@@ -498,7 +502,11 @@ class SMBStorage:
             lambda: _gated(self._smb.open_file, path, mode="rb", share_access="rw", **self._creds)))
 
     def file_size(self, rel: str) -> int | None:
-        """SMB stat без чтения медиа, используется для поиска дублей."""
+        stamp = self.file_stamp(rel)
+        return stamp[0] if stamp is not None else None
+
+    def file_stamp(self, rel: str) -> tuple[int, float] | None:
+        """SMB stat без чтения медиа."""
         path = self.base + "\\" + "\\".join(_check_rel(rel))
         try:
             info = self._retry(lambda: _gated(self._smb.stat, path, **self._creds))
@@ -509,7 +517,7 @@ class SMBStorage:
         attrs = getattr(info, "st_file_attributes", 0)
         if not statmod.S_ISREG(info.st_mode) or attrs & FILE_ATTRIBUTE_REPARSE_POINT:
             return None
-        return int(info.st_size)
+        return int(info.st_size), float(info.st_mtime)
 
 
 class RestoreWriter:

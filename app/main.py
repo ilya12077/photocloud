@@ -1306,8 +1306,10 @@ async def pc_changes(request: Request, _: dict = Depends(require_pc)):
 
 @app.get("/api/pc/uploads")
 async def pc_uploads(_: dict = Depends(require_pc)):
+    items = await run_in_threadpool(upload_queue.list, ("ready",))
+    _queue_upload_previews(items)
     return no_store(JSONResponse({
-        "items": await run_in_threadpool(upload_queue.list, ("ready",)),
+        "items": items,
         "folders": sorted(f for f in library._folders if f),
     }))
 
@@ -1330,6 +1332,10 @@ async def pc_upload_discard(request: Request, _: dict = Depends(require_pc)):
         try:
             await on_pc(upload_queue.discard, item["id"], item["sha"], timeout=60)
             deleted.append(item["id"])
+            try:
+                await run_in_threadpool(db.run, "DELETE FROM upload_previews WHERE id = ?", (item["id"],))
+            except Exception:
+                log.exception("не удалось удалить временный эскиз")
         except (ValueError, OSError, ConnectionError, TimeoutError) as exc:
             failures.append({"id":item["id"], "reason":str(exc)[:160]})
     if deleted:
@@ -1359,6 +1365,12 @@ async def pc_upload_complete(request: Request, _: dict = Depends(require_pc)):
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
 
+    # Если фон ещё не успел подготовить эскиз, пробуем до удаления источника на ПК.
+    try:
+        await _pending_thumb(ident)
+    except Exception:
+        log.info("эскиз загрузки %s будет сформирован после переноса", ident)
+
     def confirm():
         # Нельзя доверять одному ACK ПК: читаем получившийся оригинал
         # из доступной только на чтение шары и сверяем SHA-256.
@@ -1372,6 +1384,16 @@ async def pc_upload_complete(request: Request, _: dict = Depends(require_pc)):
                 digest.update(part)
         if total != item["size"] or digest.hexdigest() != item["sha"]:
             raise ValueError("SHA-256 файла после переноса не совпал")
+        stamp = storage.file_stamp(destination)
+        if stamp is None or stamp[0] != total:
+            raise ValueError("файл после переноса отсутствует или изменился")
+        # Фиксируем проверенный новый путь, прежде чем удалить манифест.
+        db.run("INSERT OR REPLACE INTO upload_imports VALUES(?,?,?,?,?,?)",
+               (ident, item["sha"], destination, total, int(stamp[1]), time.time()))
+        try:
+            _promote_upload_preview(ident, item["sha"], destination, total, int(stamp[1]))
+        except Exception:
+            log.exception("перенос эскиза будет повторён при индексации")
         if not upload_queue.completed(ident, destination):
             raise ValueError("состояние загрузки изменилось")
     try:
@@ -1605,7 +1627,9 @@ async def upload_folders(_: Session = Depends(require_admin)):
 async def upload_list(_: Session = Depends(require_admin)):
     if not await PC.is_up():
         return no_store(JSONResponse({"items": []}))
-    return no_store(JSONResponse({"items": await run_in_threadpool(upload_queue.list)}))
+    items = await run_in_threadpool(upload_queue.list)
+    _queue_upload_previews(items)
+    return no_store(JSONResponse({"items": items}))
 
 
 def _upload_size_comparison(folder: str, name: str, size: int, pending=None) -> dict:
@@ -1744,6 +1768,7 @@ async def upload_finish(ident: str, request: Request, s: Session = Depends(requi
     except (ValueError, OSError, ConnectionError, TimeoutError) as e:
         await run_in_threadpool(upload_queue.cancel, ident, s.user)
         raise HTTPException(409, f"Не удалось закончить передачу на ПК: {e}") from None
+    _queue_upload_previews([item])
     audit("upload_finished", s.user, ip_of(request), f"{item['name']} -> {item['folder']}")
     bg(ha.notify("upload_received", f"PhotoCloud: файл «{clean(item['name'], 100)}» принят на ПК. "
                  "Ожидает переноса в фотоархив.", dedupe_s=5))
@@ -1782,12 +1807,93 @@ def _pending_open(ident):
     return upload_queue.open_received(ident)[1]
 
 
+def _save_upload_preview(ident, sha, kind, data):
+    # Не записываем эскиз после удаления или завершения этой загрузки.
+    with upload_queue.mu:
+        item = upload_queue.get(ident)
+        if item and item["state"] == "ready" and item["sha"] == sha:
+            db.run("INSERT OR REPLACE INTO upload_previews VALUES(?,?,?,?)",
+                   (ident, sha, kind, data))
+
+
+def _promote_upload_preview(ident, sha, destination, size, mtime):
+    rows = db.run("SELECT data FROM upload_previews WHERE id=? AND sha=? AND kind=?",
+                  (ident, sha, _pkind("t")))
+    if not rows:
+        return False
+    data = rows[0][0]
+    key = f"{destination}\0{size}\0{int(mtime)}"
+    small = render(data, S.thumb_small_size, S.thumb_quality, S.image_format)
+    if Path(destination).suffix.lower() in video.DEMUXER:
+        db.vthumb_put(key, S.image_format, small)
+    else:
+        pthumbs.put(key, _pkind("t"), data)
+        pthumbs.put(key, _pkind("s"), small)
+    return True
+
+
+def _finish_upload_imports():
+    # Индекс мог начать обход раньше подтверждения переноса. Повторяем
+    # запись эскизов, когда новый путь действительно появился в индексе.
+    rows = db.run("SELECT id,sha,destination,size,mtime,created FROM upload_imports")
+    for ident, sha, destination, size, mtime, created in rows:
+        p = _by_rel(destination)
+        if not p or p.size != size or int(p.mtime) != mtime:
+            continue
+        try:
+            _promote_upload_preview(ident, sha, destination, size, mtime)
+            # У файла уже проверен SHA-256 после физического переноса.
+            db.hashes_put_many([(p.cache_key(), sha)])
+            db.run("DELETE FROM upload_previews WHERE id=? AND sha=?", (ident, sha))
+            db.run("DELETE FROM upload_imports WHERE id=?", (ident,))
+        except Exception:
+            log.exception("не удалось завершить перенос эскиза %s", ident)
+
+
+_upload_warm_queue = {}
+_upload_warm_seen = {}
+_upload_warm_task = None
+
+
+def _queue_upload_previews(items):
+    global _upload_warm_task
+    now = time.monotonic()
+    for ident, retry in list(_upload_warm_seen.items()):
+        if retry <= now:
+            _upload_warm_seen.pop(ident, None)
+    for item in items:
+        ident = item["id"]
+        if ident not in _upload_warm_seen:
+            _upload_warm_seen[ident] = now + 300
+            _upload_warm_queue[ident] = None
+    if _upload_warm_queue and (_upload_warm_task is None or _upload_warm_task.done()):
+        _upload_warm_task = asyncio.create_task(_warm_upload_previews())
+
+
+async def _warm_upload_previews():
+    # Только один фоновый потребитель; запросы галереи могут присоединяться.
+    while _upload_warm_queue:
+        ident = next(iter(_upload_warm_queue))
+        _upload_warm_queue.pop(ident, None)
+        try:
+            await _pending_thumb(ident)
+        except Exception:
+            log.debug("фоновый эскиз %s пока недоступен", ident)
+
+
 async def _pending_thumb(ident):
     item, p = await _pending_photo(ident)
+    kind = _pkind("t")
     key = ("upload", ident, item["sha"], S.thumb_size, S.image_format, S.thumb_quality)
     data = thumb_cache.get(key)
     if data is not None:
         return data
+    rows = await run_in_threadpool(db.run,
+        "SELECT data FROM upload_previews WHERE id=? AND sha=? AND kind=?",
+        (ident, item["sha"], kind))
+    if rows:
+        thumb_cache.put(key, rows[0][0])
+        return rows[0][0]
     task = inflight.get(key)
     if task is None:
         async def make():
@@ -1800,6 +1906,7 @@ async def _pending_thumb(ident):
                                        _pending_video_src(ident), timeout=240 if p.video else 60)
                 finally:
                     lane.release()
+                await run_in_threadpool(_save_upload_preview, ident, item["sha"], kind, data)
                 thumb_cache.put(key, data)
                 return data
             finally:
@@ -2789,6 +2896,10 @@ def _damaged_check(force: bool = False) -> None:
 
 
 def _after_scan() -> None:
+    try:
+        _finish_upload_imports()
+    except Exception:
+        log.exception("не удалось завершить перенос эскизов")
     threading.Thread(target=lambda: _safe(_damaged_check), name="meta-damaged", daemon=True).start()
     # Журнал событий изменённого архива больше не нужен после полного обхода.
     # Не чистим его при пропущенных папках, чтобы не подтвердить ложные удаления.
