@@ -435,6 +435,14 @@ function upPrepare(files) {
     picked.length !== (files || []).length
     ? 'Часть файлов пропущена: неподдерживаемый формат, пустой файл или размер более 4 ГиБ.' : '';
 }
+function upSelectFolder(path) {
+  const select = $('up-folder');
+  if (![...select.options].some(option => option.value === path)) {
+    const option = el('option', null, path || 'Корень фотоархива');
+    option.value = path; select.append(option);
+  }
+  select.value = path;
+}
 async function upLoadFolders() {
   UP.available = false;
   $('up-submit').disabled = true;
@@ -443,10 +451,11 @@ async function upLoadFolders() {
     const r = await api('/api/upload/folders');
     if (!r.ok) throw new Error('Не удалось проверить состояние ПК.');
     const data = await r.json();
-    $('up-folder-list').replaceChildren(...(data.folders || []).map(name => {
-      const item = el('option'); item.value = name; return item;
+    const selected = UP.folderEdited ? $('up-folder').value : (data.default_folder || '');
+    $('up-folder').replaceChildren(...[...new Set(['', ...(data.folders || []), selected])].map(name => {
+      const item = el('option', null, name || 'Корень фотоархива'); item.value = name; return item;
     }));
-    if (!UP.folderEdited) $('up-folder').value = data.default_folder || '';
+    upSelectFolder(selected);
     UP.available = !!data.ready;
     UP.offlineMessage = data.message ||
       (UP.available ? '' : 'ПК выключен. Включите компьютер — загрузка недоступна.');
@@ -497,7 +506,7 @@ function upOpen(files) {
   $('up-modal').hidden = false;
   UP.folderEdited = false;
   const newestPhoto = st.lib?.photos.find(photo => !(photo[6] & F_VIDEO));
-  $('up-folder').value = newestPhoto ? (st.lib.folders[newestPhoto[1]] || '') : '';
+  upSelectFolder(newestPhoto ? (st.lib.folders[newestPhoto[1]] || '') : '');
   if (files) upPrepare(files);
   upLoadFolders();
   upLoadPending();
@@ -512,7 +521,7 @@ $('up-modal').addEventListener('click', event => {
   if (event.target === $('up-modal')) upClose();
 });
 $('up-files').addEventListener('change', event => upPrepare(event.target.files));
-$('up-folder').addEventListener('input', () => { UP.folderEdited = true; });
+$('up-folder').addEventListener('change', () => { UP.folderEdited = true; });
 $('up-refresh').addEventListener('click', () => { upLoadPending(); upLoadFolders(); });
 $('up-new-folder').addEventListener('click', () => {
   const name = prompt('Название новой папки внутри выбранной:');
@@ -521,7 +530,7 @@ $('up-new-folder').addEventListener('click', () => {
     $('up-status').textContent = 'Недопустимое имя папки'; return;
   }
   const parent = $('up-folder').value.trim().replace(/\/+$/, '');
-  $('up-folder').value = (parent ? parent + '/' : '') + name;
+  upSelectFolder((parent ? parent + '/' : '') + name);
   UP.folderEdited = true;
   $('up-status').textContent = 'Папка будет создана клиентом ПК при переносе.';
 });
