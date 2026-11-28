@@ -170,6 +170,42 @@ const assert=require('node:assert/strict');
  await page.waitForFunction(()=>!UP.busy && UP.files.length===0 && !$('up-result').hidden);
  assert.equal(await page.evaluate(()=>UP.done),1);
  assert.equal(await page.evaluate(()=>UP.files.length),0);
+ // A real MP4 with its moov atom beyond the old 4 MiB limit.
+ const fs=require('node:fs'), cp=require('node:child_process'), path=require('node:path');
+ const ffmpeg=cp.execFileSync('python',['-c','from app.video import find_ffmpeg; print(find_ffmpeg(""))'],{encoding:'utf8'}).trim();
+ const videoPath=path.join(output,'pending-fixture.mp4');
+ cp.execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-y','-f','lavfi','-i','color=c=red:s=160x120:r=10:d=2','-c:v','mpeg4',videoPath]);
+ const raw=fs.readFileSync(videoPath);
+ let moov=-1;
+ for(let pos=0;pos+8<=raw.length;){
+   const size=raw.readUInt32BE(pos);
+   if(raw.toString('ascii',pos+4,pos+8)==='moov'){moov=pos;break}
+   assert(size>=8);pos+=size;
+ }
+ assert(moov>0);
+ const free=Buffer.alloc(5*1024*1024);free.writeUInt32BE(free.length,0);free.write('free',4);
+ const clip=Buffer.concat([raw.subarray(0,moov),free,raw.subarray(moov)]);
+ const csrf={'x-requested-with':'photocloud'};
+ const started=await page.request.post(base+'/api/upload/start',{headers:csrf,data:{name:'pending-fixture.mp4',folder:'',size:clip.length,mtime:1700000000}});
+ assert.equal(started.status(),200,await started.text());
+ const uploadId=(await started.json()).id;
+ for(let off=0;off<clip.length;off+=2*1024*1024){
+   const chunk=await page.request.post(base+'/api/upload/'+uploadId+'/chunk',{headers:{...csrf,'x-upload-offset':String(off),'content-type':'application/octet-stream'},data:clip.subarray(off,off+2*1024*1024)});
+   assert.equal(chunk.status(),200,await chunk.text());
+ }
+ const finished=await page.request.post(base+'/api/upload/'+uploadId+'/finish',{headers:csrf,data:{}});
+ assert.equal(finished.status(),200,await finished.text());
+ const media=await page.request.get(base+'/api/upload/'+uploadId+'/media',{headers:{range:'bytes='+ (clip.length-16) +'-'}});
+ assert.equal(media.status(),206);
+ assert.deepEqual(await media.body(),clip.subarray(-16));
+ const thumbUrl=base+'/api/upload/'+uploadId+'/thumb';
+ const thumb=await page.request.get(thumbUrl,{timeout:120000});
+ assert.equal(thumb.status(),200);
+ const image=await thumb.body();
+ assert.equal(image.toString('ascii',8,12),'WEBP');
+ const again=await page.request.get(thumbUrl);
+ assert.deepEqual(await again.body(),image);
+ fs.unlinkSync(videoPath);
  await page.screenshot({path:output+'/mobile-upload.png'});
  assert.equal(errors.length,0,errors.join('\n'));console.log(JSON.stringify(results));await browser.close();
 })().catch(e=>{console.error(e);process.exit(1)});

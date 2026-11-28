@@ -166,7 +166,7 @@ class UploadedFilesStartupTests(unittest.TestCase):
             _up_refreshing=True, up_tree=Mock(),
             root=mock_root, upload_tab=Mock(), nb=Mock(), up_canvas=Mock(),
             upload_items=[], upload_by_id={}, _uploads_known=None,
-            _up_active_id=None,
+            _up_active_id=None, up_thumbs={}, up_asked=set(), up_no_thumb=set(),
             up_gen=1, _up_layout=Mock(), _up_render=Mock(),
             _up_selection_changed=Mock(), up_status=Mock())
         object_under_test.up_tree.selection.return_value = ()

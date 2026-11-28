@@ -1809,10 +1809,10 @@ async def _pending_thumb(ident):
         inflight[key] = task
     try:
         return await asyncio.shield(task)
+    except (UnidentifiedImageError, ValueError, TooLarge):
+        raise HTTPException(404, "thumbnail unavailable") from None
     except (OSError, ConnectionError, TimeoutError):
         raise HTTPException(503, "pc") from None
-    except (ValueError, TooLarge):
-        raise HTTPException(404, "thumbnail unavailable") from None
 
 
 @app.get("/api/upload/{ident}/thumb")
