@@ -389,7 +389,7 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .up-selected p { margin: 3px 0; color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
 .up-actions { flex-wrap: wrap; justify-content: flex-start; margin: 10px 0; }
 #up-submit { border: 0; background: var(--accent); color: var(--accent-fg); border-radius: 8px; padding: 9px 20px; cursor: pointer; font-weight: 650; }
-#up-submit:disabled { opacity: .5; cursor: default; }
+#up-submit:disabled { background: var(--tile); color: var(--dim); cursor: default; }
 #up-cancel { border: 1px solid var(--line); padding: 8px 15px; background: var(--surface); border-radius: 8px; cursor: pointer; }
 #up-status { color: var(--dim); font-size: 13px; flex: 1; }
 .up-progress-wrap { display: grid; gap: 4px; }
@@ -471,6 +471,8 @@ tr.lvl-warning td { color: #b8860b; } tr.lvl-error td, tr.lvl-critical td { colo
 .up-result-actions button { border: 1px solid var(--line); border-radius: 8px;
   background: var(--surface); padding: 8px 12px; cursor: pointer; }
 #up-result-close { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+#up-result-retry { flex-basis: 100%; background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 650; }
+#up-result-retry:not([hidden]) ~ #up-result-close { background: var(--surface); color: var(--fg); border-color: var(--line); }
 
 /* Общая скорость и оставшееся время для всех выбранных файлов. */
 #up-progress-stats { display: block; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.5; }

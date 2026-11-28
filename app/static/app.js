@@ -413,6 +413,9 @@ function upSafeName(name) {
     && !/[\\/:*?"<>|\u0000-\u001f]/.test(name) && !/[. ]$/.test(name);
 }
 
+function upSyncSubmit() {
+  $('up-submit').disabled = !UP.files.length || UP.busy || !UP.available || !$('up-result').hidden;
+}
 function upResetResult() {
   $('up-result').hidden = true;
   $('up-result').removeAttribute('data-state');
@@ -420,6 +423,7 @@ function upResetResult() {
   $('up-progress').value = 0;
   $('up-progress-caption').textContent = '';
   $('up-progress-stats').textContent = '';
+  upSyncSubmit();
 }
 function upShowResult(done, skipped, errors, stopped) {
   const anyErrors = errors.length > 0, anyUploaded = done > 0;
@@ -430,6 +434,7 @@ function upShowResult(done, skipped, errors, stopped) {
   $('up-progress-wrap').hidden = true;       // полоса 100 % больше не висит в интерфейсе
   $('up-result').hidden = false;
   $('up-result').dataset.state = state;
+  upSyncSubmit();
   $('up-result-retry').hidden = !UP.files.length;
   $('up-result-retry').textContent = 'Повторить оставшиеся (' + UP.files.length + ')';
   $('up-result-icon').textContent = state === 'success' ? '✓' : '!';
@@ -476,7 +481,7 @@ function upRenderSelection() {
     const p = el('p'); p.textContent = file.name + ' · ' + (file.size / 1048576).toFixed(1) + ' МиБ'; return p;
   }));
   if (picked.length > 60) $('up-selected').append(el('p', null, '… ещё ' + (picked.length - 60)));
-  $('up-submit').disabled = !picked.length || UP.busy || !UP.available;
+  upSyncSubmit();
   $('up-submit').textContent = picked.length ? 'Загрузить ' + picked.length : 'Загрузить';
 }
 function upSelectFolder(path) {
@@ -505,7 +510,7 @@ async function upLoadFolders() {
       (UP.available ? '' : 'ПК выключен. Включите компьютер — загрузка недоступна.');
     $('up-offline').hidden = UP.available;
     $('up-offline-text').textContent = UP.offlineMessage;
-    $('up-submit').disabled = !UP.available || UP.busy || !UP.files.length;
+    upSyncSubmit();
     $('up-status').textContent = UP.available
       ? (UP.files.length ? 'ПК подключён. Файлы готовы к отправке.' : 'ПК подключён. Выберите файлы.')
       : UP.offlineMessage;
@@ -2587,7 +2592,7 @@ async function fillInfo() {
   body.replaceChildren(el('h3', null, 'Подробнее'),
     infoRows([['Дата', `${when} (${src})`], ['Файл', ph[2]], ['Папка', folder], ['Размер', sizeStr(ph[5])],
     ]), extra);
-  if (isPendingId(ph[0])) { extra.replaceChildren(el('div', 'dim', 'Подробные метаданные появятся после переноса в архив.')); return; }
+  if (isPendingId(ph[0])) { extra.replaceChildren(el('div', 'dim', 'Подробные метаданные появятся после переноса файлов из PhotoCloud-Uploads на ПК в основную галерею.')); return; }
   const info = await getInfo(ph);
   if (seq !== INFO.seq || !INFO.open) return;
   extra.replaceChildren();
