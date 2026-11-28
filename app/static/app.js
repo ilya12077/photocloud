@@ -31,6 +31,7 @@ const HQ = HID ? '?hidden=1' : STARRED ? '?starred=1' : '';
 
 const st = {
   me: null,
+  baseLib: null, pendingItems: [], pendingKey: '', pendingSeq: 0,
   lib: null,          // {v, folders, photos:[[id, fidx, name, date, mtime, sizeKB, flags]]}
   children: null, totals: null, cover: null, folderIdx: null, parent: null,
   folder: '', sort: 'new', rec: true,
@@ -293,7 +294,7 @@ $('tfa-form').addEventListener('submit', async (e) => {
 
 $('logout').addEventListener('click', async () => {
   try { await api('/api/logout', { method: 'POST' }); } catch (_) {}
-  st.lib = null; clearGrid(); $('folders').replaceChildren(); hideMenu();
+  st.lib = st.baseLib = null; st.pendingItems = []; st.pendingKey = ''; st.pendingSeq++; clearGrid(); $('folders').replaceChildren(); hideMenu();
   showLogin(); PK.auto = true;          // вышел сам — окно ключа сразу не открываем (кнопка и подсказка остаются)
 });
 
@@ -307,6 +308,7 @@ async function enter() {
   const r = await api('/api/me', { allow401: true });
   if (r.status === 401) { st.libPromise = null; showLogin(err); return; }
   const me = await r.json(); st.me = me;
+  st.lib = st.baseLib = null; st.pendingItems = []; st.pendingKey = ''; st.pendingSeq++;
   if (me.name) { $('title').textContent = me.name; document.title = me.name; }
   if (me.sizes) Z.sizes = me.sizes;
   $('admin-link').hidden = me.role !== 'admin';
@@ -333,7 +335,6 @@ async function enter() {
   $('login').hidden = true; $('main').hidden = false;
   readRoute(); initZoom();
   poll();
-  upLoadFeed();
   const early = await st.libPromise; st.libPromise = null;
   // Если ранний запрос не удался, пробуем снова сразу, не дожидаясь опроса статуса.
   if (!st.lib) {
@@ -342,34 +343,64 @@ async function enter() {
   }
 }
 
-// Ожидающие переноса файлы администратора доступны на главной странице
-// отдельной галереей, пока агент ПК не подтвердит их перенос.
-async function upLoadFeed() {
-  if (!st.me || st.me.role !== 'admin') return;
+// Подтверждённые загрузки из Restored показываем обычными плитками в целевых папках.
+const isPendingId = id => typeof id === 'string' && id.startsWith('upload:');
+const pendingUrl = (ph, kind) => '/api/upload/' + encodeURIComponent(ph[0].slice(7)) + '/' + kind;
+const PENDING_VIDEO = /\.(mp4|mov|m4v|3gp|webm|mts|m2ts|avi|mpg|mpeg|vob)$/i;
+const PENDING_PLAYABLE = /\.(mp4|mov|m4v|3gp|webm)$/i;
+
+function mergePending(base, items) {
+  if (!items.length) return base;
+  const folders = base.folders.slice(), folderIds = new Map(folders.map((f, i) => [f, i]));
+  const ensureFolder = path => {
+    if (folderIds.has(path)) return folderIds.get(path);
+    const cut = path.lastIndexOf('/');
+    if (cut >= 0) ensureFolder(path.slice(0, cut));
+    const i = folders.length; folders.push(path); folderIds.set(path, i); return i;
+  };
+  // Если ПК уже перенёс файл и индекс его увидел, временная копия не нужна.
+  const key = (folder, name, size, mtime) => JSON.stringify([folder.toLowerCase(), name.toLowerCase(), size, mtime]);
+  const indexed = new Set(base.photos.map(p => key(base.folders[p[1]], p[2], p[5], p[4])));
+  const added = [];
+  for (const item of items) {
+    if (!item.id || !item.name || !Number.isFinite(item.mtime) || !Number.isFinite(item.size)) continue;
+    const folder = item.folder || '', mtime = Math.floor(item.mtime), size = Math.ceil(item.size / 1024);
+    if (indexed.has(key(folder, item.name, size, mtime))) continue;
+    const video = PENDING_VIDEO.test(item.name);
+    let flags = video ? F_VIDEO | (PENDING_PLAYABLE.test(item.name) ? 0 : F_NOPLAY) : 0;
+    let date = mtime;
+    // IMG_20261121_123456 и аналогичные имена: дата съёмки, а не день загрузки.
+    const m = item.name.match(/(?:^|[^0-9])((?:19|20)\d{2})[-_]?([01]\d)[-_]?([0-3]\d)(?:[T _-]?([0-2]\d)[-:]?([0-5]\d)[-:]?([0-5]\d))?(?!\d)/);
+    if (m) {
+      const y = +m[1], mo = +m[2], d = +m[3], h = +(m[4] || 0), mi = +(m[5] || 0), se = +(m[6] || 0);
+      const t = new Date(y, mo - 1, d, h, mi, se);
+      if (t.getFullYear() === y && t.getMonth() === mo - 1 && t.getDate() === d && h < 24) {
+        date = Math.floor(t.getTime() / 1000); flags |= F_NAME;
+      }
+    }
+    added.push(['upload:' + item.id, ensureFolder(folder), item.name, date, mtime, size, flags]);
+  }
+  if (!added.length) return base;
+  return { ...base, folders, photos: [...base.photos, ...added].sort((a,b) => b[3] - a[3]) };
+}
+
+async function refreshPendingGallery() {
+  if (!st.baseLib || st.me?.role !== 'admin' || HID || STARRED || $('main').hidden || !$('viewer').hidden || SEL.on) return;
+  const seq = ++st.pendingSeq;
   try {
-    const r = await api('/api/upload/list', {poll: true});
+    const r = await api('/api/upload/list', {poll: true, timeout: 15000});
     if (!r.ok) return;
     const data = await r.json();
+    if (seq !== st.pendingSeq || !st.baseLib || $('main').hidden || !$('viewer').hidden || SEL.on) return;
     const items = data.items || [];
-    const feed = $('up-feed');
-    feed.hidden = !items.length || HID || STARRED;
-    if (feed.hidden) return;
-    $('up-feed-title').textContent = 'Загруженные · ожидают переноса: ' + items.length;
-    const cards = [];
-    for (const item of items.slice(0, 24)) {
-      const a = el('a', 'up-feed-card');
-      a.href = '/api/upload/' + encodeURIComponent(item.id) + '/media';
-      a.target = '_blank'; a.rel = 'noopener'; a.title = item.name + ' · ' + (item.folder || 'Корень');
-      const image = el('img'); image.alt = ''; image.loading = 'lazy';
-      image.src = '/api/upload/' + encodeURIComponent(item.id) + '/thumb';
-      image.onerror = () => { image.removeAttribute('src'); image.style.visibility = 'hidden'; };
-      a.append(image, el('span', null, item.name));
-      cards.push(a);
-    }
-    $('up-feed-grid').replaceChildren(...cards);
+    const key = JSON.stringify(items.map(x => [x.id,x.folder,x.name,x.size,x.mtime]));
+    if (key === st.pendingKey) return;
+    const place = keepPlace();
+    st.pendingItems = items; st.pendingKey = key;
+    installLibrary(mergePending(st.baseLib, items));
+    restorePlace(place);
   } catch (_) {}
 }
-$('up-feed-open').addEventListener('click', () => upOpen());
 
 // ---------------------------------------------------------------- загрузка новых фото/видео в Restored через очередь ПК
 const UP = { files: [], busy: false, abort: null, activeId: null, depth: 0, done: 0,
@@ -787,11 +818,11 @@ async function upUpload() {
     upRenderSelection();
     if (previewComplete) {
       upLoadPending();
-      upLoadFeed();
+      refreshPendingGallery();
     }
     upShowResult(UP.done, skips.length, errors, ctrl.signal.aborted);
     // Принятые файлы сохраняются, а список обновляется без перехода в режим загрузки.
-    if (UP.done) upLoadPending();
+    if (UP.done) { upLoadPending(); refreshPendingGallery(); }
   }
 }
 $('up-submit').addEventListener('click', upUpload);
@@ -908,11 +939,12 @@ async function poll(delay) {
   if (ix.v && !st.lib && !st.libPromise) await loadLibrary();
   else if (ix.v && st.lib && ix.v !== st.lib.v && ix.state !== 'building') {
     // молча обновляем, только если пользователь ещё не начал листать
-    if (window.scrollY < 50 && $('viewer').hidden && Date.now() > L.calmUntil) await loadLibrary();
+    if (window.scrollY < 50 && $('viewer').hidden && !SEL.on && Date.now() > L.calmUntil) await loadLibrary();
     else if (!st.newVersion) { st.newVersion = ix.v; next = 100; }
   }
   if (prevPc !== 'up' && s.pc === 'up') retryBroken();
   if (!st.lib && ix.state !== 'error' && s.pc === 'up') next = Math.min(next, 1500);
+  refreshPendingGallery();
   st.pollTimer = setTimeout(() => poll(), next);
 }
 
@@ -959,8 +991,14 @@ async function loadLibraryInner(pre) {
   if (!r.ok) return;
   const j = await r.json();
   if (!j.v) return;
-  const lib = decode(j);
-  st.lib = lib; st.newVersion = null;
+  st.baseLib = decode(j); st.newVersion = null;
+  installLibrary(mergePending(st.baseLib, st.pendingItems));
+  refreshPendingGallery();
+  if (!st.placed) { st.placed = true; restorePlace(loadPlace()); }   // первая загрузка — туда, где был
+}
+
+function installLibrary(lib) {
+  st.lib = lib;
   const F = lib.folders.length;
   st.folderIdx = new Map(lib.folders.map((p, i) => [p, i]));
   st.children = Array.from({ length: F }, () => []);
@@ -988,8 +1026,6 @@ async function loadLibraryInner(pre) {
   // Повторно запрашиваем видимые плитки без необходимости обновлять страницу.
   requestAnimationFrame(() => { if (st.lib === lib && !$('main').hidden) draw(false); });
   if ($('banner-text').textContent.startsWith('Загружаю')) banner(null);
-  if (st.me?.role === 'admin') upLoadFeed();
-  if (!st.placed) { st.placed = true; restorePlace(loadPlace()); }   // первая загрузка — туда, где был
 }
 
 function readRoute() {
@@ -1008,8 +1044,8 @@ $('rec').addEventListener('change', (e) => { st.rec = e.target.checked; store('p
 
 // ================================================================== адреса картинок
 
-const imgUrl = (kind, ph) => `/img/${kind}/${encodeURIComponent(ph[0])}?v=${ph[4]}`;
-const origUrl = (ph, dl) => `/img/o/${encodeURIComponent(ph[0])}${dl ? '?dl=1' : ''}`;
+const imgUrl = (kind, ph) => isPendingId(ph[0]) ? pendingUrl(ph, 'thumb') + '?v=' + ph[4] : `/img/${kind}/${encodeURIComponent(ph[0])}?v=${ph[4]}`;
+const origUrl = (ph, dl) => isPendingId(ph[0]) ? pendingUrl(ph, 'media') : `/img/o/${encodeURIComponent(ph[0])}${dl ? '?dl=1' : ''}`;
 
 function thumbKind() {
   // сколько реальных пикселей занимает плитка -> ближайший размер эскиза
@@ -1499,7 +1535,7 @@ async function gridPrefetch() {
       const img = tile.querySelector('img');
       if (img && !img.dataset.loaded && !img.dataset.err) pending = true;
       const ph = st.list[+tile.dataset.i];
-      if (!ph || (ph[6] & F_VIDEO)) continue;
+      if (!ph || isPendingId(ph[0]) || (ph[6] & F_VIDEO)) continue;
       const u = imgUrl('q', ph) + '&n=p';
       if (!prefetched.has(u)) want.push(u);
     }
@@ -1550,9 +1586,14 @@ function selUpdate() {
   $('grid').classList.toggle('selmode', SEL.on);
   $('sel-n').textContent = `Выбрано: ${SEL.set.size.toLocaleString('ru')}`;
   for (const id of ['sel-download', 'sel-hide', 'sel-show', 'sel-star', 'sel-unstar', 'sel-del']) $(id).disabled = !SEL.set.size;
-  $('sel-group').disabled = selIds().length < 2;
+  const ids = selIds(), pending = ids.some(isPendingId);
+  if (pending) {
+    for (const id of ['sel-hide','sel-show','sel-star','sel-unstar','sel-del']) $(id).disabled = true;
+    if (ids.length > 50) $('sel-download').disabled = true;
+  }
+  $('sel-group').disabled = pending || ids.length < 2;
   // «Разгруппировать» — если среди выбранных есть фото из группы
-  $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || ![...SEL.set].some((id) => GX.byId.has(id));
+  $('sel-ungroup').hidden = !st.me || st.me.role !== 'admin' || pending || ![...SEL.set].some((id) => GX.byId.has(id));
   // «Не удалять» — когда среди выбранных есть помеченные на удаление
   $('sel-undel').hidden = !HID || !st.me || !st.me.can_delete || ![...SEL.set].some((id) => MARK.ids.has(id));
   for (const h of $('grid').querySelectorAll('.mhead, .dhead')) h.classList.toggle('sel', SEL.on && monthAllSel(+h.dataset.start, +h.dataset.n));
@@ -1614,7 +1655,7 @@ async function selDownload() {
       for (const members of GX.of.values()) for (const ph of members) names.set(ph[0], ph[2]);
       // Все клики внутри исходного нажатия: браузер может попросить разрешить
       // несколько скачиваний подряд, поэтому не используем setTimeout.
-      for (const id of ids) clickDownload('/img/o/' + encodeURIComponent(id) + '?dl=1', names.get(id));
+      for (const id of ids) clickDownload(origUrl([id], true), names.get(id));
       banner('Скачивание ' + count(ids.length) + ' отдельно. Если браузер спросит — разреши несколько загрузок.');
     } else {
       const response = await api('/api/download/prepare', { method: 'POST', body: { ids } });
@@ -1728,6 +1769,7 @@ function paintStars() {
 }
 function starBtn() {
   const ph = st.list[V.i], on = !!ph && STAR.ids.has(ph[0]);
+  $('v-star').hidden = HID || st.me?.role !== 'admin' || !!ph && isPendingId(ph[0]);
   $('v-star').classList.toggle('on', on);
   $('v-star').title = $('v-star').ariaLabel = on ? 'Убрать из избранного' : 'В избранное';
 }
@@ -2048,7 +2090,7 @@ function loadHls() {
 
 async function playVideo(ph, tok, startAt) {
   const v = $('v-video');
-  const canTranscode = st.me && st.me.transcode;
+  const canTranscode = !isPendingId(ph[0]) && st.me && st.me.transcode;
   // Новый ключ: после обновления всем по умолчанию открываем исходный файл,
   // даже если раньше сохранялся выключенный «Оригинал». Явное выключение
   // «без сжатия» запоминаем для следующих видео.
@@ -2097,7 +2139,8 @@ $('v-origchk').addEventListener('change', (e) => {
 function show(i) {
   if (i < 0 || i >= st.list.length) return;
   V.i = i; const ph = st.list[i]; const tok = ++V.token;
-  const isVideo = !!(ph[6] & F_VIDEO) && (!(ph[6] & F_NOPLAY) || (st.me && st.me.transcode));
+  const pending = isPendingId(ph[0]);
+  const isVideo = !!(ph[6] & F_VIDEO) && (!(ph[6] & F_NOPLAY) || (!pending && st.me && st.me.transcode));
   $('v-name').textContent = ph[2];
   starBtn();
   const fromMeta = ph[6] & F_TAKEN, fromName = ph[6] & F_NAME;
@@ -2122,6 +2165,10 @@ function show(i) {
     const v = $('v-video'); v.hidden = false; v.poster = imgUrl('m', ph);
     low.style.visibility = 'hidden'; $('v-spin').hidden = true;
     playVideo(ph, tok, 0);
+  } else if (pending) {
+    low.classList.add('sharp');
+    $('v-spin').hidden = pcOff || !canOriginal(ph);
+    if (!pcOff && canOriginal(ph)) { VZ.want = 'o'; loadStep(ph, tok, 'o', ''); }
   } else {
     // Загрузка по ступеням, строго по очереди (на медленном канале параллельные
     // загрузки только мешают друг другу):
@@ -2201,7 +2248,7 @@ async function prefetchNear(i, tok) {
   const urls = [];
   for (const j of [i + 1, i - 1]) {
     const n = st.list[j];
-    if (n && !(n[6] & F_VIDEO)) urls.push(imgUrl('q', n) + `&n=${full}`);
+    if (n && !isPendingId(n[0]) && !(n[6] & F_VIDEO)) urls.push(imgUrl('q', n) + `&n=${full}`);
   }
   for (const u of urls) {
     if (tok !== V.token || ctl.signal.aborted) return;
@@ -2540,6 +2587,7 @@ async function fillInfo() {
   body.replaceChildren(el('h3', null, 'Подробнее'),
     infoRows([['Дата', `${when} (${src})`], ['Файл', ph[2]], ['Папка', folder], ['Размер', sizeStr(ph[5])],
     ]), extra);
+  if (isPendingId(ph[0])) { extra.replaceChildren(el('div', 'dim', 'Подробные метаданные появятся после переноса в архив.')); return; }
   const info = await getInfo(ph);
   if (seq !== INFO.seq || !INFO.open) return;
   extra.replaceChildren();

@@ -124,6 +124,21 @@ const assert=require('node:assert/strict');
  await page.unroute('**/api/upload/start');
  const pending=await (await page.request.get(base+'/api/upload/list')).json();
  assert.equal(pending.items.filter(x=>x.name.startsWith('queue-')||x.name==='extra.jpg').length,17);
+ await page.waitForFunction(()=>st.list.filter(p=>isPendingId(p[0])).length===17,null,{timeout:20000});
+ assert.equal(await page.locator('#up-feed').count(),0);
+ assert.equal(await page.evaluate(()=>st.list.length),95);
+ assert(await page.evaluate(()=>st.list.filter(p=>isPendingId(p[0])).every(p=>imgUrl('s',p).includes('/api/upload/') && origUrl(p,true).endsWith('/media'))));
+ // Тот же файл после индексации не дублируется; целевая вложенная папка создаётся в общей ленте.
+ assert(await page.evaluate(()=>{
+   const row = ['abcdefgh',0,'IMG_20261121_123456.jpg',1,1,1,0];
+   const base = {folders:[''],photos:[row]};
+   const duplicate = {id:'duplicate',name:row[2],folder:'',mtime:1,size:1024};
+   const nested = {id:'nested',name:'IMG_20261122_123456.jpg',folder:'Новая/Подпапка',mtime:2,size:1024};
+   const merged=mergePending(base,[duplicate,nested]);
+   return merged.photos.length===2 && merged.photos[0][0]==='upload:nested' &&
+      merged.folders[merged.photos[0][1]]==='Новая/Подпапка' && merged.folders.includes('Новая') &&
+      (merged.photos[0][6]&F_NAME)!==0 && base.folders.length===1;
+ }));
  // The same file can be selected again after completion; duplicate checking stays active.
  await page.locator('#up-files').setInputFiles(batch[0]);
  assert.equal(await page.evaluate(()=>UP.files.length),1);
