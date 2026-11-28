@@ -93,6 +93,61 @@ const assert=require('node:assert/strict');
  await page.locator('#up-files').setInputFiles([]);
  assert.equal(await page.evaluate(()=>UP.files.length),17);
  assert.equal(await page.locator('#up-submit').textContent(),'Загрузить 17');
+ // Network failure before duplicate checking must preserve the entire selection.
+ await page.route('**/api/upload/check', route=>route.abort('failed'));
+ await page.locator('#up-submit').click();
+ await page.waitForFunction(()=>!UP.busy && !$('up-result').hidden);
+ assert.equal(await page.evaluate(()=>UP.files.length),17);
+ await page.unroute('**/api/upload/check');
+ // One failed file, sixteen successful real HTTP uploads.
+ const starts=[];
+ await page.route('**/api/upload/start', route=>{
+   const name=route.request().postDataJSON().name; starts.push(name);
+   return name==='queue-0.jpg' ? route.abort('failed') : route.continue();
+ });
+ await page.locator('#up-result-retry').click();
+ await page.waitForFunction(()=>!UP.busy && UP.done===16 && !$('up-result').hidden,null,{timeout:60000});
+ assert.equal(await page.evaluate(()=>UP.done),16);
+ assert.deepEqual(await page.evaluate(()=>UP.files.map(f=>f.name)),['queue-0.jpg']);
+ assert.equal(await page.locator('#up-submit').textContent(),'Загрузить 1');
+ assert.equal(starts.length,17);
+ await page.unroute('**/api/upload/start');
+ const retried=[];
+ await page.route('**/api/upload/start', route=>{
+   retried.push(route.request().postDataJSON().name); return route.continue();
+ });
+ await page.locator('#up-result-retry').click();
+ await page.waitForFunction(()=>!UP.busy && UP.files.length===0 && !$('up-result').hidden,null,{timeout:30000});
+ assert.deepEqual(retried,['queue-0.jpg']);
+ assert.equal(await page.evaluate(()=>UP.files.length),0);
+ assert(await page.locator('#up-result-retry').isHidden());
+ await page.unroute('**/api/upload/start');
+ const pending=await (await page.request.get(base+'/api/upload/list')).json();
+ assert.equal(pending.items.filter(x=>x.name.startsWith('queue-')||x.name==='extra.jpg').length,17);
+ // The same file can be selected again after completion; duplicate checking stays active.
+ await page.locator('#up-files').setInputFiles(batch[0]);
+ assert.equal(await page.evaluate(()=>UP.files.length),1);
+ await page.locator('#up-submit').click();
+ await page.waitForFunction(()=>!UP.busy && !$('up-result').hidden);
+ assert.equal(await page.evaluate(()=>UP.files.length),0);
+ assert.match(await page.locator('#up-result-summary').textContent(),/Пропущено: 1/);
+ // Cancellation while checking must keep the files for another attempt.
+ await page.locator('#up-files').setInputFiles({name:'cancel-retry.jpg',mimeType:'image/jpeg',buffer:Buffer.from('cancel')});
+ let releaseCheck;
+ const checkReached=new Promise(resolve=>{releaseCheck=resolve});
+ let heldRoute;
+ await page.route('**/api/upload/check',route=>{heldRoute=route;releaseCheck()});
+ await page.locator('#up-submit').click();
+ await checkReached;
+ await page.locator('#up-cancel').click();
+ await heldRoute.abort('aborted');
+ await page.waitForFunction(()=>!UP.busy && !$('up-result').hidden);
+ assert.deepEqual(await page.evaluate(()=>UP.files.map(f=>f.name)),['cancel-retry.jpg']);
+ await page.unroute('**/api/upload/check');
+ await page.locator('#up-result-retry').click();
+ await page.waitForFunction(()=>!UP.busy && UP.files.length===0 && !$('up-result').hidden);
+ assert.equal(await page.evaluate(()=>UP.done),1);
+ assert.equal(await page.evaluate(()=>UP.files.length),0);
  await page.screenshot({path:output+'/mobile-upload.png'});
  assert.equal(errors.length,0,errors.join('\n'));console.log(JSON.stringify(results));await browser.close();
 })().catch(e=>{console.error(e);process.exit(1)});

@@ -399,6 +399,8 @@ function upShowResult(done, skipped, errors, stopped) {
   $('up-progress-wrap').hidden = true;       // полоса 100 % больше не висит в интерфейсе
   $('up-result').hidden = false;
   $('up-result').dataset.state = state;
+  $('up-result-retry').hidden = !UP.files.length;
+  $('up-result-retry').textContent = 'Повторить оставшиеся (' + UP.files.length + ')';
   $('up-result-icon').textContent = state === 'success' ? '✓' : '!';
   $('up-result-title').textContent = title;
   $('up-result-summary').textContent =
@@ -411,6 +413,7 @@ function upShowResult(done, skipped, errors, stopped) {
     : 'Выберите файлы для загрузки.';
   $('up-status').textContent = '';
 }
+$('up-result-retry').addEventListener('click', () => upUpload());
 $('up-result-again').addEventListener('click', () => {
   upResetResult();
   $('up-files').click();
@@ -431,15 +434,19 @@ function upPrepare(files) {
     if (!seen.has(id)) { seen.add(id); picked.push(file); }
   }
   UP.files = picked;
+  upRenderSelection();
+  $('up-status').textContent = !UP.available ? UP.offlineMessage :
+    incoming.length !== (files || []).length
+    ? 'Часть файлов пропущена: неподдерживаемый формат, пустой файл или размер более 4 ГиБ.' : '';
+}
+function upRenderSelection() {
+  const picked = UP.files;
   $('up-selected').replaceChildren(...picked.slice(0, 60).map(file => {
     const p = el('p'); p.textContent = file.name + ' · ' + (file.size / 1048576).toFixed(1) + ' МиБ'; return p;
   }));
   if (picked.length > 60) $('up-selected').append(el('p', null, '… ещё ' + (picked.length - 60)));
   $('up-submit').disabled = !picked.length || UP.busy || !UP.available;
   $('up-submit').textContent = picked.length ? 'Загрузить ' + picked.length : 'Загрузить';
-  $('up-status').textContent = !UP.available ? UP.offlineMessage :
-    incoming.length !== (files || []).length
-    ? 'Часть файлов пропущена: неподдерживаемый формат, пустой файл или размер более 4 ГиБ.' : '';
 }
 function upSelectFolder(path) {
   const select = $('up-folder');
@@ -510,9 +517,9 @@ function upOpen(files) {
   if (!st.me || st.me.role !== 'admin') return;
   if (!UP.busy) upResetResult();
   $('up-modal').hidden = false;
-  UP.folderEdited = false;
+  if (!UP.files.length && !UP.busy) UP.folderEdited = false;
   const newestPhoto = st.lib?.photos.find(photo => !(photo[6] & F_VIDEO));
-  upSelectFolder(newestPhoto ? (st.lib.folders[newestPhoto[1]] || '') : '');
+  if (!UP.folderEdited) upSelectFolder(newestPhoto ? (st.lib.folders[newestPhoto[1]] || '') : '');
   if (files) upPrepare(files);
   upLoadFolders();
   upLoadPending();
@@ -667,20 +674,22 @@ function upProgressTracker(totalBytes) {
   };
 }
 
-$('up-submit').addEventListener('click', async () => {
-  if (!UP.files.length || UP.busy || !UP.available) return;
-  if (!await upLoadFolders()) return;
+async function upUpload() {
+  if (!UP.files.length || UP.busy) return;
+  if (!await upLoadFolders() || UP.busy || !UP.files.length) return;
   const folder = $('up-folder').value.trim().replace(/\/+$/, '');
   if (folder && (!folder.split('/').every(upSafeName) || folder.split('/').some(
       x => ['restored','.photocloud','photocloud-uploads'].includes(x.toLowerCase())))) {
     $('up-status').textContent = 'Недопустимый путь папки'; return;
   }
   const files = [...UP.files], ctrl = new AbortController();
+  const remaining = new Set(files.map((_, i) => i));
   if (files.length > 3000) {
     $('up-status').textContent = 'За раз можно проверить не более 3000 файлов.';
     return;
   }
   UP.busy = true; UP.abort = ctrl; UP.done = 0;
+  UP.folderEdited = true;
   upResetResult();
   $('up-submit').disabled = true;
   $('up-cancel').hidden = false;
@@ -743,12 +752,14 @@ $('up-submit').addEventListener('click', async () => {
           });
           tracker.complete(f.size);
           UP.done++;
+          remaining.delete(i);
         } catch (error) {
           tracker.skip(f.size - uploadedBytes);
           tracker.complete(uploadedBytes);
           if (ctrl.signal.aborted) break;
           if (/^Дубль:/.test(error.message)) {
             skips.push(f.name + ' — дубль обнаружен при повторной проверке');
+            remaining.delete(i);
           } else {
             errors.push(f.name + ': ' + error.message);
           }
@@ -762,6 +773,7 @@ $('up-submit').addEventListener('click', async () => {
         }
       } else {
         tracker.skip(f.size);
+        remaining.delete(i);
       }
     }
   } catch (error) {
@@ -770,14 +782,10 @@ $('up-submit').addEventListener('click', async () => {
     $('up-duplicate-dialog').hidden = true;
     UP.busy = false; UP.abort = null;
     $('up-cancel').hidden = true;
-    $('up-submit').disabled = !UP.available || !UP.files.length;
+    UP.files = files.filter((_, i) => remaining.has(i));
+    $('up-files').value = '';
+    upRenderSelection();
     if (previewComplete) {
-      $('up-selected').replaceChildren(...skips.slice(0, 80).map(message => {
-        const row = el('p', 'up-skipped'); row.textContent = message; return row;
-      }));
-      if (skips.length > 80) $('up-selected').append(el('p', null, '… и ещё ' + (skips.length - 80)));
-      UP.files = []; $('up-files').value = '';
-      $('up-submit').disabled = true;
       upLoadPending();
       upLoadFeed();
     }
@@ -785,7 +793,8 @@ $('up-submit').addEventListener('click', async () => {
     // Принятые файлы сохраняются, а список обновляется без перехода в режим загрузки.
     if (UP.done) upLoadPending();
   }
-});
+}
+$('up-submit').addEventListener('click', upUpload);
 $('up-cancel').addEventListener('click', () => UP.abort?.abort());
 let upDragDepth = 0;
 function upFileDrag(e) { return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files'); }
