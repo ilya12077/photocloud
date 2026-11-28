@@ -420,10 +420,16 @@ $('up-result-close').addEventListener('click', () => {
 });
 
 function upPrepare(files) {
-  if (!st.me || st.me.role !== 'admin') return;
-  if (!UP.busy) upResetResult();
-  const picked = Array.from(files || []).filter(file => upMedia(file) && upSafeName(file.name)
+  if (!st.me || st.me.role !== 'admin' || UP.busy) return;
+  upResetResult();
+  const incoming = Array.from(files || []).filter(file => upMedia(file) && upSafeName(file.name)
     && file.size > 0 && file.size <= 4 * 1024 ** 3);
+  const key = file => JSON.stringify([file.name, file.size, file.lastModified, file.webkitRelativePath || '']);
+  const picked = [...UP.files], seen = new Set(picked.map(key));
+  for (const file of incoming) {
+    const id = key(file);
+    if (!seen.has(id)) { seen.add(id); picked.push(file); }
+  }
   UP.files = picked;
   $('up-selected').replaceChildren(...picked.slice(0, 60).map(file => {
     const p = el('p'); p.textContent = file.name + ' · ' + (file.size / 1048576).toFixed(1) + ' МиБ'; return p;
@@ -432,7 +438,7 @@ function upPrepare(files) {
   $('up-submit').disabled = !picked.length || UP.busy || !UP.available;
   $('up-submit').textContent = picked.length ? 'Загрузить ' + picked.length : 'Загрузить';
   $('up-status').textContent = !UP.available ? UP.offlineMessage :
-    picked.length !== (files || []).length
+    incoming.length !== (files || []).length
     ? 'Часть файлов пропущена: неподдерживаемый формат, пустой файл или размер более 4 ГиБ.' : '';
 }
 function upSelectFolder(path) {
@@ -520,7 +526,10 @@ $('up-close').addEventListener('click', upClose);
 $('up-modal').addEventListener('click', event => {
   if (event.target === $('up-modal')) upClose();
 });
-$('up-files').addEventListener('change', event => upPrepare(event.target.files));
+$('up-files').addEventListener('change', event => {
+  upPrepare(event.target.files);
+  event.target.value = ''; // allow choosing the same file again after a completed batch
+});
 $('up-folder').addEventListener('change', () => { UP.folderEdited = true; });
 $('up-refresh').addEventListener('click', () => { upLoadPending(); upLoadFolders(); });
 $('up-new-folder').addEventListener('click', () => {
